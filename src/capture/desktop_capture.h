@@ -133,6 +133,17 @@ class DesktopCapture {
   ComPtr<IDXGIOutputDuplication> dup_;
   ComPtr<ID3D11Texture2D> staging_;
 
+  /// 目标输出的设备名（`\\.\DISPLAY1`）。**它才是稳定的标识**：适配器和输出
+  /// 都是按下标枚举的，而显示器一插一拔，枚举顺序就可能整体错位 —— 错位之后
+  /// 下标不会报错，它会安静地指向**另一台显示器**，录出来的是别人的桌面。
+  /// 所以每次建会话都按名字核一遍，而不是只在下标取不到的时候才去找。
+  std::string device_name_;
+
+  /// 输出被拔掉/重新枚举之后，按 device_name_ 把它找回来（找到了会顺手修正
+  /// 下面两个下标）。找不到就退回按下标枚举。
+  bool pick_output(IDXGIFactory1* factory, IDXGIAdapter1** adapter,
+                   IDXGIOutput** output, std::string& err);
+
   unsigned adapter_index_ = 0;
   unsigned output_index_ = 0;
   int width_ = 0;

@@ -118,6 +118,15 @@ struct SessionStats {
 
 class CaptureSession {
  public:
+  /// run() 的三种结局。**刻意不是 bool**："跑完了"和"这条链得整个重建一遍"
+  /// 是完全不同的两件事，而后者是要接着干活的信号 —— 混成一个 false 的话，
+  /// 调用方要么把它当失败退出，要么就得再去看一个布尔成员，两种写法都容易漏。
+  enum class RunResult {
+    Finished,  ///< 正常结束（到时间、Ctrl+C、被 request_stop）
+    Restart,   ///< 采集尺寸中途变了，调用方应当**再调一次 run()**（新文件、新 RTSP）
+    Failed,    ///< 出错，err 里是人话
+  };
+
   CaptureSession() = default;
   ~CaptureSession();
 
@@ -125,7 +134,12 @@ class CaptureSession {
   CaptureSession& operator=(CaptureSession const&) = delete;
 
   /// 阻塞直到跑完（到时间或 Ctrl+C）。失败时 err 填入人话。
-  bool run(SessionOptions const& opt, std::string& err);
+  ///
+  /// 返回 Restart 时这一趟已经**完整收尾**了：MP4 关了（能播）、RTSP 停了、
+  /// 统计是齐的。调用方拿新的 SessionOptions 再调一次即可 —— 之所以要重来
+  /// 一趟而不是就地改，是因为编码器的 SPS/PPS、MP4 的轨道头、SDP 里的
+  /// `sprop-parameter-sets` 都在创建时就把尺寸写死了。
+  RunResult run(SessionOptions const& opt, std::string& err);
 
   /// 每秒一次的统计回调，**在采集线程上**调用（就是跑 `run()` 的那个线程）。
   ///

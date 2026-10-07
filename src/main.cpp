@@ -21,6 +21,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -776,6 +777,13 @@ int cmd_firewall(ParsedArgs const& args) {
   return 0;
 }
 
+/// 一次运行里最多重开几段。录制中途换分辨率是正常事件（插拔显示器、切用户、
+/// 游戏全屏），每换一次就要把编码器/封装/SDP 整条链重建一遍，所以它是有代价
+/// 的；而**反复**重建说明有东西在不停切模式（有些程序切进全屏会连切好几次）。
+/// 到这个上限就停下来，而不是无限重开 —— 那会变成"一直在重开、什么都没录到"，
+/// 比明确报错难查得多。
+constexpr int kMaxSegments = 8;
+
 int cmd_run(ParsedArgs const& args) {
   d2o::SessionOptions opt;
 
@@ -1285,11 +1293,84 @@ int cmd_run(ParsedArgs const& args) {
         });
   }
 
-  bool const ok = session.run(opt, err);
+  // --- 采集：跑一段，中途换分辨率就接着再跑一段 ---------------------------
+  //
+  // **为什么是个循环**：录制中途显示器换了分辨率（插拔、切换用户、游戏全屏、
+  // 改显示设置）之后，编码器的 SPS/PPS、MP4 的轨道头、SDP 里的
+  // sprop-parameter-sets 全都绑死在旧尺寸上，就地改不了 —— 硬换只会得到一个
+  // 解不出来的流。而 CaptureSession::run() 里的编码器、封装器、RTSP 服务
+  // 全都是它自己的局部变量，所以"把整条链重建一遍"就是"再调一次 run()"。
+  //
+  // 文件按段落盘：第一段用用户给的名字，之后是 main.1.mp4、main.2.mp4 ——
+  // 一个 MP4 轨道装不下两种分辨率，硬写进去就是个解不开的文件。名字由这里
+  // 决定而不是由 CaptureSession 决定：文件怎么摆是命令行的事。
+  d2o::SessionOptions seg = opt;
+  d2o::CaptureSession::RunResult res = d2o::CaptureSession::RunResult::Finished;
+  std::chrono::steady_clock::time_point const run_start =
+      std::chrono::steady_clock::now();
+  int segment = 0;
+  for (;;) {
+    res = session.run(seg, err);
+    if (res != d2o::CaptureSession::RunResult::Restart) break;
+
+    ++segment;
+    if (segment > kMaxSegments) {
+      err = d2o::fmt("中途换分辨率超过 %d 次，停下来 —— 再重开下去就成了"
+                     "反复重建而录不到东西。用一个固定的显示模式，或者先关掉"
+                     "会自动切分辨率的程序。",
+                     kMaxSegments);
+      res = d2o::CaptureSession::RunResult::Failed;
+      break;
+    }
+
+    // 时间预算是**整段运行**的，不是每段一份：--seconds 20 在两段里也是 20 秒。
+    if (opt.seconds > 0) {
+      double const used = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - run_start)
+                              .count();
+      int const left = opt.seconds - static_cast<int>(used);
+      if (left < 1) {
+        // 剩下的时间不够再录一段了。这一段已经完整收尾，就当正常结束。
+        res = d2o::CaptureSession::RunResult::Finished;
+        break;
+      }
+      seg.seconds = left;
+    }
+
+    // 下一段的文件名：main.mp4 → main.1.mp4（没有扩展名就往后接）。
+    d2o::SessionStats const& done = session.stats();
+    std::string next_file;
+    if (!opt.output_path.empty()) {
+      std::string const& base = opt.output_path;
+      std::size_t const dot = base.find_last_of('.');
+      std::size_t const slash = base.find_last_of("/\\");
+      bool const has_ext =
+          dot != std::string::npos && dot != 0 &&
+          (slash == std::string::npos || dot > slash + 1);
+      next_file = has_ext
+                      ? base.substr(0, dot) + "." + std::to_string(segment) +
+                            base.substr(dot)
+                      : base + "." + std::to_string(segment);
+    }
+    seg.output_path = next_file;
+
+    std::printf("\n");
+    if (!opt.output_path.empty()) {
+      std::printf("这一段录到 %s —— %s\n", opt.output_path.c_str(),
+                  done.summary().c_str());
+    } else {
+      std::printf("采集尺寸变了，重开会话继续推流 —— %s\n",
+                  done.summary().c_str());
+    }
+    std::printf("接着录：换分辨率之后编码器/封装/SDP 都得按新尺寸重建，"
+                "所以从这里另起一段%s。\n",
+                next_file.empty() ? "" : ("（" + next_file + "）").c_str());
+  }
+
   // 先停 Web 再做后面的打印：否则采集已经结束、web 还在推最后一帧旧数据，
   // 用户看到的是"进程要退了页面还在跳"。
   web.stop();
-  if (!ok) {
+  if (res == d2o::CaptureSession::RunResult::Failed) {
     std::fprintf(stderr, "\n失败：%s\n", err.c_str());
     return 1;
   }
@@ -1300,6 +1381,10 @@ int cmd_run(ParsedArgs const& args) {
     std::printf("  文件    : %s\n", opt.output_path.c_str());
   }
   std::printf("  统计    : %s\n", s.summary().c_str());
+  if (segment > 0) {
+    std::printf("  分段    : 共 %d 段（中途换了 %d 次分辨率）\n", segment + 1,
+                segment);
+  }
 
   std::printf("\n验证一下：\n");
   if (!opt.output_path.empty()) {

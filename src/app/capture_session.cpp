@@ -35,12 +35,29 @@ using SteadyClock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 using std::chrono::nanoseconds;
 
-/// 捕获会话连续重建失败多少次就放弃。会话失效是正常事件，但一直重建不起来
-/// 说明是硬件层面的事（显示器拔了、驱动挂了），继续转没有意义。
-constexpr int kMaxRecoverAttempts = 10;
+/// 连续重建失败多少次之后把告警降频。**这不是"放弃"**：显示器被拔掉、系统
+/// 休眠、切换用户都会让会话在一段时间里根本建不起来，而"过一会儿插回来"是
+/// 常态。放弃等于交给用户一台"显示器碰一下就死"的摄像机，而它连一句"我放弃
+/// 了"都只说一次。改成降频重试之后，插回来就自动接着录。
+constexpr int kNoisyRecoverAttempts = 10;
+
+/// 降频之后每隔这么多秒再报一次，免得挂一整夜刷出几万行日志。
+constexpr int kRecoverWarnIntervalSeconds = 60;
+
+/// 会话失效之后隔多久做第一次重建。显示模式切换要几帧才稳定，立刻重建多半
+/// 再失败一次；但也不能久 —— 这段时间画面是停住的。
+constexpr int kFirstRecoverDelayMs = 150;
+
+/// 重建失败的重试间隔上限。退让到这个值就封顶：再长的话显示器插回来了却要
+/// 等半天才恢复。
+constexpr int kMaxRecoverDelayMs = 2000;
 
 /// 落后超过这么多秒就重设时间基准，见 run() 里的说明。
 constexpr int kMaxLagSeconds = 2;
+
+/// 编码线程判断"队列空了"用的超时。**它只是轮询间隔，不是停机信号** ——
+/// 停机走 close()。见 BoundedQueue::PopStatus。
+using QueuePopStatus = BoundedQueue<CapturedFrame>::PopStatus;
 
 /// Ctrl+C。默认行为是直接终止进程 —— 那样 MP4 的索引写不完，文件是坏的。
 std::atomic<bool> g_interrupted{false};
@@ -236,7 +253,19 @@ struct Pipeline {
     std::uint64_t last_content_id = 0;
     bool have_last = false;
 
-    while (queue->pop(f, milliseconds(200))) {
+    // **只有"队列关了"才是收工信号。** 空队列等超时只是"采集侧暂时没帧"，
+    // 必须接着等 —— 把它也当成收工就会让编码线程在一次 200 ms 的采集停顿之后
+    // 静默退出（不设 failed、不打日志），录制和推流从此全停而进程照常跑到
+    // 时间结束、退出码 0。成因与后果见 BoundedQueue::PopStatus 的注释。
+    //
+    // 采集侧真正会停顿的地方不少：DXGI 重建会话的退让、锁屏、切分辨率、
+    // 显示器休眠、系统卡顿。也就是说这不是一条罕见的边界，而是**任何一次
+    // 停顿都会踩**的路。
+    for (;;) {
+      auto const st = queue->pop(f, milliseconds(200));
+      if (st == QueuePopStatus::Closed) break;
+      if (st == QueuePopStatus::Timeout) continue;
+
       if (!f.image) continue;
 
       // 画面自上一帧以来变了没有。没变时编码器跳过整帧色彩转换，
@@ -349,7 +378,8 @@ std::shared_ptr<BgraFrame const> CaptureSession::snapshot() const {
   return snapshot_;
 }
 
-bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
+CaptureSession::RunResult CaptureSession::run(SessionOptions const& opt,
+                                              std::string& err) {
   stop_.store(false, std::memory_order_relaxed);
   stats_ = SessionStats{};
 
@@ -360,7 +390,7 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
   if (opt.output_path.empty() && !opt.rtsp.enabled && !stats_hook_) {
     err = "既没有指定输出文件也没有开推流，那就没有任何事可做。"
           "给个 --record <文件> 或者 --rtsp。";
-    return false;
+    return RunResult::Failed;
   }
 
 #ifdef _WIN32
@@ -374,12 +404,12 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
   std::vector<OutputInfo> outputs = enumerate_outputs();
   if (outputs.empty()) {
     err = "没有找到任何显示输出";
-    return false;
+    return RunResult::Failed;
   }
   if (opt.display_index >= outputs.size()) {
     err = fmt("--display %u 超出范围，本机只有 %zu 个输出。用 --list-displays 看清单",
               opt.display_index, outputs.size());
-    return false;
+    return RunResult::Failed;
   }
   OutputInfo const& out = outputs[opt.display_index];
   D2O_INFO("目标输出：#%u %s", opt.display_index, describe(out).c_str());
@@ -391,25 +421,25 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
     err = fmt("这个输出无法做桌面复制：\n    %s\n  输出：%s\n"
               "  用 --list-displays 看全部输出，选一个标着 [可捕获] 的换 --display 序号",
               probe.message.c_str(), describe(out).c_str());
-    return false;
+    return RunResult::Failed;
   }
 
   // --- 2. 捕获会话 --------------------------------------------------------
   DesktopCapture capture;
-  if (!capture.open(out, err)) return false;
+  if (!capture.open(out, err)) return RunResult::Failed;
 
   int const w = capture.width();
   int const h = capture.height();
   if (w <= 0 || h <= 0) {
     err = fmt("拿到的桌面尺寸不合法：%dx%d", w, h);
-    return false;
+    return RunResult::Failed;
   }
   if ((w % 2) != 0 || (h % 2) != 0) {
     // H.264 的 4:2:0 色度是半分辨率，宽高必须是偶数。外接奇异分辨率的显示器
     // 会碰到（历史上有一些 1366x768 之外的非标准模式）。
     err = fmt("桌面尺寸 %dx%d 不是偶数，H.264 编不了。"
               "改一下显示分辨率再录（Phase 6 会加裁剪处理）", w, h);
-    return false;
+    return RunResult::Failed;
   }
 
   // 尺寸要在**采集循环开始之前**就填好：ONVIF 的 GetProfiles 可能在这之前
@@ -437,7 +467,7 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
   ec.global_header = true;
 
   X264Encoder encoder;
-  if (!encoder.open(ec, err)) return false;
+  if (!encoder.open(ec, err)) return RunResult::Failed;
 
   // --- 3b. 子码流编码器 ---------------------------------------------------
   //
@@ -466,7 +496,7 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
       // 子码流的线程数**单独封顶**：它的像素只有主码流的几十分之一，按核数
       // 开线程纯属浪费，还会和主码流抢 CPU。
       sc.threads = std::min(opt.threads > 0 ? opt.threads : 6, 2);
-      if (!sub_encoder.open(sc, err)) return false;
+      if (!sub_encoder.open(sc, err)) return RunResult::Failed;
       D2O_INFO("子码流已启用：%dx%d（%.0f kbps）", sub_w, sub_h,
                static_cast<double>(opt.sub_bitrate_kbps));
     } else {
@@ -484,7 +514,7 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
   Mp4Writer writer;
   Mp4Consumer mp4;
   if (!opt.output_path.empty()) {
-    if (!writer.open(opt.output_path, encoder.codec_context(), err)) return false;
+    if (!writer.open(opt.output_path, encoder.codec_context(), err)) return RunResult::Failed;
     mp4.writer = &writer;
   }
 
@@ -499,7 +529,7 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
     extras.push_back(encoder.extradata());
     if (sub_on) extras.push_back(sub_encoder.extradata());
 
-    if (!rtsp.start(opt.rtsp, extras, err)) return false;
+    if (!rtsp.start(opt.rtsp, extras, err)) return RunResult::Failed;
 
     rtsp_consumer.server = &rtsp;
     rtsp_consumer.stream = 0;
@@ -593,11 +623,19 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
   std::uint64_t tick = 0;
   std::uint64_t content_id = 0;
   std::shared_ptr<const BgraFrame> last;
+  /// 连续重建失败次数。成功取到一帧就归零 —— 它驱动的是"多久再试一次"和
+  /// "还要不要每次都报"，不是"什么时候放弃"（**没有放弃这回事**）。
   int recover_attempts = 0;
+  /// 会话已经失效、正等着重建。为真时这一拍不采集，画面沿用上一帧。
+  bool session_down = false;
+  SteadyClock::time_point next_recover_at{};
+  SteadyClock::time_point next_recover_warn{};
   bool warned_pool = false;
   bool warned_no_content = false;
   bool logged_cursor = false;
   bool fatal = false;
+  /// 采集尺寸变了，需要调用方重建整条链。见 RunResult::Restart。
+  bool restart = false;
   SteadyClock::time_point next_report = start + std::chrono::seconds(1);
 
   while (!stop_.load(std::memory_order_relaxed) &&
@@ -626,6 +664,56 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
       }
     }
 
+    // --- 会话恢复 ---------------------------------------------------------
+    //
+    // 重建**不提在 acquire 的重试循环里做**，而是放到这一层。理由有二：
+    //
+    //   * 重建失败的退让是秒级的（显示器拔了要等它插回来），睡在"这一拍剩下的
+    //     时间里多要几次帧"那个循环里，等于让重试节奏去决定采集的时间轴；
+    //     放在这里，恢复期间每一拍照常推进 tick、照常出报表。
+    //   * 会话没建起来的时候 acquire() 会返回 Fatal（dup_ 是空的），而它没法
+    //     区分"没有会话"和"别的致命错"。句柄空着就不去调它，是唯一稳妥的做法。
+    //
+    // 恢复期间照常把上一帧入队：NVR 那边看到的是画面停住，而不是流断掉。
+    if (session_down) {
+      SteadyClock::time_point const now = SteadyClock::now();
+      if (now >= next_recover_at) {
+        std::string rerr;
+        if (capture.reopen(rerr)) {
+          D2O_INFO("捕获会话已重建（累计 %llu 次）",
+                   static_cast<unsigned long long>(stats_.access_lost));
+          if (recover_attempts > 0) {
+            D2O_INFO("（连续失败 %d 次之后重建成功，录制继续）", recover_attempts);
+          }
+          session_down = false;
+          if (capture.width() != w || capture.height() != h) {
+            // 尺寸变了。**就地改不了**：编码器的 SPS/PPS、MP4 的轨道头、
+            // SDP 里的 sprop-parameter-sets 和新尺寸的 avcC 全都绑死在旧值上，
+            // 硬换只会得到一个解不出来的流。交给调用方把整条链重建一遍
+            // （见 CaptureSession::RunResult::Restart）。
+            D2O_WARN("采集尺寸从 %dx%d 变成 %dx%d：编码器、MP4 轨道和 SDP 里"
+                     "都写死了旧尺寸，就地换不了。这一段落盘收尾，下一段按新"
+                     "尺寸重开。",
+                     w, h, capture.width(), capture.height());
+            restart = true;
+            break;
+          }
+        } else {
+          ++recover_attempts;
+          // 前几次每次都报（好定位），之后每分钟报一次（免得刷屏）。**不放弃。**
+          if (recover_attempts <= kNoisyRecoverAttempts || now >= next_recover_warn) {
+            D2O_WARN("重建捕获会话失败（第 %d 次）：%s —— 继续重试，显示器接回来"
+                     "之后会自动接着录",
+                     recover_attempts, rerr.c_str());
+            next_recover_warn =
+                now + std::chrono::seconds(kRecoverWarnIntervalSeconds);
+          }
+          next_recover_at =
+              now + milliseconds(std::min(150 * recover_attempts, kMaxRecoverDelayMs));
+        }
+      }
+    }
+
     BgraFrame* buf = pool->take();
     if (!buf) {
       // 池子空了：编码 + 写出已经落后一整个池子的量。跳过这一帧。
@@ -643,6 +731,9 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
 
     bool got_content = false;
     for (;;) {
+      // 会话正等着重建（见上面那一段）。句柄是空的，acquire 只会回 Fatal。
+      if (session_down) break;
+
       SteadyClock::time_point const now = SteadyClock::now();
       if (now >= deadline) break;
 
@@ -661,32 +752,14 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
       } else if (st == DesktopCapture::Status::Timeout) {
         continue;  // 桌面没动，看看这一拍剩下的时间里会不会动
       } else if (st == DesktopCapture::Status::AccessLost) {
+        // **不做原地重建，也不睡觉**：标一下，这一拍就到此为止，下一拍由上面
+        // 那段统一处理。在这里重建会睡 150~2000 ms，而采集循环一停，编码队列
+        // 就见底 —— 以前这一停正是把编码线程"劝退"的原因（见 PopStatus）。
         ++stats_.access_lost;
-        ++recover_attempts;
-        if (recover_attempts > kMaxRecoverAttempts) {
-          err = fmt("捕获会话连续 %d 次重建失败，放弃", kMaxRecoverAttempts);
-          fatal = true;
-          break;
-        }
-        // 切换分辨率/锁屏之后立刻重建多半会再失败一次，退让一下。
-        std::this_thread::sleep_for(
-            milliseconds(std::min(200 * recover_attempts, 1000)));
-        std::string rerr;
-        if (!capture.reopen(rerr)) {
-          D2O_WARN("重建捕获会话失败（第 %d/%d 次）：%s", recover_attempts,
-                   kMaxRecoverAttempts, rerr.c_str());
-          continue;
-        }
-        D2O_INFO("捕获会话已重建（累计 %llu 次）",
-                 static_cast<unsigned long long>(stats_.access_lost));
-        if (capture.width() != w || capture.height() != h) {
-          err = fmt("录制中途分辨率从 %dx%d 变成了 %dx%d。"
-                    "流里换分辨率需要重开会话（Phase 6 的内容）",
-                    w, h, capture.width(), capture.height());
-          fatal = true;
-          break;
-        }
-        recover_attempts = 0;
+        session_down = true;
+        next_recover_at =
+            SteadyClock::now() + milliseconds(kFirstRecoverDelayMs);
+        break;
       } else {
         err = aerr;
         fatal = true;
@@ -806,14 +879,14 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
     // 而漏掉它会让收尾报表上每一路的数字全是 0。
     if (opt.rtsp.enabled) fill_rtsp_stats(stats_, rtsp, pipeline);
     err = fmt("编码线程出错：%s（已写出的部分仍会保存）", werr.c_str());
-    return false;
+    return RunResult::Failed;
   }
   if (fatal) {
     // 采集侧出错，err 里已经是原因了。同样把已写出的部分收尾。
     std::string ignored;
     if (!opt.output_path.empty()) writer.close(ignored);
     if (opt.rtsp.enabled) fill_rtsp_stats(stats_, rtsp, pipeline);
-    return false;
+    return RunResult::Failed;
   }
 
   // 冲刷编码器里剩下的帧。少这一步最后几帧会丢 —— 它们还在 x264 的内部缓冲里。
@@ -859,12 +932,16 @@ bool CaptureSession::run(SessionOptions const& opt, std::string& err) {
   // 对主码流那一路就是照抄它们。早一步调用，两处会差着冲刷的那几帧。
   if (opt.rtsp.enabled) fill_rtsp_stats(stats_, rtsp, pipeline);
 
-  if (!opt.output_path.empty() && !writer.close(err)) return false;
+  if (!opt.output_path.empty() && !writer.close(err)) return RunResult::Failed;
 
   stats_.effective_fps = stats_.elapsed_s > 0
                              ? static_cast<double>(stats_.packets) / stats_.elapsed_s
                              : 0.0;
-  return true;
+
+  // 走到这里说明这一趟**已经完整收尾**：编码线程 join 了、编码器冲干净了、
+  // 文件关了（能播）、RTSP 停了。所以 Restart 和 Finished 的差别只是"要不要
+  // 再来一趟"，不是"成没成功"。
+  return restart ? RunResult::Restart : RunResult::Finished;
 }
 
 }  // namespace d2o

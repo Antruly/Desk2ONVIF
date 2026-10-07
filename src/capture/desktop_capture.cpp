@@ -79,13 +79,81 @@ bool DesktopCapture::open(OutputInfo const& out, std::string& err) {
   close();
   adapter_index_ = out.adapter_index;
   output_index_ = out.output_index;
+  device_name_ = out.device_name;
   width_ = out.width();
   height_ = out.height();
   return create_session(err);
 }
 
+bool DesktopCapture::pick_output(IDXGIFactory1* factory, IDXGIAdapter1** adapter_out,
+                                 IDXGIOutput** output_out, std::string& err) {
+  // --- 1. 按设备名找 -------------------------------------------------------
+  //
+  // **先按名字，不先按下标。** 下标只在"枚举顺序没变过"的前提下才等价于
+  // "同一台显示器"，而显示器一插一拔、切换主副屏、驱动重载都会让它错位。
+  // 错位之后 EnumOutputs 照样成功 —— 它指向的是另一台显示器，于是录屏安静地
+  // 换成了别人的桌面，没有任何一条错误信息。名字是唯一稳定的标识。
+  if (!device_name_.empty()) {
+    for (UINT ai = 0;; ++ai) {
+      ComPtr<IDXGIAdapter1> ad;
+      if (FAILED(factory->EnumAdapters1(ai, ad.put())) || !ad) break;
+      for (UINT oi = 0;; ++oi) {
+        ComPtr<IDXGIOutput> op;
+        if (FAILED(ad->EnumOutputs(oi, op.put())) || !op) break;
+        DXGI_OUTPUT_DESC d{};
+        if (FAILED(op->GetDesc(&d))) continue;
+        if (device_name_ != to_utf8(d.DeviceName)) continue;
+
+        if (ai != adapter_index_ || oi != output_index_) {
+          // 换了适配器的话，D3D 设备和中转纹理都是**旧适配器**上的东西，
+          // 必须一起丢掉重建 —— 拿旧设备去 DuplicateOutput 新适配器的输出
+          // 会返回 E_INVALIDARG，而那条路看起来像"这台显示器不支持复制"。
+          D2O_INFO("目标输出 %s 的枚举下标变了：#%u/%u → #%u/%u，已重新定位",
+                   device_name_.c_str(), adapter_index_, output_index_, ai, oi);
+          if (ai != adapter_index_) {
+            device_.reset();
+            context_.reset();
+          }
+          staging_.reset();
+          adapter_index_ = ai;
+          output_index_ = oi;
+        }
+        *adapter_out = ad.detach();
+        *output_out = op.detach();
+        return true;
+      }
+    }
+  }
+
+  // --- 2. 退回按下标找 -----------------------------------------------------
+  //
+  // 走到这里有两种情况：设备名是空的（老调用方），或者那块屏此刻真的不在
+  // 枚举里。后者会在下面以"枚举输出失败"收场，而调用方会带着退让重试 ——
+  // 显示器插回来之后就又能按名字找到了。
+  ComPtr<IDXGIAdapter1> adapter;
+  HRESULT hr = factory->EnumAdapters1(adapter_index_, adapter.put());
+  if (FAILED(hr) || !adapter) {
+    err = fmt("枚举适配器 %u 失败：%s", adapter_index_,
+              hresult_text(static_cast<long>(hr)).c_str());
+    return false;
+  }
+  ComPtr<IDXGIOutput> output;
+  hr = adapter->EnumOutputs(output_index_, output.put());
+  if (FAILED(hr) || !output) {
+    std::string const who = device_name_.empty() ? std::string("该输出")
+                                                 : (device_name_ + " 这台显示器");
+    err = fmt("枚举输出 %u 失败：%s —— %s此刻不在输出列表里（断开了？）",
+              output_index_, hresult_text(static_cast<long>(hr)).c_str(),
+              who.c_str());
+    return false;
+  }
+  *adapter_out = adapter.detach();
+  *output_out = output.detach();
+  return true;
+}
+
 bool DesktopCapture::create_session(std::string& err) {
-  // --- 1. 工厂与适配器 -----------------------------------------------------
+  // --- 1. 工厂、适配器、输出 ----------------------------------------------
   ComPtr<IDXGIFactory1> factory;
   HRESULT hr = ::CreateDXGIFactory1(__uuidof(IDXGIFactory1),
                                     reinterpret_cast<void**>(factory.put()));
@@ -95,21 +163,8 @@ bool DesktopCapture::create_session(std::string& err) {
   }
 
   ComPtr<IDXGIAdapter1> adapter;
-  hr = factory->EnumAdapters1(adapter_index_, adapter.put());
-  if (FAILED(hr) || !adapter) {
-    err = fmt("枚举适配器 %u 失败：%s", adapter_index_,
-              hresult_text(static_cast<long>(hr)).c_str());
-    return false;
-  }
-
   ComPtr<IDXGIOutput> output;
-  hr = adapter->EnumOutputs(output_index_, output.put());
-  if (FAILED(hr) || !output) {
-    // 显示器拔掉了、或者下标因为枚举顺序变了而错位。
-    err = fmt("枚举输出 %u 失败：%s —— 显示器可能已经断开，重新 --list-displays 看看",
-              output_index_, hresult_text(static_cast<long>(hr)).c_str());
-    return false;
-  }
+  if (!pick_output(factory.get(), adapter.put(), output.put(), err)) return false;
 
   DXGI_OUTPUT_DESC od{};
   if (SUCCEEDED(output->GetDesc(&od))) {
