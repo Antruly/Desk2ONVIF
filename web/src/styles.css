@@ -1,0 +1,1158 @@
+/*
+ * Desk2ONVIF 控制台的全局样式与设计系统。
+ *
+ * ## 为什么是深色 + 青紫
+ *
+ * 这不是审美偏好：这一页有一半时间是当"监控画面墙"用的，旁边永远开着一个
+ * 视频预览。深色底不会在暗环境里把屏幕变成一块光源，青/紫两色在低亮度下
+ * 的对比度也远好过红绿（而红绿对约 8% 的男性读者根本区分不出来）。
+ *
+ * ## 两条纪律
+ *
+ * 1. **颜色只用来表达状态，而且永远跟着一个文字标签。** 文字一律走
+ *    `--text` / `--text-2` / `--text-3` 这三档灰蓝。只靠颜色表意的控件，
+ *    在灰阶截图、色觉障碍、以及"用户只是没注意到那个小圆点"这三种情况下
+ *    都会失效。
+ * 2. **数字一律等宽 + `tabular-nums`。** 这一页每秒刷新一次，比例字体的
+ *    数字宽度不一样，整块面板会左右抖 —— 抖动的面板读不出趋势。
+ *
+ * 下面所有颜色都集中在 token 里，页面和组件里不要再写裸 hex。
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* 底色。--bg 是页面最底层，背景光效叠在它上面。 */
+  --bg: #070b14;
+  --bg-2: #0a1120;
+
+  /* 面板。半透明是为了让背景的网格和光晕透上来一点 —— 全不透明的卡片
+     会把背景层完全遮住，那层就白做了。但也不能太透：表格和输入框压在上面
+     时对比度会掉到读不清。 */
+  --surface: rgba(16, 27, 46, 0.72);
+  --surface-solid: #101b2e;
+  --surface-2: rgba(30, 47, 76, 0.55);
+  --surface-3: rgba(44, 66, 102, 0.5);
+
+  --border: rgba(0, 212, 255, 0.14);
+  --border-strong: rgba(0, 212, 255, 0.3);
+
+  --text: #e9f2ff;
+  --text-2: #9db2d2;
+  --text-3: #66799a;
+
+  --primary: #00d4ff;
+  --primary-dim: #0891b2;
+  --accent: #a78bfa;
+
+  /* 状态色。三个都挑了在深底上能过 WCAG AA 正文对比度的色相。 */
+  --good: #2dd4a7;
+  --warn: #fbbf24;
+  --crit: #fb7185;
+
+  --glow: rgba(0, 212, 255, 0.35);
+
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+
+  --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+
+  /* 动效时长。三档，够用了：
+     .15s 悬停反馈 / .25s 卡片与面板 / .4s 布局变化。
+     再长会让人觉得"卡"，再短则看不出发生了什么。 */
+  --t-fast: 0.15s ease;
+  --t-base: 0.25s ease;
+  --t-slow: 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+  /* 窄屏下不该出现横向滚动条；个别宽内容（表格、代码）自己滚。 */
+  overflow-x: hidden;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+a {
+  color: var(--primary);
+  text-decoration: none;
+  transition: color var(--t-fast);
+}
+
+a:hover {
+  color: var(--accent);
+}
+
+/* 数字统一等宽 + 定宽数字：实时刷新时字宽不变，整块面板才不会左右抖。 */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+}
+
+/* 键盘用户必须能看见焦点在哪。鼠标点击不显示（:focus-visible 的语义），
+   所以不会影响观感。 */
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ---------- 布局骨架 ---------- */
+
+.app {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 10px 24px;
+  background: rgba(9, 15, 28, 0.82);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar::after {
+  /* 顶栏底部那道光。用伪元素而不是 border-bottom，因为 border 只能是一色。 */
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--primary), var(--accent), transparent);
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.brand .brand-mark {
+  color: var(--primary);
+  filter: drop-shadow(0 0 8px var(--glow));
+}
+
+.brand .brand-sub {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.nav {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+.nav a {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: 13.5px;
+  border: 1px solid transparent;
+  transition: all var(--t-fast);
+}
+
+.nav a:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* 当前页用**底色 + 边框 + 底部高亮**三重表示，不只靠颜色 —— 单看色差在
+   低亮度屏幕上几乎看不出来。 */
+.nav a.router-link-active {
+  background: linear-gradient(180deg, rgba(0, 212, 255, 0.16), rgba(0, 212, 255, 0.05));
+  border-color: var(--border-strong);
+  color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.page {
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 22px 24px 56px;
+}
+
+.page-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.page-head h1 {
+  font-size: 22px;
+  margin: 0;
+}
+
+/* 标题左侧那道竖线，和背景的"科技感"呼应。 */
+.page-head h1::before {
+  content: '';
+  display: inline-block;
+  width: 3px;
+  height: 15px;
+  margin-right: 10px;
+  vertical-align: -1px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--primary), var(--accent));
+  box-shadow: 0 0 10px var(--glow);
+}
+
+h2 {
+  font-size: 15px;
+  margin: 0 0 14px;
+  color: var(--text);
+}
+
+.muted {
+  color: var(--text-3);
+}
+
+.hint {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+.tone-good {
+  color: var(--good);
+}
+.tone-warn {
+  color: var(--warn);
+}
+.tone-crit {
+  color: var(--crit);
+}
+
+/* ---------- 卡片 ---------- */
+
+.card {
+  position: relative;
+  background: var(--surface);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  margin-bottom: 18px;
+  overflow: hidden;
+  transition: transform var(--t-base), border-color var(--t-base), box-shadow var(--t-base);
+}
+
+/* 卡片顶部一道 1px 的渐变光，和顶栏呼应。 */
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 16px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--primary), var(--accent), transparent);
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+/* 悬停时扫过一道光。用伪元素 + transform，不触发重排。
+   **只在真能悬停的设备上开**（`hover: hover`）—— 触屏上 :hover 会粘住，
+   手指划过去之后卡片会一直保持抬起的状态，看起来像坏了。 */
+@media (hover: hover) {
+  .card:hover {
+    transform: translateY(-2px);
+    border-color: var(--border-strong);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 24px rgba(0, 212, 255, 0.07);
+  }
+
+  .card::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: -60%;
+    width: 40%;
+    background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.045), transparent);
+    transform: skewX(-18deg);
+    pointer-events: none;
+    transition: left 0.65s ease;
+  }
+
+  .card:hover::after {
+    left: 130%;
+  }
+}
+
+/* ---------- 状态标记 ---------- */
+
+/* 状态色**永远**搭配文字。圆点只是让它在余光里也能被扫到。 */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12.5px;
+  white-space: nowrap;
+  transition: border-color var(--t-fast), color var(--t-fast);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+  transition: background var(--t-base), box-shadow var(--t-base);
+}
+
+.pill.is-online {
+  color: var(--text);
+  border-color: rgba(45, 212, 167, 0.4);
+}
+.pill.is-online .dot {
+  background: var(--good);
+  box-shadow: 0 0 8px var(--good);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+.pill.is-connecting {
+  color: var(--text);
+  border-color: rgba(251, 191, 36, 0.4);
+}
+.pill.is-connecting .dot {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+  animation: pulse 1s ease-in-out infinite;
+}
+.pill.is-offline {
+  color: var(--text-2);
+  border-color: rgba(251, 113, 133, 0.4);
+}
+.pill.is-offline .dot {
+  background: var(--crit);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ---------- 指标块 ---------- */
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 12px;
+}
+
+.tile {
+  position: relative;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-width: 0;
+  overflow: hidden;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+
+.tile:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-3);
+}
+
+/* 左上角一个小直角，纯装饰，给指标块一点"仪表"的感觉。 */
+.tile::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 14px;
+  height: 14px;
+  border-top: 2px solid var(--primary);
+  border-left: 2px solid var(--primary);
+  border-top-left-radius: var(--radius);
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.tile-label {
+  color: var(--text-3);
+  font-size: 12px;
+  margin-bottom: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile-value {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.3;
+  word-break: break-all;
+}
+
+.tile-value.small {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.tile-unit {
+  font-size: 12.5px;
+  color: var(--text-3);
+  margin-left: 4px;
+  font-weight: 400;
+}
+
+.tile-sub {
+  color: var(--text-3);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* 指标块的强调色：只用于数值，且每个都带一个说明文字在旁边。 */
+.tile-value.tone-good {
+  color: var(--good);
+}
+.tile-value.tone-warn {
+  color: var(--warn);
+}
+.tile-value.tone-crit {
+  color: var(--crit);
+}
+
+/* ---------- 按钮 ---------- */
+
+.btn,
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 7px 15px;
+  font: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--t-fast);
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--surface-3);
+  box-shadow: 0 0 14px rgba(0, 212, 255, 0.12);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.primary {
+  background: linear-gradient(135deg, var(--primary-dim), var(--primary) 55%, var(--accent));
+  background-size: 180% 180%;
+  border-color: transparent;
+  color: #04121b;
+  font-weight: 600;
+  box-shadow: 0 4px 15px rgba(0, 212, 255, 0.3);
+}
+
+button.primary:hover:not(:disabled) {
+  background-position: 100% 0;
+  box-shadow: 0 6px 22px rgba(0, 212, 255, 0.42);
+  color: #04121b;
+}
+
+button.ghost {
+  background: transparent;
+  border-color: var(--border);
+}
+
+button.danger {
+  border-color: rgba(251, 113, 133, 0.45);
+  color: var(--crit);
+}
+
+button.danger:hover:not(:disabled) {
+  background: rgba(251, 113, 133, 0.12);
+  border-color: var(--crit);
+  box-shadow: 0 0 14px rgba(251, 113, 133, 0.18);
+}
+
+button.icon-only {
+  padding: 7px 9px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* ---------- 提示条 ---------- */
+
+.banner {
+  position: relative;
+  border: 1px solid var(--border-strong);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  /* pre-wrap：后端返回的错误正文里可能有换行，压成一行会读不出来。 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.banner strong {
+  color: var(--text);
+}
+
+.banner.is-ok {
+  border-left-color: var(--good);
+  background: rgba(45, 212, 167, 0.07);
+}
+.banner.is-err {
+  border-left-color: var(--crit);
+  background: rgba(251, 113, 133, 0.07);
+}
+.banner.is-warn {
+  border-left-color: var(--warn);
+  background: rgba(251, 191, 36, 0.07);
+}
+
+/* ---------- 表单 ---------- */
+
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 4px 18px 18px;
+  margin: 0 0 18px;
+  background: var(--surface);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+legend {
+  padding: 0 10px;
+  color: var(--text);
+  font-weight: 600;
+  font-size: 13.5px;
+  letter-spacing: 0.04em;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
+  gap: 14px 18px;
+}
+
+label.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.field-label {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+input[type='text'],
+input[type='number'],
+input[type='password'],
+select {
+  background: rgba(6, 12, 22, 0.6);
+  border: 1px solid rgba(120, 155, 200, 0.24);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 7px 10px;
+  font: inherit;
+  min-width: 0;
+  width: 100%;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast), background var(--t-fast);
+}
+
+input::placeholder {
+  color: var(--text-3);
+}
+
+input:hover:not(:disabled),
+select:hover:not(:disabled) {
+  border-color: rgba(120, 155, 200, 0.4);
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--primary);
+  background: rgba(6, 12, 22, 0.85);
+  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.14);
+}
+
+input:disabled {
+  opacity: 0.5;
+}
+
+/* 下拉框：原生箭头在深色底上是浅灰的、位置也不受控，所以自己画一个。
+   用 data URI 的 SVG，不额外发请求。 */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%239db2d2' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5 8 10.5l4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 15px;
+  padding-right: 30px;
+  cursor: pointer;
+}
+
+/* 下拉弹出的是操作系统画的列表，深色底上需要显式声明配色，否则
+   在浅色系统主题下会弹出白底 + 浅色文字。 */
+select option {
+  background: #0e1830;
+  color: var(--text);
+}
+
+.field-error {
+  color: var(--crit);
+  font-size: 12px;
+}
+
+input.invalid {
+  border-color: var(--crit);
+}
+
+input.invalid:focus {
+  box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.16);
+}
+
+/* ---------- 开关 ---------- */
+
+/* 自绘的开关。原生 checkbox 在各浏览器里长得都不一样，而这个界面里
+   "开/关"是个高频操作，形状得稳定。
+   无障碍上没有妥协：真 input 还在（视觉隐藏但可聚焦、可被读屏朗读），
+   焦点环画在轨道上。 */
+label.field.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  padding-top: 18px;
+}
+
+label.check input[type='checkbox'] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+label.check .track {
+  position: relative;
+  flex: none;
+  width: 38px;
+  height: 21px;
+  border-radius: 999px;
+  background: rgba(6, 12, 22, 0.9);
+  border: 1px solid rgba(120, 155, 200, 0.3);
+  transition: background var(--t-base), border-color var(--t-base), box-shadow var(--t-base);
+}
+
+label.check .track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transition: transform var(--t-base), background var(--t-base);
+}
+
+label.check input:checked + .track {
+  background: linear-gradient(135deg, var(--primary-dim), var(--primary));
+  border-color: var(--primary);
+  box-shadow: 0 0 12px rgba(0, 212, 255, 0.35);
+}
+
+label.check input:checked + .track::after {
+  transform: translateX(17px);
+  background: #04121b;
+}
+
+label.check input:focus-visible + .track {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+label.check input:disabled + .track {
+  opacity: 0.45;
+}
+
+/* ---------- 「已保存但要重启」的清单 ---------- */
+
+/* 用列而不是顿号连排：通常有七八项，连成一行的结果是谁也不会去数到底是哪几项。 */
+.pending-list {
+  margin: 8px 0 8px;
+  padding-left: 20px;
+  columns: 2;
+}
+
+.pending-list li {
+  margin: 0;
+  break-inside: avoid;
+}
+
+/* ---------- 只读值（RTSP 地址一类） ---------- */
+
+.readonly-row {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.readonly-row + .readonly-row {
+  margin-top: 8px;
+}
+
+code.value {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: rgba(6, 12, 22, 0.7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 9px;
+  word-break: break-all;
+  color: var(--primary);
+}
+
+/* ---------- 表格 ---------- */
+
+.stream-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 14px;
+  font-size: 13px;
+}
+
+.stream-table th,
+.stream-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.stream-table th {
+  color: var(--text-3);
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.stream-table tbody tr {
+  transition: background var(--t-fast);
+}
+
+.stream-table tbody tr:hover {
+  background: rgba(0, 212, 255, 0.05);
+}
+
+.stream-table td code {
+  font-family: var(--mono);
+}
+
+/* 窄屏下七列挤成一团，让表格自己横向滚动，而不是把整页撑宽。 */
+.table-scroll {
+  overflow-x: auto;
+}
+
+/* ---------- 登录页 ---------- */
+
+.login-wrap {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  position: relative;
+  width: 100%;
+  max-width: 400px;
+  padding: 40px 34px 30px;
+  background: rgba(14, 24, 42, 0.86);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-strong);
+  border-radius: 20px;
+  box-shadow: 0 0 44px rgba(0, 212, 255, 0.1), 0 26px 60px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  animation: cardIn 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+@keyframes cardIn {
+  from {
+    opacity: 0;
+    transform: translateY(18px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.login-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--primary), var(--accent), transparent);
+}
+
+.login-head {
+  text-align: center;
+  margin-bottom: 30px;
+}
+
+.login-logo {
+  color: var(--primary);
+  filter: drop-shadow(0 0 18px var(--glow));
+  animation: logoGlow 3.4s ease-in-out infinite;
+}
+
+@keyframes logoGlow {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 14px rgba(0, 212, 255, 0.5));
+  }
+  50% {
+    filter: drop-shadow(0 0 24px rgba(0, 212, 255, 0.85));
+  }
+}
+
+.login-head h1 {
+  font-size: 23px;
+  margin: 16px 0 6px;
+  letter-spacing: 0.06em;
+}
+
+.login-head .sub {
+  color: var(--text-3);
+  font-size: 11.5px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.login-field {
+  display: block;
+  margin-bottom: 18px;
+}
+
+.login-field .field-label {
+  display: block;
+  margin-bottom: 7px;
+}
+
+/*
+ * 输入框里带图标。
+ *
+ * `.input-wrap` 只包住 input 本身（标签在它外面），图标才能用 `top: 50%`
+ * 对准输入框的中线 —— 把标签也包进来的话，图标会跑到"标签 + 输入框"这个
+ * 整体的中线上，看起来就是图标浮在标签旁边。
+ *
+ * 指针事件关掉，否则点到图标上输入框不聚焦。
+ */
+.input-wrap {
+  position: relative;
+  display: block;
+}
+
+.input-wrap .input-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-3);
+  pointer-events: none;
+  transition: color var(--t-fast);
+  display: flex;
+}
+
+.input-wrap:focus-within .input-icon {
+  color: var(--primary);
+}
+
+.input-wrap input {
+  height: 46px;
+  padding-left: 40px;
+  font-size: 15px;
+}
+
+.login-btn {
+  width: 100%;
+  height: 46px;
+  margin-top: 6px;
+  font-size: 14.5px;
+  letter-spacing: 0.18em;
+}
+
+/* 登录卡片里的提示条不再往下压 16px —— 它下面跟着的是按钮，不是段落。 */
+.login-card .banner {
+  margin-bottom: 18px;
+}
+
+.login-card .banner code.value {
+  font-size: 11.5px;
+  padding: 2px 6px;
+}
+
+.login-foot {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  text-align: center;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+/* ---------- 预览 ---------- */
+
+/* 舞台。黑底 + 一点点内阴影，让画面看起来是"嵌"在面板里的。 */
+.stage {
+  position: relative;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 260px;
+  padding: 0;
+  overflow: hidden;
+}
+
+/*
+ * 画面本体。
+ *
+ * `width/height: auto` + `aspect-ratio` + 两条 max 约束，等价于"按比例塞满
+ * 可用区域"，而且**不留黑边** —— 用 `width: 100%` 配 `object-fit: contain`
+ * 的话，遇到 3:2 的桌面（2880x1920）会在 16:9 的框里补出左右黑边，白白
+ * 浪费掉一块能显示画面的面积。`aspect-ratio` 由 JS 在 loadedmetadata 里
+ * 换成真实比例，这里的 16/9 只是第一帧到达之前的占位。
+ */
+.stage video {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 72vh;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  object-fit: contain;
+  margin: 0 auto;
+}
+
+/* 只有播起来了才把光标改成手型 —— 没画面时点它没有意义，而一个手型光标
+   会让人以为"点了应该发生什么"。 */
+.stage video.is-clickable {
+  cursor: pointer;
+}
+
+/* 全屏时画面上不该留边距，也不该被 72vh 卡住。 */
+.stage:fullscreen {
+  border: none;
+  border-radius: 0;
+  min-height: 100vh;
+  max-height: none;
+}
+
+.stage:fullscreen video {
+  max-height: 100vh;
+}
+
+/* 覆盖在画面上的实时状态。放在左上角，用半透明底和轻微模糊，
+   既看得清又不会盖住画面主体。 */
+.stage-overlay {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  pointer-events: none;
+}
+
+.stage-overlay .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  background: rgba(6, 12, 22, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+
+/* 播放器中央的那些状态（未就绪 / 出错 / 等待关键帧）。 */
+.stage-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+  padding: 24px;
+  color: var(--text-3);
+  pointer-events: none;
+}
+
+.stage-placeholder .ph-title {
+  color: var(--text-2);
+  font-size: 14px;
+}
+
+.stage-placeholder .ph-text {
+  font-size: 12.5px;
+  max-width: 46em;
+  line-height: 1.7;
+}
+
+.snapshot {
+  display: block;
+  max-width: 100%;
+  max-height: 460px;
+  object-fit: contain;
+}
+
+/* ---------- 工具类 ---------- */
+
+.scroll-x {
+  overflow-x: auto;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* 尊重系统的"减少动态效果"。这一页有常驻动画背景，对前庭敏感的人
+   是真的会难受，而且这个设置本来就该被尊重。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@media (max-width: 720px) {
+  .topbar {
+    padding: 9px 14px;
+    gap: 10px;
+  }
+
+  /* 窄屏下把品牌副标题收掉，不然顶栏会折成两三行。 */
+  .brand .brand-sub {
+    display: none;
+  }
+
+  .page {
+    padding: 16px 14px 44px;
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pending-list {
+    columns: 1;
+  }
+}

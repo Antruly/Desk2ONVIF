@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      图标内联成 data URI，不走文件。
+      理由是这个前端会被装到别人机器上的任意路径里，多一个要跟着 dist 走的
+      静态文件就多一处"路径没解析对"的失败方式；而这个图标一共不到 1 KB。
+      `#` 必须写成 %23 —— 在 data URI 里它是片段分隔符，不编码的话后面全被吃掉。
+    -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1120'/%3E%3Cg fill='none' stroke='%2300d4ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 12h13a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z'/%3E%3Cpath d='M24 16l4-3v9l-4-3z'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <!-- 让手机浏览器的地址栏也跟着变深，不然上面会留一条白边。 -->
+    <meta name="theme-color" content="#070b14" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Desk2ONVIF 控制台：桌面推流与 ONVIF 设备模拟的本地管理界面" />
+    <title>Desk2ONVIF 控制台</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

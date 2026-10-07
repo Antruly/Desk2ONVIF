@@ -1,0 +1,12 @@
+{
+  "name": "desk2onvif-browser-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "用本机已装的 Chrome 驱动真实浏览器，验 Web UI（登录、预览能不能播、页面长什么样）。",
+  "scripts": {
+    "probe": "node probe.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.63.0"
+  }
+}
