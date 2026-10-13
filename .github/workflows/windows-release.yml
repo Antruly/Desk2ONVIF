@@ -108,9 +108,30 @@ jobs:
 
       # --- 工具链 ------------------------------------------------------------
       #
-      # setup-msys2 默认装到 C:\msys64，而 scripts\build.ps1 的 -MsysRoot 默认值
-      # 和 build_live555.ps1 里找 bash.exe 的路径都写死了这个地方 —— 所以这里
-      # 不能改安装位置。
+      # 目标根是 `C:\msys64`：build.ps1 的 -MsysRoot 默认值、fetch_uvcpp.ps1 的
+      # -GccBin 默认值，以及 build_live555.ps1 里**写死**的那个
+      # C:\msys64\usr\bin\bash.exe 都认它。后两个脚本里前两个能传参覆盖，
+      # 但第三个不能 —— 所以换根就得改用户已经验过的脚本，不如让空壳挪位。
+      #
+      # runner 恰好自带一个 MSYS2 空壳在 `C:\msys64`（只有 usr\bin\bash.exe，
+      # 没有 mingw64\ 工具链），而 setup-msys2 见目标已存在就直接拒绝：
+      #   Trying to install MSYS2 to C:\msys64 but that already exists, cannot continue.
+      # 先改名而不是直接删：同一卷内改名是瞬时的，且万一后面还有东西要用它，
+      # 这一轮里翻得回去。改名失败（被占用）才退回删除。
+      - name: 让开 runner 自带的 C:\msys64 空壳
+        run: |
+          if (-not (Test-Path 'C:\msys64')) {
+            Write-Host 'C:\msys64 本来就不存在，无需让位'
+            exit 0
+          }
+          try {
+            Move-Item 'C:\msys64' 'C:\msys64.runner-base' -ErrorAction Stop
+            Write-Host '已改名为 C:\msys64.runner-base'
+          } catch {
+            Write-Host "改名失败（$($_.Exception.Message)），改为删除"
+            Remove-Item 'C:\msys64' -Recurse -Force
+            Write-Host '已删除'
+          }
       #
       # `make` 单独列：Live555 的 genMakefiles 产出的是 POSIX Makefile，
       # build_live555.sh 里调的是裸 `make`，它得从 /usr/bin 找得到。
