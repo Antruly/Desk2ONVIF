@@ -13,6 +13,27 @@
 
 $VerifyCounters = @{ Pass = 0; Fail = 0 }
 
+# --- 被重定向时，自己的输出一律写成 UTF-8 -------------------------------------
+#
+# `Invoke-Capture` 用 `StandardOutputEncoding = UTF8` 去读子进程，而
+# `Invoke-Capture` 创建的子进程带 `CreateNoWindow`（= CREATE_NO_WINDOW），
+# **没有控制台可以继承** —— 于是 `powershell.exe` 的 `[Console]::OutputEncoding`
+# 退回 ANSI 代码页（这里 936），两边对不上，中文整片变成 U+FFFD。
+#
+# 症状有辨识度：脚本自己在控制台上跑得好好的，一旦被 `Invoke-Capture` 收走，
+# 落进日志的断言文字就只剩英文标点在，**证据等于没有**。第一次跑 Phase AB 的
+# 变异检验就是这么翻的车 —— 两份日志各 900 多个替换字符。
+#
+# **只在重定向时改**：挂在真人控制台上时不动它，否则在一个 GBK 控制台里
+# 中文会变成乱码 —— 那是把一个坑换成另一个。
+#
+# 放共用层而不是各脚本自己写：这是"脚本的输出被别的脚本收走"这件事的性质，
+# 与具体哪一份验收无关。`-verify_common.ps1` 给 python 探针加 `-X utf8`
+# 处理的是同一个问题的另一半。
+if ([Console]::IsOutputRedirected) {
+    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+}
+
 function Check {
     param([bool]$ok, [string]$what, [string]$detail = '')
     if ($ok) {
@@ -36,6 +57,77 @@ function Show {
         Select-Object -Last $last | ForEach-Object { Write-Host ("  | " + $_) -ForegroundColor DarkGray }
 }
 
+# 探针失败时，把它**所有**标了失败的行打出来，并把完整输出转储到文件。
+#
+# 为什么不是"尾巴多打几行"：`web_contract.py` 有一百多条断言，红的那条可能在
+# 第 30 行，而尾巴（`Show $wc.Stdout 6`）只带得回最后 6 行 —— 于是报告上只剩
+# 一句"退出码 = 1"，**没有一条说要紧的话**。2026-10-08 就是这样：安装包验收报
+# `通过 42 项，失败 2 项`，而失败的是哪一条断言、为什么，全被那个过滤器吃掉了，
+# 只能把整轮重跑一遍来找。这正是陷阱 46 的形状 —— 一个把答案滤掉的过滤器，
+# 看上去像"信息本来就这么少"。
+#
+# 转储而不是只打屏：断言失败信息里常常带着一长串上下文（比如 pending 的字段
+# 列表），打屏会被折行糊掉；文件里那份是逐字原样的，可以直接对着看。
+function Show-Failures {
+    param([string]$text, [string]$dumpTo = '')
+    if (-not $text) { return }
+    if ($dumpTo) {
+        try {
+            $dir = Split-Path -Parent $dumpTo
+            if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            [IO.File]::WriteAllText($dumpTo, $text, (New-Object Text.UTF8Encoding $false))
+        } catch { }
+    }
+    $lines = $text -split "`r?`n" | Where-Object { $_ -ne '' }
+    $bad = @($lines | Where-Object { $_ -match '\[FAIL\]' })
+    if ($bad.Count -gt 0) {
+        foreach ($l in $bad) { Write-Host ("  ! " + $l.Trim()) -ForegroundColor Red }
+    } else {
+        # 一条 [FAIL] 都没有却退了非零 —— 大概率是探针自己中途抛异常了，
+        # 那时真正的原因在最后几行，而不在任何一条断言上。
+        Write-Host "  ! 输出里没有 [FAIL] 行（探针可能自己抛异常了），最后 15 行：" -ForegroundColor Red
+        $lines | Select-Object -Last 15 | ForEach-Object { Write-Host ("  ! " + $_) -ForegroundColor Red }
+    }
+    if ($dumpTo) { Write-Host ("  ! 探针的完整输出已存到 " + $dumpTo) -ForegroundColor DarkGray }
+}
+
+# 把一个参数按 **msvcrt / CommandLineToArgvW 那套规则**拼进命令行。
+#
+# 这里原来写的是"含空白才加引号，加了引号再把引号换成 \"". 它有一个洞，是
+# 第五轮 Phase AA 收尾时才踩到的：**参数里带一个不含空白的双引号时，它根本
+# 不加引号**，于是 `A"b\c` 原样进了命令行 —— 而 argv 那一层的规则是"引号
+# 开/关切换"，最终收到的是 `Ab\c`（引号被吃掉，没有任何东西报错）。
+# 安装包验收里那个口令正好是 `A"b\c`（它存在的理由就是引号和反斜杠），
+# 一旦把它当参数传给 python 探针，就会静默变成另一个口令，报出来的是
+# "登录失败"，一个字的线索都不指向这里。这正是陷阱 91 那一族的形状：
+# **参数被改坏之后的样子，和我根本没传对一个样。**
+#
+# 规则：
+#   · 不含空白也不含引号、且非空 → 原样（绝大多数参数走这一支）
+#   · 否则整段加引号；引号写成 \"，而**紧挨着引号的那串反斜杠**要加倍
+#     （结尾那串反斜杠同理 —— 否则会把收尾的那个引号转义掉）
+function Quote-Arg([string]$Arg) {
+    if ($null -eq $Arg) { $Arg = '' }
+    if ($Arg -ne '' -and $Arg -notmatch '[\s"]') { return $Arg }
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.Append('"')
+    $slashes = 0
+    foreach ($ch in $Arg.ToCharArray()) {
+        if ($ch -eq [char]0x5C) { $slashes++; continue }
+        if ($ch -eq '"') {
+            $null = $sb.Append('\' * ($slashes * 2 + 1))
+            $null = $sb.Append('"')
+            $slashes = 0
+            continue
+        }
+        if ($slashes -gt 0) { $null = $sb.Append('\' * $slashes); $slashes = 0 }
+        $null = $sb.Append($ch)
+    }
+    if ($slashes -gt 0) { $null = $sb.Append('\' * ($slashes * 2)) }
+    $null = $sb.Append('"')
+    return $sb.ToString()
+}
+
 # 跑一个外部命令，带硬超时，拿退出码和输出。
 #
 # 这两件事都别交给 Start-Process：
@@ -53,9 +145,7 @@ function Invoke-Capture {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName  = $File
-    $psi.Arguments = (($Sw | ForEach-Object {
-        if ($_ -match '\s') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-    }) -join ' ')
+    $psi.Arguments = (($Sw | ForEach-Object { Quote-Arg $_ }) -join ' ')
     $psi.WorkingDirectory = $WorkDir
     $psi.UseShellExecute  = $false          # 设编码前必须为 false
     $psi.CreateNoWindow   = $true
@@ -140,6 +230,28 @@ function Stop-Desk2Onvif {
     Get-Process -Name 'desk2onvif' -ErrorAction SilentlyContinue | ForEach-Object {
         try { $_.Kill(); $null = $_.WaitForExit(15000) } catch {}
     }
+}
+
+# 一棵目录树的逐项快照（相对路径 + 大小 + mtime 的 tick）。用来判"有没有往
+# 那里写东西"。
+#
+# 为什么不直接断言"这个目录不存在"：那种判据在**已经用过安装版**的机器上恒真
+# —— 目录本来就在，里面写没写新东西它都"存在"，于是这一条永远通过，等于没验。
+# 而那恰恰是最需要它生效的机器。快照比法对两种初始状态都成立：目录原先没有，
+# 跑完还得没有；原先有，跑完得**一个字节都没变**。
+#
+# 两份脚本要用（绿色版那个判"没往 %APPDATA% 写"，安装凭据那个判"start-local.bat
+# 没有回落到 %APPDATA% 那份配置"），所以放在共用层 —— 两份各写一遍的话，
+# 迟早在"比不比 mtime""算不算目录"上不一致，而那种不一致没人会发现。
+function Get-TreeSnapshot([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return '<不存在>' }
+    $items = @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+               Sort-Object FullName | ForEach-Object {
+                   $rel = $_.FullName.Substring($Path.Length + 1)
+                   if ($_.PSIsContainer) { "D $rel" }
+                   else { "F $rel $($_.Length) $($_.LastWriteTimeUtc.Ticks)" }
+               })
+    return ($items -join "`n")
 }
 
 function Wait-Backend {
@@ -230,6 +342,46 @@ function Test-ScriptSyntax([string]$Path) {
         return (($errs | ForEach-Object { "第 $($_.Extent.StartLineNumber) 行：$($_.Message)" }) -join '; ')
     }
     return $null
+}
+
+# 登录后读 `/api/status` 的 `version` 字段。读不到返回 $null。
+#
+# 存在的理由是一条**三方一致**断言：包名 / exe 的文件属性 / 程序在网络上报的
+# 版本，必须是同一个数。前两处是文件属性，第三处是**运行期**的 —— 它顺带证明
+# 那个字段真的接上了线（`patch_live_counters` 里那一行），而不只是"编译进去了
+# 一个常量"。只对文件属性会漏掉"接口上根本没这个字段"，而那种情况界面上是
+# 一片空白，谁都不会发现。
+#
+# `/api/*` 在 Web 登录之后（web_server.cpp 的 register_auth_routes），所以这里
+# 得先 POST /api/login 拿会话 cookie —— 用 -SessionVariable 让 PS 自己管。
+#
+# 默认值取的是出厂那一对 admin/admin，但**用哪一对是调用方的输入，不是这个
+# 函数能假定的事**：安装包从第五轮起把向导里填的用户名/口令同时写进
+# web.user / web.password（在那之前 WriteConfig 只写了 ONVIF 那一份，这里
+# 才碰巧能登进去 —— 那句"安装包那份走默认 admin/admin"已经过期了），
+# 而绿色版那份配置由首次运行生成、仍然是内置默认值。所以谁调用谁给值。
+function Get-StatusVersion {
+    param(
+        [int]    $Port,
+        [string] $User = 'admin',
+        [string] $Password = 'admin',
+        [int]    $TimeoutMs = 15000
+    )
+    $sec = [Math]::Max(1, [int]($TimeoutMs / 1000))
+    $base = "http://127.0.0.1:$Port"
+    try {
+        $body = @{ user = $User; password = $Password } | ConvertTo-Json -Compress
+        $null = Invoke-WebRequest -Uri "$base/api/login" -Method Post -Body $body `
+                    -ContentType 'application/json' -TimeoutSec $sec `
+                    -SessionVariable sess -UseBasicParsing
+        $resp = Invoke-WebRequest -Uri "$base/api/status" -WebSession $sess `
+                    -TimeoutSec $sec -UseBasicParsing
+        return [string](($resp.Content | ConvertFrom-Json).version)
+    } catch {
+        # 不在这里报错：调用方手里有"期望值"，由它给出一句能对账的失败信息。
+        # 这里报的话，消息里只有"登录失败"这种没法定位的话。
+        return $null
+    }
 }
 
 function Write-VerifySummary {

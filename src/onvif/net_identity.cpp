@@ -183,16 +183,21 @@ std::string machine_seed() {
   os << "host=" << hostname();
   os << ";guid=" << read_machine_guid();
 
-  // MAC 排序之后再用：GetAdaptersAddresses 的顺序不保证稳定（插拔网卡、
-  // 启用禁用都会变），不排序的话同一台机器可能派生出两个 UUID。
-  std::vector<std::string> macs;
-  for (LocalAddr const& la : local_ipv4_addresses()) {
-    if (!la.mac.empty() && la.mac != "000000000000") macs.push_back(la.mac);
-  }
-  std::sort(macs.begin(), macs.end());
-  macs.erase(std::unique(macs.begin(), macs.end()), macs.end());
-  for (std::string const& m : macs) os << ";mac=" << m;
-
+  // **MAC 不参与。** 第五轮之前这里是"把所有网卡 MAC 排序后拼进种子"，
+  // 理由写的是"GetAdaptersAddresses 的顺序不稳定，排序之后才稳定"。
+  // 那句话本身没错，但它**答的不是这里要问的问题**：排序解决的是同一组
+  // 网卡的不同枚举顺序，而这里要的是"这台机器的身份"。多插一块 USB 网卡、
+  // 插拔一次扩展坞、禁用一张虚拟网卡（Sunlogin/Oray 那种），**集合本身
+  // 就变了** —— 排序再稳，种子也会变，于是序列号和 UUID 一起变，NVR 那边
+  // 多出一台"新"摄像机。
+  //
+  // 留在种子里的两样都满足"换硬件不变"：hostname 是用户自己起的名字，
+  // MachineGuid 是安装系统时生成、写在注册表里的，换网卡不动它。
+  //
+  // **诚实边界**：用同一个磁盘镜像克隆出来的两台机器 MachineGuid 相同 ⇒
+  // 序列号相同。这是换来"换网卡不变"的代价。真要区分就去手改 config.json
+  // 里的 `onvif.serial_number` / `onvif.device_uuid`（那是逃生门，见
+  // `apply_config` 里那段只读锁的注释）。
   return os.str();
 }
 

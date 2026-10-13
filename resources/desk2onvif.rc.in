@@ -1,0 +1,76 @@
+/* Desk2ONVIF 的 Windows 资源脚本模板 —— CMake 的 configure_file 会把 @...@
+ * 换成真值，生成物在**构建目录**里，然后由 add_executable 编进 exe。
+ *
+ * ## 为什么是模板，不是一份写死的 .rc
+ *
+ * 因为版本号曾经在这里漂移过，而且漂得体面：`scripts\package.ps1` 那段注释
+ * 白纸黑字写着"安装程序显示的版本、程序输出的版本、文件名里的版本必须是同一个，
+ * 各写一份的结果是……几乎不可能被发现"，可它只做到了两处 —— 安装包的文件名和
+ * `--version`。**exe 自己的 VersionInfo 是硬编码的 `0.1.0`，压根没接上**，
+ * 于是升到 0.2.0 之后资源管理器里那个文件属性仍然写着 0.1.0。
+ * 一条"我保证 X 一致"的注释是一句承诺，不是一个检查；能自动对账的就去对账。
+ *
+ * 现在唯一的来源是 `CMakeLists.txt` 的 `project(... VERSION x.y.z)`，
+ * 而 `scripts\verify_installer.ps1` / `verify_portable.ps1` 里有一条**三方
+ * 一致**断言盯着它（包名 == exe 的 VersionInfo == `/api/status` 的 version）。
+ *
+ * ## 图标那行为什么是绝对路径
+ *
+ * 因为 windres 解析 `.rc` 引用的文件时，是**相对于 `.rc` 自己的目录**找的
+ * （不是当前工作目录）。生成物在构建目录里，所以一句相对的
+ * `1 ICON "desk2onvif.ico"` 会去构建目录里找那个图标。这是陷阱 55 的同一个
+ * 机制，只是触发条件从"在别的 cwd 下跑 windres"变成了"把 .rc 挪到别处"。
+ *
+ * ## 编码
+ *
+ * 这个文件是 UTF-8 **无 BOM** —— 只有注释和版本块里有中文。windres 对 BOM
+ * 的处理很差，会在文件开头报语法错；而中文靠 CMake 传的 `--codepage=65001`
+ * 转成 UTF-16。configure_file 是逐字节复制的，所以生成物也保持无 BOM。
+ * 验证方式是编完读一遍 exe 的 VersionInfo。
+ *
+ * ## 图标在这个项目里有三处
+ *
+ * 各管各的，少一处就有一处显示成 Windows 的默认图标：
+ *   1. exe 自己（资源管理器里看文件、任务栏、Alt-Tab）—— 就是这里；
+ *   2. 安装包 Setup.exe（Inno 的 SetupIconFile，见 packaging/desk2onvif.iss）；
+ *   3. 快捷方式（Inno 的 [Icons] IconFilename）。
+ * 只做 2、3 的话，安装包好看、快捷方式好看，而程序一跑起来任务栏上是个
+ * 白底默认图标。
+ */
+
+/* 这个 include 不是装饰：VOS_NT_WINDOWS32 / VFT_APP 这些名字都定义在
+   头文件里，不包含的话它们在 rc 语法里就是未定义的标识符，报的是
+   "syntax error" 指向 FILEOS 那一行 —— 看着像语法写错了，其实是缺 include。
+   （windres 会以 `gcc -E -xc -DRC_INVOKED` 先跑一遍预处理器，
+   所以这里走的是 MinGW 的 windows.h。） */
+#include <windows.h>
+
+1 ICON "@CMAKE_CURRENT_SOURCE_DIR@/resources/desk2onvif.ico"
+
+1 VERSIONINFO
+FILEVERSION     @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+PRODUCTVERSION  @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    /* 0x0804 = 中文(简体)，0x04b0 = 1200 = Unicode。两处必须和下面
+       VarFileInfo 里的 Translation 对上，否则读的人会按别的代码页解。 */
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "CompanyName",      "Desk2ONVIF contributors"
+      VALUE "FileDescription",  "Desk2ONVIF — 把桌面变成 ONVIF 摄像机"
+      VALUE "FileVersion",      "@PROJECT_VERSION@"
+      VALUE "InternalName",     "desk2onvif"
+      VALUE "LegalCopyright",   "GPL-3.0-or-later"
+      VALUE "OriginalFilename", "desk2onvif.exe"
+      VALUE "ProductName",      "Desk2ONVIF"
+      VALUE "ProductVersion",   "@PROJECT_VERSION@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x804, 1200
+  END
+END

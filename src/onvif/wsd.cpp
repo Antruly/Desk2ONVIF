@@ -228,21 +228,38 @@ struct WsdResponder::Impl {
     return msg_no.fetch_add(1, std::memory_order_relaxed);
   }
 
-  std::string xaddrs_for(std::string const& peer_ip) const {
+  std::string xaddrs_for(std::string const& peer_ip, int port) const {
     std::string ip = pick_local_address_for(peer_ip);
     if (ip.empty()) ip = default_local_address();
     if (ip.empty()) ip = "127.0.0.1";
-    return "http://" + ip + ":" + std::to_string(opt.http_port) +
-           opt.device_service_path;
+    return "http://" + ip + ":" + std::to_string(port) + opt.device_service_path;
   }
 
-  std::string scopes_text() const {
+  static std::string scopes_text(std::vector<std::string> const& scopes) {
     std::string s;
-    for (std::string const& sc : opt.scopes) {
+    for (std::string const& sc : scopes) {
       if (!s.empty()) s.push_back(' ');
       s += sc;
     }
     return s;
+  }
+
+  /// 展开成"要宣告的全部端点"。**通道 1 恒在下标 0**，后面按 `opt.extra`
+  /// 的顺序 —— 别处（日志、`xaddrs_for(default_local_address())`）都按
+  /// "第一个就是主设备"读，所以这个顺序是一份约定，不是巧合。
+  std::vector<WsdEndpoint> endpoints() const {
+    std::vector<WsdEndpoint> v;
+    WsdEndpoint primary;
+    primary.uuid = opt.uuid;
+    primary.http_port = opt.http_port;
+    primary.scopes = opt.scopes;
+    v.push_back(std::move(primary));
+    for (WsdEndpoint const& e : opt.extra) {
+      WsdEndpoint x = e;
+      if (x.scopes.empty()) x.scopes = opt.scopes;
+      v.push_back(std::move(x));
+    }
+    return v;
   }
 
   /// 发一个 UDP 报文。`dst` 为空表示发到组播地址。
@@ -301,23 +318,41 @@ struct WsdResponder::Impl {
 
   /// 组播的 Hello / Bye。Bye 按规范可以不带 XAddrs —— 地址在这里没有意义，
   /// 带上反而会让某些实现去连一个正在下线的设备。
-  std::string make_hello_or_bye(std::string const& action_suffix) {
+  ///
+  /// 多通道时**每个端点各发一条**：一条报文里只能有一个 EndpointReference，
+  /// 而 NVR 就是按它建条目的。N 个通道 = N 条 Hello，这是规范内的做法。
+  std::string make_hello_or_bye(std::string const& action_suffix,
+                                WsdEndpoint const& ep) {
     std::string body;
     body += "<d:" + action_suffix + ">";
-    body += "<w:EndpointReference><w:Address>" + xml_escape(opt.uuid) +
+    body += "<w:EndpointReference><w:Address>" + xml_escape(ep.uuid) +
             "</w:Address></w:EndpointReference>";
     body += "<d:Types>" + xml_escape(opt.types) + "</d:Types>";
-    body += "<d:Scopes>" + xml_escape(scopes_text()) + "</d:Scopes>";
+    body += "<d:Scopes>" + xml_escape(scopes_text(ep.scopes)) + "</d:Scopes>";
     if (action_suffix == "Hello") {
       body += "<d:XAddrs>" +
-              xml_escape(xaddrs_for(default_local_address())) + "</d:XAddrs>";
+              xml_escape(xaddrs_for(default_local_address(), ep.http_port)) +
+              "</d:XAddrs>";
     }
     body += "<d:MetadataVersion>1</d:MetadataVersion>";
     body += "</d:" + action_suffix + ">";
     return envelope(kToDiscovery,
                     "http://schemas.xmlsoap.org/ws/2005/04/discovery/" +
                         action_suffix,
-                    std::string(), opt.uuid, instance_id, next_msg_no(), body);
+                    std::string(), ep.uuid, instance_id, next_msg_no(), body);
+  }
+
+  /// 每个端点一条。Hello 和 Bye 都走这里，别在调用点手写循环 ——
+  /// `stop()` / `reannounce()` / `start()` 三处各写一遍迟早漏一处，
+  /// 而漏掉的那个端点表现为"这个通道在 NVR 里一直显示在线"。
+  ///
+  /// `on_done` 会**每个端点各被调一次**：调用方给的通常是"放掉一份 udp 引用"
+  /// 那种幂等动作（见 `shutdown_on_loop`），多调几次没有副作用。
+  void send_hello_or_bye(uvcpp_udp* u, std::string const& action_suffix,
+                         std::function<void()> on_done = nullptr) {
+    for (WsdEndpoint const& ep : endpoints()) {
+      send_multicast(u, make_hello_or_bye(action_suffix, ep), on_done);
+    }
   }
 
   void on_datagram(ssize_t nread, uv_buf_t const* buf, sockaddr const* addr);
@@ -367,27 +402,54 @@ void WsdResponder::Impl::on_datagram(ssize_t nread, uv_buf_t const* buf,
   // 前缀式的（`onvif://www.onvif.org/type/` 能匹配 `.../type/x`），这里按
   // 互相为前缀来判，宽松一点 —— 判错的代价是"设备在 NVR 里搜不到"，
   // 而多回一次包的代价只是 NVR 试着添加一台它其实能连上的设备。
+  //
+  // **逐端点各判一次**：通道 2 起的 scopes 里带着自己的名字，某个 Probe 明确
+  // 只要 `name/前门` 时，只有那一个通道该回答。判一次全局的话，要么全都回
+  // （用户只想要一台却收到八台），要么全都不回。
   std::string const probe_scopes = find_tag_text(xml, "Scopes");
-  if (tail == "Probe" && !probe_scopes.empty()) {
-    bool match = false;
+  auto scopes_match = [&probe_scopes](std::vector<std::string> const& mine) {
+    if (probe_scopes.empty()) return true;
     for (std::string const& want : split_ws(probe_scopes)) {
-      for (std::string const& mine : opt.scopes) {
-        if (want.size() <= mine.size() ? mine.compare(0, want.size(), want) == 0
-                                       : want.compare(0, mine.size(), mine) == 0) {
-          match = true;
-          break;
+      for (std::string const& m : mine) {
+        if (want.size() <= m.size() ? m.compare(0, want.size(), want) == 0
+                                    : want.compare(0, m.size(), m) == 0) {
+          return true;
         }
       }
-      if (match) break;
     }
-    if (!match) {
+    return false;
+  };
+
+  std::vector<WsdEndpoint> const eps = endpoints();
+
+  // Resolve 问的是**指定**的那一个端点，所以先按 EndpointReference 挑。
+  // Probe 是"谁在" —— 把所有匹配 scopes 的端点都答上。
+  std::vector<WsdEndpoint> answering;
+  if (tail == "Resolve") {
+    // 请求里的第一个 `Address` 就是它要找的端点（`Types`/`Scopes` 里也可能
+    // 有同名标签，但 `EndpointReference` 在最前面，`find_tag_text` 取首个）。
+    std::string const want = find_tag_text(xml, "Address");
+    for (WsdEndpoint const& ep : eps) {
+      if (want.empty() || ep.uuid == want) answering.push_back(ep);
+    }
+    if (answering.empty()) {
+      // 找的不是我们。**必须不回答** —— 单播回一句"其实我是别人"会让对方
+      // 把它当成自己问的那台设备。
+      D2O_DEBUG("WS-Discovery %s 的 Resolve 问的是 %s，不是本机。",
+                ip.c_str(), want.c_str());
+      return;
+    }
+  } else {
+    for (WsdEndpoint const& ep : eps) {
+      if (scopes_match(ep.scopes)) answering.push_back(ep);
+    }
+    if (answering.empty()) {
       D2O_DEBUG("WS-Discovery %s 的 scopes 与本机没有交集，不回答。", ip.c_str());
       return;
     }
   }
 
   std::string const relates = find_tag_text(xml, "MessageID");
-  std::string const xaddrs = xaddrs_for(ip);
 
   if (!budget_ok()) {
     // 不回答，但**要记下来**：静默限流和"根本没收到"在现象上一模一样，
@@ -397,25 +459,37 @@ void WsdResponder::Impl::on_datagram(ssize_t nread, uv_buf_t const* buf,
     return;
   }
 
+  // **一条报文装下全部端点**，而不是每个端点回一条。N 条单播包在 NVR 那边
+  // 是 N 次独立的处理，中间丢一条就少一个通道，而且丢哪条是随机的 ——
+  // 而一条报文要么整份到、要么整份不到。
   std::string body;
   std::string action_out;
+  std::string first_xaddrs;
   if (tail == "Probe") {
-    body = "<d:ProbeMatches><d:ProbeMatch>"
-           "<w:EndpointReference><w:Address>" + xml_escape(opt.uuid) +
-           "</w:Address></w:EndpointReference>"
-           "<d:Types>" + xml_escape(opt.types) + "</d:Types>"
-           "<d:Scopes>" + xml_escape(scopes_text()) + "</d:Scopes>"
-           "<d:XAddrs>" + xml_escape(xaddrs) + "</d:XAddrs>"
-           "<d:MetadataVersion>1</d:MetadataVersion>"
-           "</d:ProbeMatch></d:ProbeMatches>";
+    body = "<d:ProbeMatches>";
+    for (WsdEndpoint const& ep : answering) {
+      std::string const xa = xaddrs_for(ip, ep.http_port);
+      if (first_xaddrs.empty()) first_xaddrs = xa;
+      body += "<d:ProbeMatch>"
+              "<w:EndpointReference><w:Address>" + xml_escape(ep.uuid) +
+              "</w:Address></w:EndpointReference>"
+              "<d:Types>" + xml_escape(opt.types) + "</d:Types>"
+              "<d:Scopes>" + xml_escape(scopes_text(ep.scopes)) + "</d:Scopes>"
+              "<d:XAddrs>" + xml_escape(xa) + "</d:XAddrs>"
+              "<d:MetadataVersion>1</d:MetadataVersion>"
+              "</d:ProbeMatch>";
+    }
+    body += "</d:ProbeMatches>";
     action_out = "http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches";
   } else {
+    WsdEndpoint const& ep = answering.front();
+    first_xaddrs = xaddrs_for(ip, ep.http_port);
     body = "<d:ResolveMatch>"
-           "<w:EndpointReference><w:Address>" + xml_escape(opt.uuid) +
+           "<w:EndpointReference><w:Address>" + xml_escape(ep.uuid) +
            "</w:Address></w:EndpointReference>"
            "<d:Types>" + xml_escape(opt.types) + "</d:Types>"
-           "<d:Scopes>" + xml_escape(scopes_text()) + "</d:Scopes>"
-           "<d:XAddrs>" + xml_escape(xaddrs) + "</d:XAddrs>"
+           "<d:Scopes>" + xml_escape(scopes_text(ep.scopes)) + "</d:Scopes>"
+           "<d:XAddrs>" + xml_escape(first_xaddrs) + "</d:XAddrs>"
            "<d:MetadataVersion>1</d:MetadataVersion>"
            "</d:ResolveMatch>";
     action_out = "http://schemas.xmlsoap.org/ws/2005/04/discovery/ResolveMatches";
@@ -426,6 +500,8 @@ void WsdResponder::Impl::on_datagram(ssize_t nread, uv_buf_t const* buf,
   // 万一遇到一个用了真实地址的，走匿名角色仍然是合法且可路由的。
   std::string const to = (tail == "Probe") ? kToDiscovery : kToAnonymous;
 
+  // 信封的发送者用**通道 1** 的身份：一条报文只能有一个 `w:Address`，而
+  // 里面每个 ProbeMatch 各自带着自己的 EPR —— 收方按 EPR 建条目，不看这个。
   std::string const reply =
       envelope(to, action_out, relates, opt.uuid, instance_id, next_msg_no(), body);
 
@@ -433,8 +509,8 @@ void WsdResponder::Impl::on_datagram(ssize_t nread, uv_buf_t const* buf,
   // 收到本与他们无关的回包，几十台摄像机就是几十倍的广播风暴。
   send_to(udp.get(), reply, addr);
   answered.fetch_add(1, std::memory_order_relaxed);
-  D2O_INFO("WS-Discovery 回答了 %s 的 %s（XAddrs %s）", ip.c_str(), tail.c_str(),
-           xaddrs.c_str());
+  D2O_INFO("WS-Discovery 回答了 %s 的 %s（%zu 个通道，首个 XAddrs %s）",
+           ip.c_str(), tail.c_str(), answering.size(), first_xaddrs.c_str());
 }
 
 void WsdResponder::Impl::shutdown_on_loop() {
@@ -445,8 +521,6 @@ void WsdResponder::Impl::shutdown_on_loop() {
   std::shared_ptr<uvcpp_udp> u = std::move(udp);
   u->recv_stop();
 
-  std::string const bye = make_hello_or_bye("Bye");
-
   // 把 udp 的最后一并交给完成回调：那条回调跑在循环线程上，于是在那里
   // 析构 udp 是安全的（`~uvcpp_handle` → `uv_close`，而 uv_close 只能在
   // 循环线程上调）。发送还没完成就把句柄拆了则会让 Bye 发不出去 —— 这是
@@ -455,7 +529,10 @@ void WsdResponder::Impl::shutdown_on_loop() {
   // 完成回调万一不跑（循环正在被拆），这一份引用就一直留着不释放。
   // 代价是进程退出前那块 uv_udp_t 不还给分配器 —— 进程马上就没了，无所谓；
   // 而反过来（提前释放）是一个真的 use-after-free。选前者。
-  send_multicast(u.get(), bye, [u]() mutable { u.reset(); });
+  //
+  // 每个端点各一份引用（lambda 按值捕获同一个 shared_ptr），最后一个跑完的
+  // 那个把它放掉 —— 于是"全部 Bye 都发完了"才真正释放，正是想要的。
+  send_hello_or_bye(u.get(), "Bye", [u]() mutable { u.reset(); });
   D2O_INFO("WS-Discovery 已停止（发出 Bye）。");
 }
 
@@ -476,6 +553,20 @@ bool WsdResponder::start(uvcpp::uvcpp_loop* loop, WsdOptions const& opt,
   if (opt.uuid.empty()) {
     err = "WS-Discovery 需要设备 UUID（见 net_identity.h）。";
     return false;
+  }
+  // 附加端点也必须有 UUID，而且**不能和通道 1 相同**：NVR 按 EPR 建条目，
+  // 撞了的话第二个通道会被当成"我已经有这台了"直接忽略 —— 现象是"只搜到
+  // 一台设备"，而它看起来完全正常。这里当**启动失败**处理，不是跳过那一个：
+  // 静默少一个通道比整个发现起不来更难查（NVR 上少一路，日志里一个字没有）。
+  for (WsdEndpoint const& e : opt.extra) {
+    if (e.uuid.empty() || e.uuid == opt.uuid) {
+      err = "WS-Discovery 的附加通道需要一个**互不相同**的 UUID。";
+      return false;
+    }
+    if (e.http_port == 0) {
+      err = "WS-Discovery 的附加通道需要一个非零的 ONVIF 端口。";
+      return false;
+    }
   }
 
   d.opt = opt;
@@ -563,11 +654,11 @@ bool WsdResponder::start(uvcpp::uvcpp_loop* loop, WsdOptions const& opt,
   d.running.store(true, std::memory_order_relaxed);
 
   // Hello：告诉局域网"我来了"。NVR 通常不等 Hello（它们主动 Probe），
-  // 但有些实现确实靠它维护在线列表。
-  d.send_multicast(d.udp.get(), d.make_hello_or_bye("Hello"));
+  // 但有些实现确实靠它维护在线列表。**每个端点一条**。
+  d.send_hello_or_bye(d.udp.get(), "Hello");
 
-  D2O_INFO("WS-Discovery 已启动：%s:%d，设备 %s", kMcastAddr, kMcastPort,
-           opt.uuid.c_str());
+  D2O_INFO("WS-Discovery 已启动：%s:%d，设备 %s（%zu 个通道）", kMcastAddr,
+           kMcastPort, opt.uuid.c_str(), d.endpoints().size());
   return true;
 }
 
@@ -600,8 +691,8 @@ void WsdResponder::reannounce() {
     // 循环线程上跑。**顺序不能反**：Bye 先摘掉，Hello 再到 —— 反过来就是
     // "先声明我在、再说我走了"，NVR 的在线状态会停在"不在"。
     if (!p->udp) return;  // stop() 可能已经在这之前排进队列并跑完了
-    p->send_multicast(p->udp.get(), p->make_hello_or_bye("Bye"));
-    p->send_multicast(p->udp.get(), p->make_hello_or_bye("Hello"));
+    p->send_hello_or_bye(p->udp.get(), "Bye");
+    p->send_hello_or_bye(p->udp.get(), "Hello");
     D2O_INFO("WS-Discovery 已重新广播（Bye + Hello），NVR 会重新收录这台设备。");
   });
 }

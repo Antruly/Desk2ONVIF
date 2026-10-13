@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '../components/Icon.vue'
 import { useAuth } from '../composables/useAuth'
+import { clearLifecycleNote, peekLifecycleNote } from '../lifecycle'
 
 /**
  * 登录页。
@@ -36,6 +37,38 @@ let tickTimer: number | null = null
 
 const canSubmit = computed(() => !busy.value && cooldown.value === 0 && password.value.length > 0)
 
+/**
+ * 「你为什么会被送到这个页面」。
+ *
+ * 两个来源，**模块里的那一条优先**：配置页在按下「重启服务 / 恢复出厂」时就把
+ * 解释写进了 `lifecycle.ts`（那里写了为什么不能用路由 query 当唯一载体 ——
+ * 把人踢到登录页的有两条互相竞争的路，赌哪条先到迟早会赌输）。
+ *
+ * 路由上的 `reason` 是退路，不是主路：它只在**刷新过登录页**之后还有用 ——
+ * 那时模块状态还在（SPA 没重载）……但如果用户是手动把 URL 拷到新标签页打开的，
+ * 模块状态就没了，只剩 URL 上这一句。两条路说的是同一件事，不会打架。
+ */
+const lifecycleNote = peekLifecycleNote()
+
+const lifecycleBanner = computed<{ reason: 'restarted' | 'reset'; text: string } | null>(() => {
+  if (lifecycleNote) return lifecycleNote
+  const raw = route.query.reason
+  const reason = Array.isArray(raw) ? raw[0] : raw
+  if (reason === 'restarted') {
+    return {
+      reason: 'restarted',
+      text: '服务刚刚重启过，会话令牌在那一下全部失效了（令牌签的是每进程一份的随机密钥）—— 用原来的账号重新登录即可。',
+    }
+  }
+  if (reason === 'reset') {
+    return {
+      reason: 'reset',
+      text: '服务刚刚恢复出厂设置并重启，会话令牌在那一下全部失效了。口令也回到了默认值（安装包形态是 admin / admin），除非当时是用命令行参数指定的。',
+    }
+  }
+  return null
+})
+
 const submitLabel = computed(() => {
   if (cooldown.value > 0) return `请等待 ${cooldown.value} 秒`
   return busy.value ? '正在登录…' : '登 录'
@@ -67,6 +100,9 @@ async function onSubmit() {
   if (res.ok) {
     // 口令不留在这份状态里，提交完立刻清掉。
     password.value = ''
+    // "服务刚重启过"那条解释到此为止。不清的话，下一次因为别的缘故（令牌过期、
+    // 改了口令）被踢到登录页时，顶上会挂着一条张冠李戴的说明。
+    clearLifecycleNote()
     // 登录前想去哪就回哪；没带 next 就回首页（首页是预览）。
     const raw = route.query.next
     const next = Array.isArray(raw) ? raw[0] : raw
@@ -106,6 +142,17 @@ onBeforeUnmount(() => {
         <Icon name="camera" :size="46" :stroke="1.4" class="login-logo" />
         <h1>Desk2ONVIF</h1>
         <div class="sub">Web Console</div>
+      </div>
+
+      <!--
+        为什么会被送到这里。**故意是独立的一块，不参与下面的 v-if/v-else-if 链**
+        —— "服务刚重启过"和"后端连不上"是两件互不相干的事，串进同一条链会让其中
+        一件盖掉另一件，而那时最需要的恰恰是同时看到两条。
+        这里没有失败可言：被重启踢出来是设计的一部分，不是错误。
+      -->
+      <div v-if="lifecycleBanner" class="banner is-warn">
+        <strong>{{ lifecycleBanner.reason === 'reset' ? '服务已恢复出厂并重启。' : '服务已重启。' }}</strong>
+        {{ lifecycleBanner.text }}
       </div>
 
       <!-- 后端根本没起来：这时登录是没有意义的重试，得说清楚。 -->

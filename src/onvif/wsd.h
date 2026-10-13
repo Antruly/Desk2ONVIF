@@ -48,16 +48,45 @@ class uvcpp_loop;
 
 namespace d2o {
 
+/// 一台设备对外宣告的**一个端点**。多通道之后，"这台机器"在组播里是**多台
+/// 摄像机**，每一路 ONVIF 端口一个 —— 所以端点的三要素（UUID、端口、scopes）
+/// 都是一份一份的，而不是全局一份。
+///
+/// `uuid` 必须**每通道各不相同**：NVR 把 EndpointReference 当主键，两个通道
+/// 共用一个 UUID 的话，第二台会被当成"我已经有这台了"直接忽略 —— 现象是
+/// "只搜到一台设备"，而它看起来完全正常。
+struct WsdEndpoint {
+  std::string uuid;                  ///< `urn:uuid:...`
+  int http_port = 8080;              ///< 这一路的 ONVIF 端口
+  /// 空 = 用 `WsdOptions::scopes`。通道 2 起的 scopes 里会带自己的名字，
+  /// 所以通常是要单独给的。
+  std::vector<std::string> scopes;
+};
+
 struct WsdOptions {
-  /// `urn:uuid:...`，跨重启必须稳定（见 net_identity.h）。
+  /// `urn:uuid:...`，跨重启必须稳定（见 net_identity.h）。**通道 1 的**。
   std::string uuid;
   /// HTTP 端口。XAddrs 是 `http://<本机地址>:<port>/onvif/device_service`，
-  /// 地址部分**按探测包的来源动态选**，不能在这里写死。
+  /// 地址部分**按探测包的来源动态选**，不能在这里写死。**通道 1 的**。
   int http_port = 8080;
   std::string device_service_path = "/onvif/device_service";
   std::string types = "dn:NetworkVideoTransmitter";
   /// 完整 scope 列表（`onvif://...`），Hello/ProbeMatch 里都要带。
+  /// `extra` 里某一项自带 scopes 时，那一项不用这份。
   std::vector<std::string> scopes;
+
+  /// 通道 2 起要**一并宣告**的端点。
+  ///
+  /// ## 为什么挂在通道 1 上，而不是每个通道各起一个 responder
+  ///
+  /// UDP 3702 只有**一个**。第二个 responder 去 bind 同一端口，靠
+  /// `SO_REUSEADDR` 也许能成，但组播的语义是"所有绑定者都收到每个包" ——
+  /// 于是 2 个通道就回 2 份 ProbeMatches，8 个通道回 8 份，每份里还都带全部
+  /// 通道。NVR 那边看到的是同一台设备被重复收录。所以**一个 socket、
+  /// 一次回答、里面打包全部通道**才是对的形状。
+  ///
+  /// 空 = 只有通道 1（第五轮之前的行为，逐字节相同）。
+  std::vector<WsdEndpoint> extra;
 };
 
 /// 把一件事投递到事件循环线程上执行（就是 `uvcpp_web_app::post`）。

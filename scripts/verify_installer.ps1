@@ -156,6 +156,26 @@ $vi = (Get-Item -LiteralPath $iconExe).VersionInfo
 Check ($vi.ProductName -ceq 'Desk2ONVIF') "版本信息里的产品名 = $($vi.ProductName)"
 Check ($vi.FileDescription -match 'ONVIF') "版本信息里的说明 = $($vi.FileDescription)"
 
+# --- 版本号：三方一致（第 1、2 处）-------------------------------------
+#
+# 一个包里的版本号有四处会说：包名、exe 的文件属性、程序在网络上报的
+# `/api/status`（也就是 `--version` 那个数）、以及 config.json 里的
+# `onvif.firmware_version`（NVR 通过 GetDeviceInformation 看得到）。四处全来自
+# `CMakeLists.txt` 的 `project(... VERSION)` 一行。
+#
+# 但"全都来自一处"本身是一句**承诺，不是检查** —— 本轮动手之前，
+# `package.ps1` 的注释就白纸黑字写着"必须是同一个"，而实操是：exe 的
+# VersionInfo 硬编码在 resources\desk2onvif.rc 里，压根没接上，升到 0.2.0 之后
+# 资源管理器里那个文件属性仍然写着 0.1.0。所以这里把它**量三遍再比**。
+#
+# 包名当锚：它是唯一一个不依赖任何构建产物、用户下载到手里的那个名字。
+$nameVer = [regex]::Match((Split-Path $Setup -Leaf),
+                          'Desk2ONVIF_Setup_(\d+\.\d+\.\d+)\.exe').Groups[1].Value
+Check (-not [string]::IsNullOrEmpty($nameVer)) "包名里有版本号（$nameVer）"
+Check ($vi.FileVersion -ceq $nameVer) `
+      "exe 的文件属性版本 = 包名里的版本（属性 $($vi.FileVersion)，包名 $nameVer）" `
+      '对不上说明 resources\desk2onvif.rc.in 没接上 project(... VERSION)，或者包是用旧 exe 打的。'
+
 # 前端产物：整套检查里最该在的一条 —— 少了它程序一个字都不报。
 $webDist = Join-Path $InstallDir 'web\dist'
 Check (Test-Path -LiteralPath (Join-Path $webDist 'index.html')) 'web\dist\index.html 存在'
@@ -180,6 +200,16 @@ if (Test-Path -LiteralPath $cfgPath) {
         Check ($cfg.onvif.password -ceq $TestPass) `
               'onvif.password 往返一致（引号 + 反斜杠）' `
               ("期望 " + $TestPass + "，实际 " + $cfg.onvif.password)
+
+        # Web 那一对。**这一条是用户报过的那条 bug 的正脸**：`.iss` 的 WriteConfig
+        # 原来只写了 onvif 那一组，于是 Web 控制台永远拿出厂 admin/admin ——
+        # 用户"在安装时设了口令、网页却怎么都登不进去"，而日志、安装日志、程序
+        # 输出里一个字都没提。它和上面那两条**不是同一件事**：ONVIF 那份一直是
+        # 对的，错的是 web 那份。（详见 desk2onvif.iss 里 WriteConfig 上面那段。）
+        Check ($cfg.web.user -ceq $TestUser) "web.user = $($cfg.web.user)"
+        Check ($cfg.web.password -ceq $TestPass) `
+              'web.password 往返一致（引号 + 反斜杠）' `
+              ("期望 " + $TestPass + "，实际 " + $cfg.web.password)
     }
 } else {
     Check $false 'config.json 存在'
@@ -200,11 +230,21 @@ Section "[5] 起服务 + 前端契约（web_contract.py）"
 $appOut = Join-Path $env:TEMP 'd2o-verify-app.out'
 $appErr = Join-Path $env:TEMP 'd2o-verify-app.err'
 
-$appArgs = '--rtsp --rtsp-port ' + $RtspPort +
-           ' --http --http-port ' + $HttpPort +
-           ' --web-root "' + $webDist + '"' +
-           ' --config "' + $cfgPath + '"'
-$app = Start-Detached $exe $appArgs $InstallDir $appOut $appErr
+# **走包里那份 start.ps1 -Portable，而不是把 exe 的参数在这里再拼一遍。**
+#
+# 这一段原先是后者（`--rtsp --rtsp-port … --config …`直拼）。那样一来，
+# 启动器里那条"凭据被无条件追加的 admin/admin 踩掉"的路**根本不会被走到**
+# —— 验收 43 项全绿，用户双击 start.bat 却登不进去（第五轮 Phase AA 的断链 2）。
+# 判据只能是"跑真的入口"：路径怎么拼、`-Portable` 映射成什么、命令行有没有
+# 把配置里那对凭据覆盖掉，全都只有走 start.ps1 才验得到。绿色版那边一直是
+# 这么做的（verify_portable.ps1 的 [5] 段），安装包这边漏了。
+#
+# 它同时给 [5] 段带来一个副作用，是有意的：`--console` 会在配置目录里建
+# `desk2onvif.log`、操作日志会建 `logs\` —— 两者都在 `[UninstallDelete]` 里，
+# 所以 [6] 段"卸载后目录整个没了"这条同时也在照那份清单（陷阱 101）。
+$psArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $InstallDir 'start.ps1') + '"' +
+          ' -Portable -LocalOnly -RtspPort ' + $RtspPort + ' -HttpPort ' + $HttpPort
+$app = Start-Detached 'powershell.exe' $psArgs $InstallDir $appOut $appErr
 
 try {
     $up = Wait-Backend $HttpPort
@@ -212,8 +252,13 @@ try {
     if (-not $up) { Show (Get-Content -LiteralPath $appErr -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) 20 }
 
     if ($up) {
+        # 凭据要**显式递给探针**：这份配置里的 web.user/web.password 是安装时
+        # 填的那一对（上面 [3] 段刚验过），探针的默认值是出厂 admin/admin，
+        # 不给就登不进去。顺带这一条也把"口令里的引号能原样穿过 Python 的命令行"
+        # 量掉了（`_verify_common.ps1` 的 Quote-Arg 就是为它修的）。
         $wc = Invoke-PythonProbe (Join-Path $root 'tests\web_contract.py') `
-                                 @('--port', "$HttpPort", '--web-root', $webDist) 180000 $root
+                                 @('--port', "$HttpPort", '--web-root', $webDist,
+                                   '--user', $TestUser, '--password', $TestPass) 180000 $root
         if (-not $wc) {
             Check $false '找得到 python（web_contract.py 要用）'
         } else {
@@ -221,14 +266,42 @@ try {
             Check ($wc.ExitCode -eq 0) "web_contract.py 退出码 = $($wc.ExitCode)"
             # 退出码万一又拿不到，"失败 0 项"这一行还在输出里，双保险。
             Check ($wc.Stdout -match '失败 0 项') 'web_contract.py 报告"失败 0 项"'
-            Show $wc.Stdout 6
+            # 红了就把**红的那些行**逐条打出来（只打尾巴的话，第 30 行的失败
+            # 会被最后 6 行挤掉，报告上只剩一句"退出码 = 1"）。
+            if (-not $wc.TimedOut -and $wc.ExitCode -ne 0) {
+                Show-Failures $wc.Stdout (Join-Path $root 'out\web_contract.txt')
+                Show $wc.Stdout 6
+            }
+        }
+
+        # 三方一致的第 3 处：**运行期**报出来的版本。
+        #
+        # 这一条和 [2] 段那两条问的不是同一件事。那两条证明"资源编对了"，
+        # 而它证明"那个数真的接上了网络这条路"—— `patch_live_counters` 里那一行
+        # 是 `/api/status` 与 `/ws/stats` 两条路共用的补丁点，加错了地方
+        # （比如只加在 handler 里）会让两个接口的字段集合不一致，而单看 HTTP
+        # 这条路的 version 却完全正常。
+        $apiVer = Get-StatusVersion -Port $HttpPort -User $TestUser -Password $TestPass
+        if ($null -eq $apiVer) {
+            Check $false '能从 /api/status 读到 version' `
+                  ("登录或请求失败了。这份配置里应当是 web.user = $TestUser（装的时候填的那一对），" +
+                   '它在 [3] 段里刚被验过 —— 所以这里红了要往"这一对没被真的用上"那条路查。')
+        } else {
+            Check ($apiVer -ceq $nameVer) `
+                  "运行期 /api/status 的 version = 包名里的版本（接口 $apiVer，包名 $nameVer）" `
+                  '对不上说明 common\version.h 那条 D2O_VERSION 没接上，或者包是拿旧 exe 打的。'
         }
     }
 } finally {
     Stop-Desk2Onvif
-    try { if (-not $app.Process.HasExited) { $app.Process.Kill() } } catch {}
+    # 收的是**整棵**进程树。走 start.ps1 之后这一串是
+    # cmd.exe → powershell.exe(start.ps1) → desk2onvif.exe；只 Kill 那个 cmd
+    # 的话下面两个会变成孤儿继续占着端口 —— 症状是"下一次运行的端口检查
+    # 莫名其妙失败"（verify_portable.ps1 那边早就按这个写法收了）。
+    try { & taskkill.exe /F /T /PID $app.Process.Id 2>&1 | Out-Null } catch {}
     Remove-Item -LiteralPath $app.CmdFile -Force -ErrorAction SilentlyContinue
 }
+Stop-Desk2Onvif
 Wait-PortFree @($RtspPort, $HttpPort)
 
 # --- [6] 静默卸载，必须一点不剩 ----------------------------------------

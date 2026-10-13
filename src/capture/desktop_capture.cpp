@@ -328,21 +328,9 @@ DesktopCapture::Status DesktopCapture::acquire(std::uint32_t timeout_ms,
     // 指针就冻在上一格，而鼠标明明在动 —— 比完全没有指针更让人困惑。
     // 桌面图（不含指针的那份）还在，从它重新合成一张就行，不需要读纹理
     // —— 此刻纹理里是未定义内容，读了就是把垃圾编进视频。
-    if (!pointer_changed || !have_desktop_) return Status::Timeout;
-
-    ensure_dst(dst);
-    if (desktop_.size() != dst.pixels.size()) {
-      // 尺寸对不上（多半是重建过会话但 have_desktop_ 还没被清）。宁可丢掉
-      // 这一帧，也不能整块拷进去 —— 那样画面的下半部分是上一次分辨率的内容。
-      have_desktop_ = false;
-      return Status::Timeout;
-    }
-    std::memcpy(dst.pixels.data(), desktop_.data(), desktop_.size());
-    if (cursor_.drawable()) {
-      cursor_.compose(dst.pixels.data(), width_, height_,
-                      static_cast<std::size_t>(dst.stride));
-      ++composited_frames_;
-    }
+    if (!pointer_changed) return Status::Timeout;
+    Status const st = composite_from_desktop(dst);
+    if (st != Status::Ok) return st;
     ++pointer_only_frames_;
     changed = true;
     return Status::Ok;
@@ -396,6 +384,28 @@ DesktopCapture::Status DesktopCapture::acquire(std::uint32_t timeout_ms,
   changed = true;
   ++changed_frames_;
   return Status::Ok;
+}
+
+DesktopCapture::Status DesktopCapture::composite_from_desktop(BgraFrame& dst) {
+  if (!have_desktop_) return Status::Timeout;
+  ensure_dst(dst);
+  if (desktop_.size() != dst.pixels.size()) {
+    // 尺寸对不上（多半是重建过会话但 have_desktop_ 还没被清）。宁可丢掉
+    // 这一帧，也不能整块拷进去 —— 那样画面的下半部分是上一次分辨率的内容。
+    have_desktop_ = false;
+    return Status::Timeout;
+  }
+  std::memcpy(dst.pixels.data(), desktop_.data(), desktop_.size());
+  if (cursor_.drawable()) {
+    cursor_.compose(dst.pixels.data(), width_, height_,
+                    static_cast<std::size_t>(dst.stride));
+    ++composited_frames_;
+  }
+  return Status::Ok;
+}
+
+DesktopCapture::Status DesktopCapture::reemit(BgraFrame& dst) {
+  return composite_from_desktop(dst);
 }
 
 void DesktopCapture::ensure_dst(BgraFrame& dst) {

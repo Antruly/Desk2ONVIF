@@ -100,6 +100,21 @@ class DesktopCapture {
   Status acquire(std::uint32_t timeout_ms, BgraFrame& dst, bool& changed,
                  std::string& err);
 
+  /// 把**手里那份桌面图**（不含指针的那份）重新合成一张帧，带上当期指针位置。
+  ///
+  /// 存在的理由只有一个：**桌面没动，但画上去的东西要变**。目前那件事是
+  /// "水印配置改了"（位置 / 字号 / 开关，见 `OsdOverlay::key()` 的注释 ——
+  /// 它的键里只有文字，所以配置变了而文字没变时，采集循环根本看不出来）。
+  /// 从前那种情况下循环会复用上一帧，而上一帧里烧着的是**旧位置**的水印，
+  /// 于是"改了没反应"，关掉水印也关不掉。
+  ///
+  /// 与 `acquire()` 里"只动了鼠标"那条路用的是同一段合成代码，差别只在
+  /// 记账：那条路计入 `pointer_only_frames_`，这条不计（它不是指针引起的）。
+  ///
+  /// 返回 `Timeout` = 手上还没有桌面图（第一帧之前）或尺寸对不上，调用方
+  /// 照常当"这一拍没有内容"处理即可 —— 它不是一个错误状态。
+  Status reemit(BgraFrame& dst);
+
   int width() const { return width_; }
   int height() const { return height_; }
 
@@ -120,6 +135,10 @@ class DesktopCapture {
  private:
   /// 按当前的输出尺寸建中转纹理；尺寸没变则复用已有的。
   bool ensure_staging(std::string& err);
+
+  /// "从 `desktop_` 重新合成一张"这件事本身。`acquire()` 的指针那条路与
+  /// `reemit()` 共用它 —— 两份拷贝的写法漂移的症状是"某一路没有指针"。
+  Status composite_from_desktop(BgraFrame& dst);
 
   /// 把 dst 调成当前尺寸。中转纹理和图都要用它。
   void ensure_dst(BgraFrame& dst);

@@ -5,6 +5,7 @@
  * @brief 字符串与错误码的小工具。
  */
 
+#include <ctime>
 #include <string>
 
 namespace d2o {
@@ -13,8 +14,22 @@ namespace d2o {
 ///
 /// 显卡名、显示器设备名都是从 DXGI 拿的宽字符，可能带中文（"英特尔(R) 超核芯
 /// 显卡"）。项目内部一律用 UTF-8 的 std::string，只在调 Windows API 的边界上
-/// 转成宽字符 —— 所以这里只做向内的那一个方向。
+/// 转成宽字符。
 std::string to_utf8(wchar_t const* w, int len = -1);
+
+/// UTF-8 → Windows 宽字符串，`to_utf8` 的反方向。
+///
+/// 需要它的只有 GDI 的 `TextOutW`（水印里可能有中文的摄像头名称）。**不能靠
+/// ANSI 代码页**：同一份 UTF-8 名字在 936 和 65001 的机器上会得到不同的字形，
+/// 而在 65001 之外的机器上中文直接变成乱码 —— 并且只在那台机器上出现。
+std::wstring from_utf8(std::string const& s);
+
+/// `time_t` → **本地**时间的 `std::tm`。
+///
+/// 包一层是因为这个转换在两个平台上叫不同的名字（`localtime_s` /
+/// `localtime_r`）**且参数顺序相反**；而标准的 `std::localtime` 返回的是静态
+/// 缓冲区，多线程下会互相踩 —— 这里有两三个线程同时在跑，不能用它。
+std::tm local_time(std::time_t t);
 
 /// HRESULT → 人能看懂的一句话。
 ///

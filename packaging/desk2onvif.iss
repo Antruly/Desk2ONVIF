@@ -120,6 +120,25 @@ Filename: "{app}\list-displays.bat"; Description: "先看看这台机器能不�
 Type: files; Name: "{app}\config.json"
 Type: files; Name: "{app}\config.json.bak"
 
+; 上面那条判据漏了一整类：**运行期才出现的文件**。【2026-10-08 实测】
+; 操作日志（第四轮 Phase V）落在 {app}\logs\audit-YYYY-MM-DD.log —— 同样是运行时
+; 才建的，不在 unins000.dat 里。不声明的话，静默卸载把 config.json 删掉、
+; 却把 logs\ 整个留下，{app} 于是照样不空、照样不被移除：
+;   [FAIL] 安装目录还在（C:\...\Desk2ONVIF-verify）
+;   [FAIL] 卸载没有留下多余东西（剩 2 项）
+;          logs, logs\audit-2026-10-08.log
+; 症状与 config.json 那一版一模一样，只是文件多了一层目录。绿色版验收没有这一条
+; （它靠 harness 删临时目录），所以只有安装包这一路能照出来。
+; filesandordirs 而不是 files：目录本身也得删掉，否则 {app}\logs 空着一样让
+; {app} 不空。范围限死在 {app} 里面，不递归到别处。
+Type: filesandordirs; Name: "{app}\logs"
+; 同一类：控制台形态（--console）会写 <配置目录>\desk2onvif.log 及其轮转的 .old。
+; 这一次的验收没跑到它们（验收里起的是裸形态 --http，那条路按设计不写日志文件），
+; 所以这两条**不是实测出来的**，是按上面同一个机制补上的 —— 写在这里以免
+; 下次有人以为是漏了。它们同样只落在 {app} 里。
+Type: files; Name: "{app}\desk2onvif.log"
+Type: files; Name: "{app}\desk2onvif.log.old"
+
 [Code]
 var
   PortsPage: TInputQueryWizardPage;
@@ -187,10 +206,27 @@ end;
 
 { 写配置文件。字段与 src/common/config.cpp 的 config_from_json 一一对应；
   没写进去的字段会落到程序内置默认值，所以这里只写"安装时问过的"那几个，
-  其余留空反而更稳（将来加字段不用改安装程序）。 }
+  其余留空反而更稳（将来加字段不用改安装程序）。
+
+  **`web` 对象里必须带上 user / password —— 这一条是真出过事的。**
+  这里原来只写 enabled/host/port，于是向导里让用户填的那一对只落到了 ONVIF 上；
+  Web 控制台拿不到它，只能落回内置默认值 admin/admin。用户的体验是
+  "我在安装时明明设了口令，网页却怎么都登不进去，只有 admin/admin 能进"，
+  而日志、安装日志、程序输出里**没有一个字**提到这件事。
+  现在两处写同一对（同一个向导页、同一份 SelectedUser/SelectedPass），
+  装完之后它们仍是**各自独立**的字段：在控制台改网页口令不会动到 NVR 那份。
+
+  **编码**：用 SaveStringsToUTF8FileWithoutBOM，不用 SaveStringToFile。
+  后者对不含 BOM 的字符串按**系统 ANSI 代码页**（这里是 936/GBK）落盘，
+  而程序那边是 std::ifstream 读字节 + nlohmann::json::parse —— 它按 UTF-8 解。
+  于是"口令里有一个中文"会写成 GBK 字节、被当成乱码 UTF-8 读，
+  结果是**用户按自己填的口令登不进去**，症状与上面那条一模一样。
+  BOM 也不能加：nlohmann 的 parse 遇到 EF BB BF 会直接抛
+  "invalid literal"，而读配置失败是**拒绝启动**的。UTF-8 无 BOM 两边都对。 }
 procedure WriteConfig;
 var
   Json, Path, Bak: String;
+  Lines: TArrayOfString;
 begin
   Path := ExpandConstant('{app}\config.json');
 
@@ -211,14 +247,21 @@ begin
     '  "rtsp":  { "enabled": true, "port": ' + IntToStr(SelectedRtspPort) + ', "path": "/live",' + #13#10 +
     '             "sub_enabled": true, "sub_path": "/live_sub",' + #13#10 +
     '             "sub_height": 360, "sub_bitrate_kbps": 512 },' + #13#10 +
-    '  "web":   { "enabled": true, "host": "' + JsonEscape(SelectedHost) + '", "port": ' + IntToStr(SelectedHttpPort) + ' },' + #13#10 +
+    '  "web":   { "enabled": true, "host": "' + JsonEscape(SelectedHost) + '", "port": ' + IntToStr(SelectedHttpPort) + ',' + #13#10 +
+    '             "auth_enabled": true, "user": "' + JsonEscape(SelectedUser) + '",' + #13#10 +
+    '             "password": "' + JsonEscape(SelectedPass) + '" },' + #13#10 +
     '  "onvif": { "enabled": true, "user": "' + JsonEscape(SelectedUser) + '",' + #13#10 +
     '             "password": "' + JsonEscape(SelectedPass) + '",' + #13#10 +
     '             "manufacturer": "Desk2ONVIF", "model": "Desk2ONVIF Virtual Camera",' + #13#10 +
     '             "firmware_version": "' + '{#MyAppVersion}' + '", "hardware_id": "1.0",' + #13#10 +
     '             "serial_number": "", "device_name": "Desk2ONVIF", "location": "Desktop" }' + #13#10 +
     '}' + #13#10;
-  if not SaveStringToFile(Path, Json, False) then
+  { UTF-8 **无 BOM**，理由见上面那段注释。签名已从编译器自己的声明表里核对过：
+    function SaveStringsToUTF8FileWithoutBOM(const FileName: String;
+      const S: TArrayOfString; const Append: Boolean): Boolean; }
+  SetArrayLength(Lines, 1);
+  Lines[0] := Json;
+  if not SaveStringsToUTF8FileWithoutBOM(Path, Lines, False) then
   begin
     { 静默安装下这条路只有一个出口：日志。弹框就是挂住。 }
     if WizardSilent() then
@@ -326,7 +369,7 @@ begin
   if SelectedUser = '' then
   begin
     SelectedUser := 'admin';
-    Log('未指定 ONVIF 用户名，用默认值 admin。');
+    Log('未指定登录用户名，用默认值 admin（Web 控制台与 ONVIF 共用这一份）。');
   end;
 
   SelectedPass := GetParam('D2OPASS', '');
@@ -334,14 +377,16 @@ begin
   if SelectedPass = '' then
   begin
     SelectedPass := 'admin';
-    Log('未指定 ONVIF 口令，用默认值 admin。口令是公开的出厂值，建议改掉。');
+    Log('未指定登录口令，用默认值 admin。口令是公开的出厂值，建议改掉。');
   end;
   { 口令**不进日志**。安装日志经常被贴进工单和聊天窗口。 }
 
+  { 只记用户名，不记口令 —— 这一行会连同上面那两条一起去查"安装时到底
+     用了什么账号"，而它记的正是会被写进 config.json 的 web.user / onvif.user。 }
   Log('安装参数：RTSP 端口 ' + IntToStr(SelectedRtspPort) +
       '，Web 端口 ' + IntToStr(SelectedHttpPort) +
       '，监听 ' + SelectedHost +
-      '，ONVIF 用户 ' + SelectedUser);
+      '，登录用户 ' + SelectedUser + '（Web 与 ONVIF 共用）');
 
   { 先把话说清楚再让人选监听范围。Web 控制台**是要登录的**，但出厂口令是
      公开的 admin/admin —— "没改过口令"和"没鉴权"在效果上几乎一样，而它默认
@@ -352,8 +397,8 @@ begin
     'Desk2ONVIF 的 Web 控制台（预览页、状态页、配置页）需要登录，' + #13#10 +
     '但**出厂用户名/口令是 admin/admin，是公开的**，装完请立刻改掉。' + #13#10 +
     '在改掉之前，如果监听所有网卡，同一局域网内任何一台机器都能进来看你的桌面画面、读配置、改配置。' + #13#10 + #13#10 +
-    'ONVIF 的 SOAP 端点（NVR 用的那个）是**另一套凭据**，它有自己的 Digest 鉴权；' + #13#10 +
-    '改 Web 的口令不会影响 NVR，两边要分别设。' + #13#10 + #13#10 +
+    '下一页让你填的那一份用户名/口令，**Web 登录和 NVR 用的都是它**（装完之后' + #13#10 +
+    '两者在控制台里仍是各自独立的字段，改网页口令不会动到 NVR 那份）。' + #13#10 + #13#10 +
     '要让 NVR 或别的机器拉流，必须选"监听所有网卡"；只想本机自己看就选"仅本机"。' + #13#10 +
     '装完也可以改：运行 start-local.bat 即可切到仅本机。',
     True, False);
@@ -375,12 +420,16 @@ begin
   PortsPage.Values[1] := IntToStr(SelectedHttpPort);
 
   CredPage := CreateInputQueryPage(PortsPage.ID,
-    'ONVIF 凭据',
-    'NVR 添加通道时要填的用户名和口令',
-    '在 NVR 上添加这台"摄像机"时，会让你填摄像机用户名/密码 —— 就是这一对。' + #13#10 + #13#10 +
+    '登录凭据',
+    'Web 控制台与 NVR 都用这一份用户名和口令',
+    '这一对会同时写进配置文件的 web 与 onvif 两处：' + #13#10 +
+    '  · 打开 Web 控制台（预览页/状态页/配置页）时登录用的就是它；' + #13#10 +
+    '  · 在 NVR 上添加这台"摄像机"时填的摄像机用户名/密码，也是它。' + #13#10 + #13#10 +
     '**请改掉默认口令**：出厂值 admin/admin 是公开的。' + #13#10 +
     '注意口令留空在这程序里**不等于关闭鉴权**，而是"口令就是空字符串"，' + #13#10 +
-    '任何知道用户名的人都能进 —— 所以不要留空。');
+    '任何知道用户名的人都能进 —— 所以不要留空。' + #13#10 + #13#10 +
+    '装完之后这两份是**各自独立**的字段：在控制台里改网页口令不会连带改掉 NVR 那份，' + #13#10 +
+    '反之亦然（这样改网页口令就不用把 NVR 全部重配一遍）。');
   CredPage.Add('用户名：', False);
   CredPage.Add('口令：', True);          { True = 输入时显示为星号 }
   CredPage.Values[0] := SelectedUser;

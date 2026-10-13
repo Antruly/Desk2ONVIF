@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 import { noteUnauthorized } from './useAuth'
-import type { ConnState, RtspStream, Stats } from '../types'
+import type { ChannelStat, ConnState, RtspStream, Stats } from '../types'
 
 /**
  * /ws/stats 的订阅状态。
@@ -29,16 +29,40 @@ function emptyStats(): Stats {
     queue_dropped: 0,
     pool_exhausted: 0,
     access_lost: 0,
+    adaptive_dropped: 0,
+    osd_refresh_frames: 0,
+    drops_recent: 0,
+    perf_state: 'ok',
+    perf_duty: 1,
+    perf_target_fps: 0,
+    perf_hint: '',
+    perf_suggested_quality: '',
     nalu_dropped: 0,
     max_nalu_bytes: 0,
     rtsp_clients: 0,
     rtsp_url: '',
+    // 0 = 采集还没产出过统计（`/api/status` 的补丁路径上这一对是缺的，
+    // 兜底成 0 之后界面显示"未知"而不是一个编出来的尺寸）。
+    video_width: 0,
+    video_height: 0,
     sub_width: 0,
     sub_height: 0,
     rtsp_streams: [],
+    // `off` 而不是 `ok`：默认就是没开音频，状态文字应当是"未启用"而不是
+    // "一切正常" —— 后者会让没开音频的人以为音轨在录。
+    audio_state: 'off',
+    audio_level_l: 0,
+    audio_level_r: 0,
+    audio_frames: 0,
+    audio_sample_rate: 0,
+    audio_packets: 0,
+    audio_zero_filled: 0,
     cursor_frames: 0,
     pointer_only_frames: 0,
     web_port: 0,
+    // 空串而不是 "0.0.0"：后端还没答话时，界面上该显示"未知"，编一个像模像样
+    // 的版本号比留空更坏 —— 没人会去怀疑一个看着正常的数字。
+    version: '',
     ws_clients: 0,
     wsd_running: false,
     wsd_probes_seen: 0,
@@ -52,6 +76,21 @@ function emptyStats(): Stats {
     preview_fragments: 0,
     preview_fragments_unwatched: 0,
     preview_clients_kicked: 0,
+    // `manual` 是配置里的默认模式，也是回调没接上（单跑录制那条路）时后端报
+    // 的值 —— 兜底取它才和后端说得一致。
+    time_mode: 'manual',
+    // 0 = 设备时间就是主机时间。这一组的兜底值里**只有它是"看着正常"的**，
+    // 而那恰好也对：偏移本来就是 0 的时候，界面上写「与主机一致」是句真话。
+    device_offset_s: 0,
+    time_synced: false,
+    last_sync_at: 0,
+    // 空串 = 还没试过。**不能兜底成 `"ok"`** —— 那会让一个从没对过时的设备
+    // 在界面上显示"对时正常"，而这正是这一组字段要防的那种假象。
+    last_sync_state: '',
+    last_sync_error: '',
+    // 空数组而不是"一行通道 1"：这份兜底只该在**后端还没答过话**时出现，而
+    // 那一刻我们连有几路都不知道 —— 编一行出来会让状态页先显示一个假的通道 1。
+    channels: [],
   }
 }
 
@@ -86,6 +125,28 @@ function streams(v: unknown): RtspStream[] {
   })
 }
 
+/** `channels` 逐行兜底。和 `streams()` 同一套理由：不能直接断言成 ChannelStat。 */
+function channels(v: unknown): ChannelStat[] {
+  if (!Array.isArray(v)) return []
+  return v.map((e) => {
+    const o = (e ?? {}) as Record<string, unknown>
+    return {
+      index: num(o.index),
+      name: str(o.name),
+      source: str(o.source),
+      // **空串兜底成一句人话**，不是什么都不填：状态那一栏是整张表的主干，
+      // 空白格看着像界面坏了。后端在跑起来之前也确实会有一段没写状态的时间。
+      state: str(o.state) || '未知',
+      fps: num(o.fps),
+      bitrate_kbps: num(o.bitrate_kbps),
+      record_file: str(o.record_file),
+      record_bytes: num(o.record_bytes),
+      web_port: num(o.web_port),
+      rtsp_path: str(o.rtsp_path),
+    }
+  })
+}
+
 /**
  * 把任意外来对象收敛成完整的 Stats。
  * 后端第一帧可能缺字段，这里逐字段兜底是必须的 —— 少一个字段就会让整块面板
@@ -104,16 +165,40 @@ export function normalizeStats(raw: unknown): Stats {
     queue_dropped: num(o.queue_dropped),
     pool_exhausted: num(o.pool_exhausted),
     access_lost: num(o.access_lost),
+    adaptive_dropped: num(o.adaptive_dropped),
+    osd_refresh_frames: num(o.osd_refresh_frames),
+    drops_recent: num(o.drops_recent),
+    // 这两个的兜底值**不能**是 num() 的 0：
+    //   perf_duty = 0 在界面上写成"每 0 拍出一帧"，而显示它的人会以为是自己配错了；
+    //   perf_state = '' 会让状态灯落到一个没有对应样式的分支上，表现为一片灰。
+    perf_state: str(o.perf_state) || 'ok',
+    perf_duty: Math.max(1, num(o.perf_duty)),
+    perf_target_fps: num(o.perf_target_fps),
+    perf_hint: str(o.perf_hint),
+    perf_suggested_quality: str(o.perf_suggested_quality),
     nalu_dropped: num(o.nalu_dropped),
     max_nalu_bytes: num(o.max_nalu_bytes),
     rtsp_clients: num(o.rtsp_clients),
     rtsp_url: str(o.rtsp_url),
+    video_width: num(o.video_width),
+    video_height: num(o.video_height),
     sub_width: num(o.sub_width),
     sub_height: num(o.sub_height),
     rtsp_streams: streams(o.rtsp_streams),
+    // 兜底是 `off` 而不是空串：空串会落到状态文字那个 switch 的 default 上，
+    // 而 default 要么什么都不显示、要么显示一句"未知状态" —— 前者让音轨整个
+    // 从界面上消失，后者在一个健康的后端上永远不会出现却看着像故障。
+    audio_state: str(o.audio_state) || 'off',
+    audio_level_l: num(o.audio_level_l),
+    audio_level_r: num(o.audio_level_r),
+    audio_frames: num(o.audio_frames),
+    audio_sample_rate: num(o.audio_sample_rate),
+    audio_packets: num(o.audio_packets),
+    audio_zero_filled: num(o.audio_zero_filled),
     cursor_frames: num(o.cursor_frames),
     pointer_only_frames: num(o.pointer_only_frames),
     web_port: num(o.web_port),
+    version: str(o.version),
     ws_clients: num(o.ws_clients),
     wsd_running: flag(o.wsd_running),
     wsd_probes_seen: num(o.wsd_probes_seen),
@@ -127,6 +212,17 @@ export function normalizeStats(raw: unknown): Stats {
     preview_fragments: num(o.preview_fragments),
     preview_fragments_unwatched: num(o.preview_fragments_unwatched),
     preview_clients_kicked: num(o.preview_clients_kicked),
+    // 兜底 `manual` 而不是空串：空串会落到界面上那个二选一的分支外面，
+    // 表现为"模式那一行整个不显示"，而模式是这一段的表头。
+    time_mode: str(o.time_mode) || 'manual',
+    device_offset_s: num(o.device_offset_s),
+    time_synced: flag(o.time_synced),
+    last_sync_at: num(o.last_sync_at),
+    // **空串是有意义的值**（= 还没试过），所以这里不能像 time_mode 那样给
+    // 一个"看着正常"的兜底：兜底成 `ok` 就是把"从没对过时"报成"对时正常"。
+    last_sync_state: str(o.last_sync_state),
+    last_sync_error: str(o.last_sync_error),
+    channels: channels(o.channels),
   }
 }
 

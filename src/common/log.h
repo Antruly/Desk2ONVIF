@@ -56,10 +56,53 @@ class Log {
   /// 拼好整行再输出，避免多线程互相插入。
   static void write(LogLevel lv, std::string const& msg, char const* file, int line);
 
+  /// 除 stderr 之外**再**写一份到文件。
+  ///
+  /// 长驻形态（`--console` / `--worker`）需要它，而且两边的理由不同：
+  ///
+  ///   * 控制台形态：用户双击起来，用完了直接把窗口一关 —— stderr 跟着消失，
+  ///     出过什么问题一点痕迹都不留。
+  ///   * 服务形态：worker 是 `CreateProcessAsUserW` 拉起来的，**根本没有控制台**，
+  ///     它的 stderr 落在虚空里。没有这一份，那种形态出问题时能拿到的只有
+  ///     "进程还在、端口开着"，任何原因都查不到（服务自己的日志只记它拉起了谁）。
+  ///
+  /// 打不开**不当错误**：只往 stderr 说一句就算。日志写不出来不该让程序起不来。
+  /// 文件超过 4 MB 自动轮转一份 `.old`（一次轮转，不留历史备份）。
+  static void set_file(std::string const& path);
+  /// 按值返回：它由一把锁保护着，而调用方拿它只是为了打印一行。
+  static std::string file_path();
+
+  /// 关掉文件那一份（幂等，没开过也照样成功）。**给"恢复出厂要删掉日志"用。**
+  ///
+  /// 存在的唯一理由是 Windows 的 `fopen` 不带 `FILE_SHARE_DELETE`：句柄开着
+  /// 的时候 `std::remove` 直接失败（Permission denied），而症状恰好是那件事最
+  /// 不该出错的地方 —— "恢复出厂之后旧的日志还在"。所以顺序只能是
+  /// **先 `close_file()`、再删、最后 `set_file(原路径)` 开回来**。
+  ///
+  /// 关掉之后文件那一份就没有了（只剩下 stderr），所以删完必须开回来，
+  /// 否则从那以后到进程退出之间的日志一行都不落盘。
+  static void close_file();
+
  private:
   static std::atomic<int> level_;
   static std::mutex mutex_;
 };
+
+/// 这个名字是不是**我们自己的**日志文件。
+///
+/// 剪枝（审计日志按天留 N 天）、清空（恢复出厂）、以及验收里"不该删的那个还在
+/// 不在"三处都调它 —— 一个判据三处用。写两遍的话它们迟早漂移，而漂移的症状
+/// 是"恢复出厂之后旧日志还在"，正好是审计最不该出问题的地方。
+///
+/// 认三种：
+///   * `desk2onvif.log`        —— 调试日志（`Log::set_file`）
+///   * `desk2onvif.log.old`    —— 它 4 MB 轮转出来的那一份
+///   * `audit-YYYY-MM-DD.log`  —— 审计日志按天一份（`audit_log`）
+///
+/// **只认名字，不认识路径**：调用方只把文件名喂进来，所以它对
+/// `..\..\windows\system32\x.log` 这种输入天然没有反应 —— 这个窄化是刻意的，
+/// 它让"删错了目录"这件事在这个函数里不可能发生。
+bool is_our_log_file(std::string const& name);
 
 }  // namespace d2o
 

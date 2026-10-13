@@ -38,7 +38,10 @@ constexpr AVRational kMicro{1, 1000000};
 /// 关键帧标志本来应该由 av_parser_parse2 填（它确实会填），但**只有它自己找
 /// 帧边界的那套状态机跑起来时才填**。而那套状态机要求"下一帧的起始码已经到
 /// 了"才肯结束当前帧，也就是每帧要压后一次调用才吐出来 —— 实测喂 300 个 AU
-/// 只出来 299 个，最后一帧永远卡在解析器里出不来，本模块又没有 flush 的位置。
+/// 只出来 299 个，最后一帧永远卡在解析器里出不来。**这一句原来跟着的下一句是
+/// "本模块又没有 flush 的位置" —— 那个位置现在有了（`flush()`），但它管的是 mov
+/// 的**分片边界**，不会替解析器吐出扣着的那一帧**，所以上面这个结论一个字都没变：
+/// 别拿 `flush()` 当它的解药，也别因为"现在有 flush 了"就以为解析器会多吐一帧。
 /// 所以解析器被切到 COMPLETE_FRAMES 模式（见 init()），代价是它不再判帧界，
 /// 于是 s->key_frame 只剩第一帧是对的（实测 300 帧只标出 1 个）。
 ///
@@ -118,8 +121,20 @@ void Fmp4Muxer::teardown() {
   ready_ = false;
   have_base_ = false;
   have_last_ = false;
+  // t0 是**每个会话一份**的：init() 会走这里，所以换一次会话就重新记一次。
+  // 不重置的话，第二次会话报出去的 t0 会是上一次那个墙钟，于是浏览器算出来的
+  // "真实延迟"平白多出一整段会话的时长 —— 而它看起来只是"延迟很大"。
+  have_t0_ = false;
+  t0_wall_ms_ = 0;
   last_dts_ = 0;
   first_duration_ = 0;
+  // 分片那两个也是**每个会话一份**的。`pending_samples_` 不清的话，第二次会话
+  // 的第一次 `flush()` 会看到上一次会话留下的计数、于是落在一个空封装器上；
+  // `fragment_on_flush_` 不清的话，一次"开着 frag_custom 的会话"之后紧接着
+  // 一次不开的会话，第二次会在 movflags 之外还留着"这个开关开着"这个印象 ——
+  // 而 init() 的 doc 明说关掉时 movflags 与加它之前逐字节相同，那是个承诺。
+  pending_samples_ = 0;
+  fragment_on_flush_ = false;
 
   if (pkt_) av_packet_free(&pkt_);
 
@@ -152,8 +167,15 @@ void Fmp4Muxer::teardown() {
 }
 
 bool Fmp4Muxer::init(int width, int height,
-                     std::vector<std::uint8_t> const& extradata_annexb, int fps) {
+                     std::vector<std::uint8_t> const& extradata_annexb, int fps,
+                     bool fragment_on_flush) {
   teardown();
+
+  // 先落到成员上再往下走：下面第 4 段算 movflags 时读它，而那是**唯一**一处
+  // 读它的地方。`flush()` 自己不回头看这个标志 —— 标志关掉时 mov 怎么对待那次
+  // 强制 flush 是它的事（我们不替它断言），我们只保证"没开这个开关时 movflags
+  // 与加它之前逐字节相同"。
+  fragment_on_flush_ = fragment_on_flush;
 
   if (width <= 0 || height <= 0 || extradata_annexb.empty()) {
     D2O_ERROR("fMP4 初始化失败：参数不合法（%dx%d，extradata %zu 字节）", width,
@@ -276,8 +298,25 @@ bool Fmp4Muxer::init(int width, int height,
   //   default_base_moof  trun 里的 data_offset 以 moof 为基准（CMAF/DASH 的
   //                  要求）。这个是给更严格的解析器准备的，浏览器两种都吃，
   //                  但既然 CMAF 规定了就没必要省。
-  av_opt_set(fmt_->priv_data, "movflags",
-             "+frag_keyframe+empty_moov+default_base_moof", 0);
+  //
+  // frag_custom 是**第四个**，默认**不加**，只在预览那条路上由 fragment_on_flush_
+  // 打开。⚠️ **它的作用与它的名字给人的印象不一样**（量过的结论，读数在头文件
+  // `flush()` 那段注释里）：真正切分片的是 `flush()` 里那句
+  // `av_write_frame(fmt_, nullptr)`，**不是这个标志**。`tests/fmp4_check.cpp` 的
+  // 「切碎不等于切坏」拿开关关着的对象、同样调 43 次 flush()：分片数一样
+  // （47/47）、样本一样（300/300），两份输出逐字节相同。
+  //
+  // 所以"不加它时上面这三个的组合与加它之前逐字节相同"这句话是对的，但它守的
+  // 不是"切不切"，只是"默认行为不变"。这一段原先把后半句写成"于是延迟收益可以
+  // 拿两次构建对减" —— 逐字节相同这件事恰好否掉了那个做法：差是 0。要 A/B 的是
+  // 调用不调用 flush()，那一处在 capture_session.cpp。
+  //
+  // 字符串在这里拼好、下面 logging 那一行直接复用它：**分片策略只有一份来源**，
+  // 于是"日志里写的"和"实际设进去的"不可能漂移 —— 而这两者漂移的症状是排查的人
+  // 按日志去查一个根本没开着的开关。
+  std::string movflags = "+frag_keyframe+empty_moov+default_base_moof";
+  if (fragment_on_flush_) movflags += "+frag_custom";
+  av_opt_set(fmt_->priv_data, "movflags", movflags.c_str(), 0);
 
   ret = avformat_write_header(fmt_, nullptr);
   if (ret < 0) {
@@ -350,9 +389,8 @@ bool Fmp4Muxer::init(int width, int height,
   }
 
   ready_ = true;
-  D2O_INFO("fMP4 就绪：%dx%d，init 段 %zu 字节，时基 1/%d，分片策略 "
-           "+frag_keyframe+empty_moov+default_base_moof",
-           width, height, init_segment_.size(), kMicro.den);
+  D2O_INFO("fMP4 就绪：%dx%d，init 段 %zu 字节，时基 1/%d，分片策略 %s",
+           width, height, init_segment_.size(), kMicro.den, movflags.c_str());
   return true;
 }
 
@@ -406,6 +444,30 @@ bool Fmp4Muxer::write_nal(std::uint8_t const* data, int size,
   pkt_->duration = have_last_ ? (dts - last_dts_) : first_duration_;
   if (key) pkt_->flags |= AV_PKT_FLAG_KEY;
 
+  // --- 媒体时间 0 点对回墙钟（浏览器那把"真实延迟"尺子的锚）-------------------
+  //
+  // **定这个 0 点的是封装器，不是上面那两行减法。** 这是量出来的，不是推的：
+  // 把 `base_dts_us_ = s.dts_us;` 改成 `= 0;`（也就是把我们那次减法整个拿掉）、
+  // 再把交出去的 dts 整体平移 74 秒重新编译，输出里的 tfdt 仍然从 0 起、
+  // **与基线逐字节相同**（`out/fmp4-t0-sweep2.txt` 的 M1）。libavformat 的 mov
+  // 封装器按"这条轨看到的第一个 dts"重新定基准，所以我们减不减它都无所谓
+  // （上面那次减法的真正职责是别让 1e6 的 timescale 撞上 int64，见本函数开头）。
+  //
+  // 于是锚点就是**第一个落到 av_interleaved_write_frame 的样本**，而它必须
+  // 在这里取，不能在 write() 入口取：这个函数的 `s` 是**当前**这个样本的，
+  // 解析器正常模式下无法在没有下一个起始码的情况下切出输入里的最后一个访问
+  // 单元 ⇒ 第一个落到封装器的包可能带着**第 1 个样本的 dts、装的却是第 0 个
+  // 样本的像素**。差一个帧间隔（30fps 下 33 ms）—— 在一把 150 ms 容差的尺子上
+  // 看不出来，但那是"差不多对"，正是这一阶段要消灭的东西。
+  //
+  // `wall_ms <= 0` 表示调用方没提供墙钟（测试、以及不用预览的路径）。这时**不记**，
+  // `has_t0()` 保持为假、界面上显示"未知" —— 比报一个看起来合理的假数好：
+  // 拿 0 当 t0 的话前端算出来的是 1970 年到现在，而它会被当成"延迟巨大"去查。
+  if (!have_t0_ && s.wall_ms > 0) {
+    t0_wall_ms_ = s.wall_ms;
+    have_t0_ = true;
+  }
+
   // av_interleaved_write_frame 会拿走包的内容（返回后 pkt_ 是空的），
   // 这正是我们要的：pkt_ 结构体留着复用，内容本来也要丢。
   int const wret = av_interleaved_write_frame(fmt_, pkt_);
@@ -417,6 +479,12 @@ bool Fmp4Muxer::write_nal(std::uint8_t const* data, int size,
 
   last_dts_ = dts;
   have_last_ = true;
+  // 只有**真的落进封装器**才计数（上面那条 return false 的路径不经过这里）：
+  // `flush()` 拿它当"有没有东西可以切"的闸门，一个写失败的样本不该让那道闸门
+  // 打开 —— 否则 flush() 会落到一个没有任何样本的封装器上，而 mov 在强制 flush
+  // 之下会照样吐一个**零样本**的 moof+mdat，那是 MSE 的 SourceBuffer 当场拒收的
+  // 东西（`AppendError`）。这条闸门的位置就是这么定下来的。
+  ++pending_samples_;
   return true;
 }
 
@@ -478,8 +546,63 @@ bool Fmp4Muxer::write(Fmp4Sample const& s, std::vector<std::uint8_t>& out) {
     out.insert(out.end(), buffer_.begin(), buffer_.end());
     buffer_.clear();
     io_state_.pos = 0;
+    // 这次 write() 吐了字节出来 ⇒ 封装器刚刚切了一刀（`frag_keyframe` 那一刀，
+    // 它落在哪个关键帧上我们看不见），攒着的样本已经落盘了。清零点就在这里，
+    // 依据是"有输出"这个**可观测**的事实，而不是去猜 mov 内部的状态。
+    // 不清的话 `flush()` 会在下一个强制切分点上把上一刀之后那些已经写出去的
+    // 样本再数一遍 —— 数多了不会写坏东西（闸门只是"非零即开"），但那个数就
+    // 不再是"攒着多少"，而是"喂过多少"，两个名字里只有一个是真的。
+    pending_samples_ = 0;
   }
   return ok;
+}
+
+bool Fmp4Muxer::flush(std::vector<std::uint8_t>& out) {
+  if (!ready_ || !fmt_ || !stream_) {
+    D2O_ERROR("fMP4：还没初始化就要求切分片");
+    return false;
+  }
+  // 没有新样本就是空操作。闸门放在这里、不指望调用方自己数，理由见头文件。
+  if (pending_samples_ == 0) return true;
+
+  buffer_.clear();
+  io_state_.pos = 0;
+
+  // **必须用 `av_write_frame`，不能用 `av_interleaved_write_frame`。** 两者在
+  // `pkt == nullptr` 时的语义**不是**同一件事，这是逐字读随包发布的头文件定下来的
+  // （不是回忆、也不是猜）：
+  //   av_write_frame()            "This parameter can be NULL (at any time, not just
+  //                                at the end), in order to immediately flush data
+  //                                buffered within the muxer, for muxers that buffer
+  //                                up data internally before writing it to the output."
+  //   av_interleaved_write_frame() "This parameter can be NULL (at any time, not just
+  //                                at the end), to flush the **interleaving queues**."
+  // 我们要的是前者 —— 让 mov 把攒着的那一簇样本切出来。后者只清空交织队列，
+  // 而我们是单流、包早就穿过它了，刷它等于什么都没做。
+  // （两段文档里都**没有**"不要混用"的警告，所以在 write() 用交织版、这里用
+  // 直接版是可以的；真要哪天合成一条路，得先把这个前提重新量一遍。）
+  int const ret = av_write_frame(fmt_, nullptr);
+  if (ret < 0) {
+    D2O_ERROR("fMP4：切分片失败：%s", av_error(ret).c_str());
+    // 不清 pending_samples_：这一刀没切成，样本还在封装器里，下一次 flush()
+    // 应该再试一次。清掉就等于把它们扔了。
+    return false;
+  }
+  // 和 write() 同一个理由：avio 是带缓冲的，不 flush 的话刚切出来的分片可能还
+  // 躺在那个 4KB 的缓冲里没落进 buffer_ —— 于是"切了一刀"在调用方看来是零字节，
+  // 而零字节和"没到该切的时候"长得一模一样。
+  avio_flush(fmt_->pb);
+
+  if (!buffer_.empty()) {
+    out.insert(out.end(), buffer_.begin(), buffer_.end());
+    buffer_.clear();
+    io_state_.pos = 0;
+    // 只有真的交出了字节才算这一刀切成了。封装器完全可能"收下了 flush 但一个分片
+    // 都没写"（还没攒够、或者分片边界不在这里），那时清零就是把闸门重新关上，
+    // 攒着的样本从此再没人去切 —— 而它在画面上只表现为"最后一段预览卡住"。
+    pending_samples_ = 0;
+  }
+  return true;
 }
 
 }  // namespace d2o

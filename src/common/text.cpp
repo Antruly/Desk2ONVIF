@@ -86,4 +86,34 @@ std::string hresult_text(long hr) {
   return "未知 HRESULT " + hresult_hex(hr);
 }
 
+std::wstring from_utf8(std::string const& s) {
+  if (s.empty()) return std::wstring();
+#ifdef _WIN32
+  // 和 to_utf8 对称：长度显式给，不走 -1（否则结尾空字符会被算进去）。
+  int const n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                                      nullptr, 0);
+  if (n <= 0) return std::wstring();
+  std::wstring w(static_cast<std::size_t>(n), L'\0');
+  ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+  return w;
+#else
+  std::wstring w;
+  w.reserve(s.size());
+  for (unsigned char c : s) w.push_back(static_cast<wchar_t>(c));
+  return w;
+#endif
+}
+
+std::tm local_time(std::time_t t) {
+  std::tm out{};
+#ifdef _WIN32
+  // 参数顺序是 (输出, 输入)。Windows 上它同时把时区和夏令时都算好 ——
+  // 时区这块正是 ONVIF 那边需要的（GetSystemDateAndTime 要报 TZ）。
+  ::localtime_s(&out, &t);
+#else
+  ::localtime_r(&t, &out);
+#endif
+  return out;
+}
+
 }  // namespace d2o

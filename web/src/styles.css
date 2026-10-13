@@ -80,7 +80,27 @@ body {
   font-family: var(--sans);
   font-size: 14px;
   line-height: 1.6;
-  /* 窄屏下不该出现横向滚动条；个别宽内容（表格、代码）自己滚。 */
+}
+
+/*
+ * 「窄屏下不该出现横向滚动条」这句只能写在 html 上，**不能写在 body 上**。
+ *
+ * 非根元素上任何非 visible 的 overflow 都会让那个元素变成一个真正的滚动
+ * 容器，而 body 的高度是 auto —— 它的滚动口永远不滚。于是 .sidebar /
+ * .topbar 上那句 `position: sticky` 会去粘**body**而不是视口：侧栏保持在自己
+ * 的静态位置上，内容一滚它就跟着滚出屏幕，看上去和完全没写 sticky 一模一样
+ * （用户实测报的就是这一条：「点菜单是滚动下拉，菜单自己也跟着滚」）。
+ * 而这一条只看样式表是看不出来的，两处 overflow 都写着 hidden，一个字都不错。
+ *
+ * html 上这句会传播到视口，所以「不出现横向滚动条」的效果一点没变；个别宽
+ * 内容（表格、代码）照旧自己滚。
+ *
+ * 实测（out\layout-aux-check.mjs，在浏览器里逐个改这一个变量）：
+ *   body 留 hidden  → 侧栏 top=-4698（没粘）
+ *   body 改 visible → 侧栏 top=0（粘住）
+ *   只改 html、body 不动 → 仍然是 -4698（**改 html 没用，问题全在 body**）
+ */
+html {
   overflow-x: hidden;
 }
 
@@ -117,12 +137,197 @@ a:hover {
 
 /* ---------- 布局骨架 ---------- */
 
+/* 横向两栏：左边是侧栏，右边是"顶栏 + 内容"的工作区。
+   侧栏用 sticky 而不是 fixed —— fixed 会让它脱离文档流，右边的宽度就得靠
+   一个手写的 margin-left 去补，而那个数会在折叠/窄屏之间来回变。 */
 .app {
   position: relative;
   z-index: 1;
   min-height: 100vh;
   display: flex;
+  flex-direction: row;
+}
+
+/* ---------- 侧栏 ---------- */
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  z-index: 22;
+  flex: 0 0 210px;
+  width: 210px;
+  height: 100vh;
+  display: flex;
   flex-direction: column;
+  background: rgba(9, 15, 28, 0.72);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border-right: 1px solid var(--border);
+  /* 收起/展开的动画。宽度用 flex-basis 和 width 一起改 —— 只改其中一个
+     的话，那条 `flex: 0 0 210px` 里的 210px 会继续说了算。 */
+  transition: width var(--t-base), flex-basis var(--t-base);
+}
+
+/* 收起：只剩一条图标栏。文字不删，只是不显示（读屏还要用）。 */
+.sidebar.is-collapsed {
+  flex-basis: 56px;
+  width: 56px;
+}
+
+.side-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 10px 10px 6px;
+  min-height: 48px;
+}
+
+.sidebar.is-collapsed .side-head {
+  justify-content: center;
+}
+
+/* 折叠按钮：它是 `<button>`，先抵消掉那条全局按钮样式（它有底色和边框）。 */
+.side-toggle {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-3);
+}
+
+.side-toggle:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.side-nav {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.side-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 分组标题。字号小、字距大、颜色淡 —— 它是个标签，不是可点的东西，
+   所以样式上要和菜单项分得开。 */
+.side-group-title {
+  padding: 0 10px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--text-3);
+}
+
+.sidebar.is-collapsed .side-group-title {
+  /* 收起时这条标题只剩一两个字宽度，会挤成一条竖线。不显示比显示好。 */
+  display: none;
+}
+
+.side-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  color: var(--text-2);
+  font-size: 13.5px;
+  transition: all var(--t-fast);
+}
+
+.side-link:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* 当前项：底色渐变 + 边框 + 左侧一道高亮。三重表示，不只靠色差 ——
+   与原来那条横向导航的判据一致（低亮度屏上单看色差几乎看不出来）。 */
+.side-link.is-active {
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.16), rgba(0, 212, 255, 0.04));
+  border-color: var(--border-strong);
+  color: var(--text);
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+
+.side-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar.is-collapsed .side-link {
+  justify-content: center;
+  padding: 9px 0;
+}
+
+.sidebar.is-collapsed .side-label {
+  /* 整个不显示，而不是缩成一个点：210→56 之后剩下的宽度不够放字，
+     勉强留着会挤出一条竖着的残影。 */
+  display: none;
+}
+
+/* 版本号。放在最底下，和菜单之间用一条分隔线断开 —— 它不是菜单项。 */
+.side-foot {
+  padding: 9px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 11.5px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* 抽屉拉开时压在内容上的那层。点它 = 收抽屉。
+   默认不显示：它只在窄屏有意义（宽屏下侧栏本来就常驻）。而"在窄屏拉开了
+   抽屉、然后把窗口拉宽"这件事会让 `drawerOpen` 留着 true —— 遮罩要是在
+   宽屏也渲染，就会盖住整个页面，用户只能靠点它来关掉。这里由 CSS 兜住，
+   不必让 JS 再去监听视口宽度（那份副本会过期）。 */
+.side-scrim {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 26;
+  background: rgba(4, 8, 16, 0.62);
+}
+
+/* ---------- 工作区 ---------- */
+
+.workspace {
+  flex: 1;
+  /* 少了这一句，里面任何一张宽表格都会把这一栏撑得比屏幕还宽，
+     于是**整页**横向滚动，而侧栏被推出视口。flex 项的 min-width 默认是
+     auto（= 内容宽度），必须显式归零。 */
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 汉堡按钮：只在 ≤720px 出现（见文件末尾那条媒体查询），
+   它取代的是原来那条横向导航。 */
+.hamburger {
+  display: none;
+  width: 34px;
+  height: 30px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-2);
+}
+
+.hamburger:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 .topbar {
@@ -177,36 +382,22 @@ a:hover {
   text-transform: uppercase;
 }
 
-.nav {
-  display: flex;
-  gap: 2px;
-  flex-wrap: wrap;
-}
+/* 锚点跳转（侧栏那几个 `/config#…` 子项）落点要避开顶栏。
+   顶部那条状态栏是 sticky 的，不让开的话段落标题正好被它盖住 —— 看起来像
+   "点进去少了一行"。这个偏移是 CSS 的活：`scrollIntoView` 认 `scroll-margin`，
+   所以 `scroll.ts` 和 `router.ts` 里都**不该**再手写一个偏移量（写两处迟早不一致）。
+   72px ≈ 顶栏高度 + 一点余量。
 
-.nav a {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 14px;
-  border-radius: var(--radius-sm);
-  color: var(--text-2);
-  font-size: 13.5px;
-  border: 1px solid transparent;
-  transition: all var(--t-fast);
-}
+   ⚠️ **这个数是两处共用的，改它要一起想。** `scrollIntoView`（`scroll.ts`）
+   认它，而 `router.ts` 的 `scrollBehavior` 不认 —— vue-router 拿到 `el` 之后
+   是自己算位置的，所以那边用 `getComputedStyle(el).scrollMarginTop` 把**这个数
+   读回去**当偏移。别在那边写死一个 72：那就成了两份会漂移的副本。
 
-.nav a:hover {
-  background: var(--surface-2);
-  color: var(--text);
-}
-
-/* 当前页用**底色 + 边框 + 底部高亮**三重表示，不只靠颜色 —— 单看色差在
-   低亮度屏幕上几乎看不出来。 */
-.nav a.router-link-active {
-  background: linear-gradient(180deg, rgba(0, 212, 255, 0.16), rgba(0, 212, 255, 0.05));
-  border-color: var(--border-strong);
-  color: var(--text);
-  box-shadow: inset 0 -2px 0 var(--primary);
+   两个标签都列上：配置页的段落是 `<fieldset>`（它本来就是分组元素，把 id 直接
+   挂在它上面比再套一层 `<section>` 少一层嵌套），后面新加的页面用 `<section>`。 */
+section[id],
+fieldset[id] {
+  scroll-margin-top: 72px;
 }
 
 .spacer {
@@ -550,6 +741,42 @@ button.icon-only {
   flex-wrap: wrap;
 }
 
+/* 预览页那排通道按钮。
+   `flex-wrap` 是必须的：通道名可以是用户自己起的（"办公室后门"这种），8 路上限
+   下一排放不下，而这一页在窄窗口里也不该横向滚。
+   和 `.actions` 分开写而不是复用它：那一排按钮底下是"这一路的名字"，语义和
+   "能对这个画面做什么"不是一回事，混在一起以后一定有人往其中一边加样式。 */
+.channel-pick {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+/* 「通道」那个字和自己那排按钮挨着，与后面那句解释拉开一点。 */
+.channel-pick > .hint:last-child {
+  margin-left: 4px;
+}
+
+/* 保存条粘在视口底部。
+   配置页被侧栏拆成了几个锚点段落，而保存按钮**只有一份** —— 不粘住的话，
+   停在中间某一段的用户就找不到它了，锚点导航等于制造了一个新的"找不到保存"。
+
+   半透明底 + 模糊是必须的：条子会浮在表单内容上面，不挡住底下那些字就没法读。
+   上沿那道渐隐让"这是浮层"这件事看得出来，而不是像表单里凭空多了一行。 */
+.save-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  margin-top: 16px;
+  padding: 12px 0 14px;
+  border-top: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(9, 15, 28, 0), rgba(9, 15, 28, 0.94) 38%);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
 /* ---------- 提示条 ---------- */
 
 .banner {
@@ -655,6 +882,25 @@ select:focus {
 
 input:disabled {
   opacity: 0.5;
+}
+
+/* 只读的**设备标识**（硬件 ID / 序列号 / 设备 UUID）。
+
+   通用那条 `input:disabled { opacity: .5 }` 把它们压得太淡了 —— 而这三个字段
+   恰恰是用户要**抄走填进 NVR** 的（UUID 尤其），看得清比"一眼看上去是灰的"
+   重要得多。所以这里把不透明度提回来，改用虚线边框和 not-allowed 光标表达
+   "改不动"，而不是靠降对比度。 */
+input.id-readonly:disabled {
+  opacity: 0.92;
+  cursor: not-allowed;
+  border-style: dashed;
+}
+
+/* 带锁的字段标题：图标和文字要在同一行、垂直居中（svg 默认坐在基线上）。 */
+.field-label.field-lock {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* 下拉框：原生箭头在深色底上是浅灰的、位置也不受控，所以自己画一个。
@@ -783,6 +1029,69 @@ label.check input:disabled + .track {
   margin-top: 8px;
 }
 
+/* ---------- 电平表（状态页的音频那一段） ---------- */
+
+/* 一条电平。宽度是**固定**的容器，里面那条填充按百分比伸缩 —— 用 `flex:1`
+   的话，L 和 R 两条会因为左边标签字数不同而长度不一，"左 0.3 / 右 0.3"
+   看起来就像两个不同的值。 */
+.meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.meter + .meter {
+  margin-top: 6px;
+}
+
+.meter-name {
+  /* 等宽 + 定宽：这个字只有一个字符，但它左右那两条必须对齐。 */
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-2);
+  width: 1.2em;
+  flex: none;
+}
+
+.meter-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 10px;
+  border-radius: 5px;
+  background: rgba(6, 12, 22, 0.85);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  border-radius: 4px 0 0 4px;
+  /* 峰值保持器已经是"带释放"的了，所以这里**不能再加** transition ——
+     两层衰减叠在一起，读数会比真实的电平慢半拍，而这一段的全部意义就是
+     "现在到底有没有声音"。 */
+  background: linear-gradient(90deg, var(--good), var(--primary));
+  transition: none;
+}
+
+/* 削顶时变红。**阈值写在 0.99 而不是 1.0**：电平表自己就是钳过位的
+   （`audio_mixer` 输出前 clamp 到 ±1），所以"到 1.0"和"顶部被削掉"
+   在读数上完全一样 —— 等到 1.0 才变红，等于永远不报。 */
+.meter-fill.is-hot {
+  background: linear-gradient(90deg, var(--warn), var(--crit));
+}
+
+.meter-value {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--text-2);
+  width: 4.2em;
+  flex: none;
+  text-align: right;
+}
+
 code.value {
   font-family: var(--mono);
   font-size: 12.5px;
@@ -792,6 +1101,335 @@ code.value {
   padding: 5px 9px;
   word-break: break-all;
   color: var(--primary);
+}
+
+/* ---------- 延时档位（三选一 + 自定义） ---------- */
+
+/* 卡片组而不是下拉框：这一档的**代价**必须和它的名字同时看得见。
+   下拉框里塞不下三行话，只能显示当前选中那一项 —— 而「选下去之前先知道代价」
+   恰好是这个功能唯一诚实的地方。 */
+.latency-tiers {
+  display: grid;
+  /* 240px 起，窄屏自然掉成一列。四张卡在 1440 宽下正好两行两列。 */
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+  margin: 6px 0 0;
+}
+
+label.latency-tier {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px 14px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(6, 12, 22, 0.32);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color var(--t-base), background var(--t-base), box-shadow var(--t-base);
+}
+
+label.latency-tier:hover {
+  border-color: rgba(120, 155, 200, 0.5);
+}
+
+/* 原生 radio 视觉隐藏，但**还在**：可聚焦、可被读屏朗读、方向键可切换。
+   与上面那个自绘开关同一条纪律（陷阱 47 那一族：别为了好看把语义拿掉）。
+   焦点环画在卡片上 —— 1px 的 input 上看不见它。 */
+label.latency-tier input[type='radio'] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+label.latency-tier:has(input:focus-visible) {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+label.latency-tier.on {
+  border-color: var(--primary);
+  background: rgba(0, 212, 255, 0.07);
+  box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.25);
+}
+
+label.latency-tier .lt-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+label.latency-tier.on .lt-name {
+  color: var(--primary);
+}
+
+/* 线值（realtime / balanced / quality）就留在名字旁边，字号压小。
+   显示层翻译、配置里永远写英文 —— 与 preset 那份翻译是同一条纪律（陷阱 80），
+   把线值一起抹掉的话，用户在配置文件里就对不上号了。 */
+label.latency-tier .lt-key {
+  margin-left: 7px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+/* 具体数字。这一行是整张卡里唯一"能被拿去对账"的东西，所以给它主色。 */
+label.latency-tier .lt-num {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--primary);
+}
+
+label.latency-tier .lt-line {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+label.latency-tier .lt-line b {
+  display: inline-block;
+  min-width: 2.6em;
+  margin-right: 2px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* 代价那一行的标签用暖色。它是整张卡里最该被读到、也最容易被跳过的一句。 */
+label.latency-tier .lt-cost b {
+  color: var(--warn);
+}
+
+/* 档位底下那段"够不到的东西"。用 `hint` 的灰和小字号，但**不能**缩到读不清 ——
+   它是这个功能唯一一句"到这里就到底了"的话。 */
+.latency-floor {
+  margin: 12px 0 0;
+  max-width: 92ch;
+  line-height: 1.7;
+}
+
+.latency-floor p {
+  margin: 0 0 4px;
+}
+
+.latency-floor ul {
+  margin: 2px 0 6px;
+  padding-left: 18px;
+}
+
+.latency-floor li {
+  margin-top: 2px;
+}
+
+.latency-floor code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+/* ---------- 预览页的延时档位说明 ---------- */
+
+/* 播放这一侧的两个数（目标延迟 / 落伍阈值）从哪来，以及本机覆盖那个下拉框。
+   单独一块、和上面的播放控制拉开距离：它是"这一页怎么播"的参数，不是操作。 */
+.latency-note {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  max-width: 92ch;
+  line-height: 1.7;
+}
+
+.latency-note select {
+  width: auto;
+}
+
+/* ---------- 水印（OSD）编辑器 ---------- */
+
+/* 段落开头那句说明。它铺满整行、不参与 `.grid` 的分列 —— 塞进 grid 里的话
+   会被挤成和输入框一样宽的一栏，读起来像某个字段的注解。 */
+.section-note {
+  margin: 4px 0 14px;
+  max-width: 76ch;
+}
+
+/* 跟在一整个 `.grid` 后面的说明（配上一行的开关用）。 */
+.span-note {
+  grid-column: 1 / -1;
+  margin: -6px 0 0;
+}
+
+.sub-head {
+  margin: 20px 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.03em;
+}
+
+/* 一项水印一块。边框把它和相邻项分开 —— 四块连成一片时，"这个下拉属于哪一项"
+   要靠人去数间距，而数间距在窄屏上根本不成立。 */
+.osd-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px 14px;
+  margin-bottom: 12px;
+  background: rgba(6, 12, 22, 0.32);
+}
+
+.osd-item-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.osd-item-index {
+  font-size: 12.5px;
+  color: var(--text-2);
+  letter-spacing: 0.03em;
+}
+
+/* 通道那一块和 `.osd-item` 是同一种东西（一块 = 一路），共用同一套边框与
+   间距规则 —— 分成两条写的话，将来只改一处就会让两段的节奏对不上。 */
+.channel-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px 14px;
+  margin-bottom: 12px;
+  background: rgba(6, 12, 22, 0.32);
+}
+
+.channel-item-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.channel-item-index {
+  font-size: 12.5px;
+  color: var(--text-2);
+  letter-spacing: 0.03em;
+}
+
+/* 「检测到」那一列：每一行是"一个可加的源"。做成可点的一行而不是下拉框 ——
+   勾选这个动作要能一眼看出"这块屏已经被占了"，而下拉框里做不到灰掉某一项。 */
+.source-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+}
+
+.source-row.is-taken {
+  opacity: 0.55;
+}
+
+.source-row .source-name {
+  font-weight: 500;
+}
+
+/* 设备信息页「通道」那一张卡里的一段：每路一个小节，用一条细分隔线和下一路
+   分开 —— 三路连排时，"这一行的端口是哪一路的"要靠人去数行距。 */
+.channel-line + .channel-line {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.source-row .source-meta {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+/* 行内的小开关：`label.field.check` 默认带 `padding-top: 18px`（它是为了和
+   旁边那些有标签的输入框对齐），在标题行里那一截空白会把整行顶歪。 */
+label.field.check.compact {
+  padding-top: 0;
+}
+
+button.tiny {
+  padding: 4px 10px;
+  font-size: 12.5px;
+}
+
+/* 拖动预览。`.stage` 已经有黑底和内阴影，这里只补两件它没有的：
+   让底图按容器宽度撑满（而不是按原始像素撑破面板），以及给标记块一个定位上下文。 */
+.osd-stage {
+  position: relative;
+  margin-top: 12px;
+  overflow: hidden;
+  /* `.stage` 的 `min-height: 260px` 在这里是有害的：窗口很宽时按比例算出来的
+     高度可能不到 260px，容器被撑高之后画面会被 `contain` 缩进中间，而标记块
+     是按**容器**的百分比摆的 —— 那一截多出来的高度会让整排标记整体下移。 */
+  min-height: 0;
+  /* 宽高比由内联样式按**编码尺寸**给（不是写死 16:9）。
+     这一条是正确性上的要求，不是美观：标记块是按容器的百分比定位的，而
+     `x_pct` 的基准是编码帧。容器比例和画面比例不一致时 `object-fit: contain`
+     会加出黑边，百分比就跟着偏 —— 表现是"预览在左上、录出来偏右下"。 */
+}
+
+.osd-stage img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* 一个水印项的标记块。**它就是文字的框**：字号、边距都由 `markerStyle()` 按
+   编码尺寸缩放后算出来，位置则直接取自 `osd.items[]` —— 所以"看到的位置"和
+   "烧进去的位置"是同一份数据，不存在第二份需要同步的副本。
+ *
+ * ⚠️ **这里一个 `padding` / `border` 都不能有。** `anchor()` 的 custom 分支把
+ * `x_pct` 解释成**文字左上角**、没有边距；而 CSS 里 `left: x%` 定的是这个块的
+ * **边框盒**左边缘。加了 border/padding，文字就从边框盒再往里缩 4px —— 于是
+ * "拖到哪"和"烧到哪"差一个固定偏移，而它是**系统性**的：每一帧、每一项都偏，
+ * 看起来像公式抄错了，其实是盒模型。所以轮廓用 `outline`（不参与布局），
+ * `outline-offset` 也一样不入流。 */
+.osd-marker {
+  position: absolute;
+  /* 字号由内联样式给，这里只兜一个行高和"别换行"：换行之后框就不是文字框了，
+     量出来的位置会偏。 */
+  line-height: 1.15;
+  white-space: nowrap;
+  padding: 0;
+  border: 0;
+  outline: 1px dashed rgba(0, 212, 255, 0.55);
+  outline-offset: 1px;
+  color: #eaf4ff;
+  background: rgba(3, 10, 20, 0.45);
+  cursor: grab;
+  touch-action: none; /* 否则触摸设备上拖动会被滚动手势吃掉 */
+  user-select: none;
+}
+
+.osd-marker:hover {
+  outline-color: var(--primary);
+  background: rgba(3, 10, 20, 0.7);
+}
+
+.osd-marker.is-dragging {
+  cursor: grabbing;
+  outline-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.25);
+}
+
+/* 已关闭的项仍然是**可拖的**（位置会记住，重新打开就是那个位置），所以它
+   只是变淡，不是 `display:none` —— 藏起来的话，用户会以为那一项被删掉了。 */
+.osd-marker.is-off {
+  opacity: 0.42;
+  outline-style: dotted;
 }
 
 /* ---------- 表格 ---------- */
@@ -1134,6 +1772,66 @@ code.value {
 }
 
 @media (max-width: 720px) {
+  /* ---------- 侧栏变抽屉 ---------- */
+
+  /* 窄屏下侧栏不再占位置，而是盖在内容上、默认推出去、由汉堡开合。
+     "折叠"这个概念在这里没有意义（56px 的图标栏在手机上点不中），
+     所以下面几条把 `is-collapsed` 整个抵消掉 —— **由 CSS 说了算**，
+     而不是让 JS 再存一份"当前视口多宽"（那份副本会在转屏、缩放、
+     窗口分屏之后过期，于是出现"JS 认为折叠、CSS 认为展开"的半吊子）。 */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    height: 100%;
+    width: 232px;
+    flex-basis: auto;
+    z-index: 30;
+    background: rgba(9, 15, 28, 0.97);
+    transform: translateX(-100%);
+    transition: transform var(--t-base), width var(--t-base);
+  }
+
+  .sidebar.is-open {
+    transform: translateX(0);
+  }
+
+  .sidebar.is-collapsed {
+    width: 232px;
+    flex-basis: auto;
+  }
+
+  .sidebar.is-collapsed .side-label {
+    display: inline;
+  }
+
+  .sidebar.is-collapsed .side-group-title {
+    display: block;
+  }
+
+  .sidebar.is-collapsed .side-link {
+    justify-content: flex-start;
+    padding: 8px 10px;
+  }
+
+  /* 抽屉里没有"折叠"这个动作 —— 收起它就是把抽屉关掉，那是汉堡的事。 */
+  .side-toggle {
+    display: none;
+  }
+
+  .sidebar .side-head {
+    justify-content: flex-end;
+  }
+
+  .side-scrim {
+    display: block;
+  }
+
+  .hamburger {
+    display: inline-flex;
+  }
+
   .topbar {
     padding: 9px 14px;
     gap: 10px;

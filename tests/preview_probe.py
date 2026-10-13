@@ -13,6 +13,16 @@
   3. **中途连上来的客户端也要先拿到初始化段。** 前端是"打开页面才开始看"，
      不是"从进程启动就盯着"—— 而初始化段整个会话只产一次。
 
+  4. **时间原点那一条控制帧**（`{"type":"t0","t0_wall_ms":…,"server_now_ms":…}`）。
+     它是**文本**帧，和分片走的不是同一条路；前端靠它把播放位置换算成墙钟，
+     才算得出「真实延迟」。少了它，页面上那个数就退化成缓冲余量（看着合理、
+     其实差着一整个 GOP）—— 见 Phase W (a) 与陷阱 90 的第一面。
+
+     ⚠️ **这一段必须先分辨文本帧再判二进制**：本探针原来是"见到文本帧就
+     `break`"，那是按"这条通道只有二进制"写的。加了 t0 之后，那个 `break`
+     会在连上后立刻退出接收循环 —— 症状是"分片 0 块"，看上去像封装器坏了，
+     而真正的原因在这里。所以现在文本帧**解析并继续**，认不出来的才报红。
+
 Web 控制台上了登录之后，这个脚本会**先登录再连** —— `/ws/preview` 的守卫写在
 WS 处理器内部（升级请求绕过中间件链），没带有效 cookie 的升级会被
 `close(1008, "unauthenticated")` 拒掉，症状是"连上了但一个二进制帧都没有"。
@@ -201,7 +211,10 @@ def top_level_boxes(data):
 
 
 def collect(host, port, path, seconds, label, want=1 << 30, cookie=None):
-    """收 seconds 秒，返回 (init 段, [分片...])。"""
+    """收 seconds 秒，返回 (init 段, [分片...], 实际耗时, [文本帧...])。
+
+    文本帧**不中断接收**（见文件头第 4 条）：收下来给调用方判，循环继续。
+    """
     sock = socket.create_connection((host, port), timeout=10)
     sock.settimeout(seconds + 10)
     pre = handshake(sock, host, port, path, cookie=cookie)
@@ -209,6 +222,7 @@ def collect(host, port, path, seconds, label, want=1 << 30, cookie=None):
 
     init = None
     frags = []
+    texts = []
     total = 0
     t0 = time.time()
     try:
@@ -233,15 +247,31 @@ def collect(host, port, path, seconds, label, want=1 << 30, cookie=None):
                     if total >= want:
                         break
             elif op == 0x1:
-                print(f"[{label}] 收到文本帧：{payload[:120]!r}")
-                break
+                texts.append((time.time(), payload))
+                print(f"[{label}] 控制帧：{payload[:160]!r}")
     finally:
         sock.close()
 
     span = time.time() - t0
-    print(f"[{label}] {span:.1f}s 内：init 1 块，分片 {len(frags)} 块，"
-          f"合计 {total} 字节")
-    return init, frags, span
+    print(f"[{label}] {span:.1f}s 内：init {'1' if init else '0'} 块，"
+          f"分片 {len(frags)} 块，合计 {total} 字节，控制帧 {len(texts)} 条")
+    return init, frags, span, texts
+
+
+def t0_of(texts):
+    """从收到的文本帧里挑出 t0 那条。返回 (字典, 收到时刻) 或 (None, None)。
+
+    **认不出来的文本帧不算 t0 也不算通过** —— 调用方会把"有文本帧但没有
+    t0"和"一条文本帧都没有"分开报，因为它们是两种不同的坏法。
+    """
+    for when, payload in texts:
+        try:
+            m = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(m, dict) and m.get("type") == "t0":
+            return m, when
+    return None, None
 
 
 def ffprobe(path):
@@ -287,8 +317,8 @@ def main():
     cookie = login_cookie(a.host, a.port, a.user, a.password, a.cookie)
 
     print("=== 1. 第一个客户端：首帧是不是初始化段 ===")
-    init, frags, span = collect(a.host, a.port, "/ws/preview", a.seconds, "1",
-                                cookie=cookie)
+    init, frags, span, texts = collect(a.host, a.port, "/ws/preview", a.seconds, "1",
+                                       cookie=cookie)
     if not check(init is not None, "连上后收到了初始化段"):
         if cookie is None:
             print("\n没收到任何二进制帧。服务端是开着登录的吗？那这里必须有 cookie。")
@@ -301,6 +331,49 @@ def main():
         check(False, "初始化段的 box 结构完整", e)
         return 1
     check(boxes == ["ftyp", "moov"], "初始化段恰好是 ftyp + moov", f"实得 {boxes}")
+
+    print("\n=== 1b. 时间原点那一帧（前端算「真实延迟」的依据）===")
+    # 这一段的判据是**墙钟**，不是媒体时间：`t0_wall_ms` 与 `server_now_ms`
+    # 都必须是 Unix 毫秒，且两者之差就是"这个会话已经跑了多久"。
+    # 换成媒体时间（0~几秒）或者计数器的值，下面第 2、4 条会当场红。
+    t0_msg, t0_when = t0_of(texts)
+    if not check(t0_msg is not None,
+                 "收到了 t0 控制帧",
+                 "" if t0_msg is not None else
+                 (f"这一路收到 {len(texts)} 条文本帧，没有一条是 t0"
+                  if texts else "一条文本帧都没收到")):
+        print("        （前端拿不到时间原点时，「真实延迟」会显示 — 而不是一个错数）")
+    else:
+        print(f"       {t0_msg}")
+        raw_t0 = t0_msg.get("t0_wall_ms")
+        raw_now = t0_msg.get("server_now_ms")
+        shapes_ok = (isinstance(raw_t0, int) and not isinstance(raw_t0, bool)
+                     and isinstance(raw_now, int) and not isinstance(raw_now, bool))
+        check(shapes_ok, "两个字段都是整数（不是字符串、不是浮点、不是布尔）",
+              f"实得 {type(raw_t0).__name__} / {type(raw_now).__name__}")
+
+        if shapes_ok:
+            t0v, nowv = raw_t0, raw_now
+            # ⚠️ 基准必须是**收到这一帧的那一刻**（`t0_when`），不是"跑检查的
+            # 那一刻" —— 后者在 `collect()` 收满 8 秒之后，于是这一条会凭空
+            # 多出一个等于接收时长的偏差（实测 8871 ms，看起来像"两边的钟
+            # 不一样"，其实是尺子量错了地方）。
+            local_ms = int(t0_when * 1000)
+            check(t0v > 0 and nowv > 0, "两个数都是正数", f"t0={t0v} now={nowv}")
+            # 1.6e12 = 2020-09-13。比这小就说明它不是 Unix 毫秒。
+            check(t0v > 1_600_000_000_000,
+                  "t0_wall_ms 是 Unix 毫秒量级（2020 年以后）",
+                  f"实得 {t0v} —— 媒体时间是 0 到几秒，那个量级会落在这里")
+            # 同一台机器、走回环，服务端的钟和本机的钟必须对得上。
+            # 这一条同时证明了它**不是**媒体时间、也不是进程内的 steady 计数。
+            skew = abs(local_ms - nowv)
+            check(skew < 1000,
+                  f"server_now_ms 与本机时钟一致（差 {skew} ms）",
+                  f"收到帧时本机 {local_ms} vs 服务端的 {nowv}")
+            age = nowv - t0v
+            check(0 <= age <= 3_600_000,
+                  f"t0_wall_ms 在 server_now_ms 之前、一小时之内（差 {age} ms）",
+                  f"t0={t0v} now={nowv} —— 负数说明 0 点在未来，几十万说明量纲错了")
 
     print("\n=== 2. 分片是不是都从 moof 开始 ===")
     check(len(frags) > 0, f"收到了分片（{len(frags)} 块）")
@@ -337,9 +410,19 @@ def main():
 
     print("\n=== 4. 中途连上来的客户端也要先拿到初始化段 ===")
     time.sleep(a.late_after)
-    init2, frags2, _ = collect(a.host, a.port, "/ws/preview", max(a.seconds - 2, 4),
-                               "2", want=1 << 20, cookie=cookie)
+    init2, frags2, _, texts2 = collect(a.host, a.port, "/ws/preview",
+                                       max(a.seconds - 2, 4), "2", want=1 << 20,
+                                       cookie=cookie)
     check(init2 is not None, "迟到的那一个也收到了初始化段")
+    # 时间原点是**每会话一份**的：后连上来的客户端要拿到**同一个** 0 点。
+    # 这条同时钉住"留一份给后来的人"那半边（只广播不留存，这里就是 None）。
+    t0_msg2, _ = t0_of(texts2)
+    check(t0_msg2 is not None, "迟到的那一个也收到了 t0 控制帧")
+    if t0_msg2 is not None and t0_msg is not None:
+        check(t0_msg2.get("t0_wall_ms") == t0_msg.get("t0_wall_ms"),
+              "两份 t0 是同一个 0 点（一个会话只有一个时间原点）",
+              f"{t0_msg.get('t0_wall_ms')} vs {t0_msg2.get('t0_wall_ms')}"
+              if t0_msg2.get("t0_wall_ms") != t0_msg.get("t0_wall_ms") else "")
     if init2 is not None:
         check(init2 == init, "两份初始化段逐字节相同",
               f"{len(init2)} vs {len(init)} 字节" if init2 != init else "")

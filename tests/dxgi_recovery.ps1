@@ -87,6 +87,26 @@ function Check([bool]$ok, [string]$what, [string]$detail = '') {
 function Section([string]$t) { Write-Host ''; Write-Host $t -ForegroundColor Cyan }
 function Note([string]$t) { Write-Host "  $t" -ForegroundColor DarkGray }
 
+# 解码判据的两把尺子（全文在 `tests\rtsp_sub_e2e.ps1` 的 Check 下面）。
+# 一、`-f null` 那条 `non monotonically increasing dts` 是 **muxer 自己的账**，
+#     不是这一路流的问题，放它过去；其余任何一个字都算致命。
+# 二、帧数是个正数信号：解出多少帧，比"没报错"更难糊弄过去。
+$script:DtsNote = 'Application provided invalid, non monotonically increasing dts to muxer in stream 0: \d+ >= \d+'
+function Split-PullErr([string]$Text) {
+    $lines = @($Text -split "`r?`n" | Where-Object { $_.Trim() })
+    return [pscustomobject]@{
+        Notes = @($lines | Where-Object { $_ -match $script:DtsNote })
+        Fatal = @($lines | Where-Object { $_ -notmatch $script:DtsNote })
+    }
+}
+function Get-PullFrames([string]$ProgressText) {
+    $n = 0
+    foreach ($line in ($ProgressText -split "`r?`n")) {
+        if ($line -match '^frame=(\d+)') { $n = [int]$Matches[1] }
+    }
+    return $n
+}
+
 # ---------------------------------------------------------------------------
 # 显示模式：读、改、还原；以及显示器电源
 # ---------------------------------------------------------------------------
@@ -504,11 +524,25 @@ if (-not $aliveAfter) {
             } else {
               '尺寸没变，重建之后当然还是原尺寸 —— 变了说明中转纹理那条路算错了。'
             })
+    # `-fps_mode passthrough`：理由见 `tests\rtsp_sub_e2e.ps1` 的 Start-Pull
+    # 上面那段（默认 vsync 会把 throttle 模式下属正常变动的帧率折算成恒定
+    # 帧率，折算时偶发重复时间戳，报的是折算器自己的损失）。这一条同样是
+    # "解 N 秒零报错"，所以同样要关掉折算。
     $play = Invoke-WithTimeout $ffmpeg @(
-        '-v', 'error', '-rtsp_transport', 'tcp', '-i', $url, '-t', "$PullSec", '-f', 'null', '-') `
+        '-v', 'error', '-rtsp_transport', 'tcp', '-i', $url, '-t', "$PullSec",
+        '-fps_mode', 'passthrough', '-progress', 'pipe:1', '-f', 'null', '-') `
         (($PullSec + 20) * 1000)
-    Check (-not $play.TimedOut -and -not $play.Err.Trim()) `
-          "重建之后解 $PullSec 秒零报错" ($play.Err -split "`r?`n" | Select-Object -First 2)
+    $v = Split-PullErr $play.Err
+    $fr = Get-PullFrames $play.Out
+    Check (-not $play.TimedOut -and $v.Fatal.Count -eq 0) `
+          "重建之后解 $PullSec 秒零报错（致命行 $($v.Fatal.Count) 条）" `
+          (($v.Fatal | Select-Object -First 3) -join ' / ')
+    # 帧数这条是 2026-10-09 加的：实测同一条 5 秒的流，`-fps_mode passthrough`
+    # 解出 126 帧而默认 vsync 只解出 66 帧 —— "没报错"这句话本身量不出这个。
+    # 下界取"平均至少 1 fps"：控制器最慢也只降到 `adaptive.min_fps`（默认 5），
+    # 就算重开之后头两秒还在等关键帧，5 秒的窗口也远不止 5 帧。
+    Check ($fr -ge $PullSec) "重建之后 $PullSec 秒解出 $fr 帧（下界平均 1 fps）"
+    foreach ($n in ($v.Notes | Select-Object -First 2)) { Note "[记账] $n" }
 }
 
 # ---------------------------------------------------------------------------
@@ -688,3 +722,8 @@ if ($failed -gt 0) {
     exit 1
 }
 Write-Host '全部通过。' -ForegroundColor Green
+
+# ⚠️ `exit 0` 不能省：不加 `exit` 结束的 .ps1 不会把 `$LASTEXITCODE` 归零，
+# 它留着脚本里最后一个**原生命令**的值 —— 而这个脚本一路在跑 ffmpeg/ffprobe/
+# taskkill，其中好几个是故意非零的。见陷阱 89。
+exit 0

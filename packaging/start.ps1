@@ -59,7 +59,15 @@ if (-not (Test-Path -LiteralPath $web)) {
 }
 
 # --- 组参数 ---------------------------------------------------------------
+#
+# `--console` 写在最前面：它不改变"跑什么"，改变的是"**谁在跑**"。加上它才有
+# 单实例互斥体和日志文件这两样 ——
+#   * 没有互斥体：快捷方式点两下 = 两个进程抢同一个 RTSP 端口，第二个绑不上，
+#     用户看到的是"推流时不时连不上"，而不是任何一句能读懂的话。
+#   * 没有日志文件：窗口一关，stderr 跟着消失，出过什么问题一点痕迹都不留。
+# 这两样只属于长驻形态，所以显式声明，而不是让"传了 --rtsp 就算长驻"。
 $argv = @(
+    '--console',
     '--rtsp', '--rtsp-port', "$RtspPort",
     '--http', '--http-port', "$HttpPort",
     '--web-root', $web
@@ -82,8 +90,39 @@ if ($Portable) {
 }
 if ($LocalOnly) { $argv += @('--http-host', '127.0.0.1') } else { $argv += @('--http-host', '0.0.0.0') }
 if ($NoSub)     { $argv += '--no-sub' }
-if ($NoOnvif)   { $argv += '--no-onvif' } else {
-    $argv += @('--onvif-user', $OnvifUser, '--onvif-password', $OnvifPassword)
+
+# --- ONVIF 凭据：**只在调用方显式给了的时候**才覆盖 ------------------------
+#
+# 这里原先是无条件追加 `--onvif-user admin --onvif-password admin`（上面两个
+# 参数的默认值），于是配置文件里装机器时设好的那一对**每次启动都被踩掉**。
+# 而 exe 那边是"命令行优先，没给才读配置"（main.cpp：args.value("--onvif-user",
+# cfg.onvif.user)），所以命令行一给，"用户填的口令没生效"就必然发生 ——
+# 这一条与安装包没写 web.user 是**两条独立的断链**，各自都能单独造成同一个症状。
+#
+# 判据用 $PSBoundParameters 而不是"值等不等于 admin"：后者分不出"用户就是要
+# admin"和"没人传过"。**默认值此刻仍然写在上面的 param 块里**（-OnvifUser
+# 的默认 'admin'），但它不再参与开火 —— 它只是"调用方真的传了这个参数"时
+# 那个值的来源。
+#
+# **这条判据量过**（跑法、读数、结论都在 out\psbound\probe-results.txt）：
+# 不给凭据参数时 ContainsKey 报 False，传了就报 True，`-File` 与同会话两种
+# 跑法一致；默认值躺在 param 块里**不会**让它变成 True。这一条必须量，
+# 因为整个修复就架在它上面 —— 判据若失效，这个改动不是"没生效"，
+# 是**看起来生效了而其实什么都没发生**。
+#
+# 顺带量到一件事，免得后人以为这里的默认值还能兜住"显式传空口令"：
+# `-OnvifUser ''` 在**同会话**调用下传得进去（given=True、值为空），
+# 而 `-File` 这条路传不了 —— 空格分隔的空串被命令行 tokenizer 吃掉
+# （报 MissingArgument），写成 `-OnvifUser=` 则整个 token 落进 $Rest、
+# 参数根本没绑上、还被原样透传给 exe。而 start.bat / start-local.bat
+# 走的正是 -File。所以"用空串把口令清掉"这件事只有同会话调用做得到，
+# 这个脚本不依赖它（真要清口令，在控制台里改）。
+$onvifUserGiven = $PSBoundParameters.ContainsKey('OnvifUser')
+$onvifPassGiven = $PSBoundParameters.ContainsKey('OnvifPassword')
+
+if ($NoOnvif) { $argv += '--no-onvif' } else {
+    if ($onvifUserGiven) { $argv += @('--onvif-user',     $OnvifUser) }
+    if ($onvifPassGiven) { $argv += @('--onvif-password', $OnvifPassword) }
 }
 if ($Extra.Count -gt 0) { $argv += $Extra }
 if ($Rest.Count  -gt 0) { $argv += $Rest }
@@ -109,6 +148,31 @@ $hostForUrl = if ($LocalOnly -or -not $lan) { '127.0.0.1' } else { $lan }
 
 $subPath = if ($NoSub) { $null } else { 'live_sub' }
 
+# --- 告示牌上要念**有效值**，不是出厂值，也不是覆盖值 ----------------------
+#
+# 上一版这里硬编码 "admin / admin"，而 :131 念的是那两个参数（覆盖值）。
+# 于是"界面说 admin/admin、实际不是"可以一直存在而没有任何人发现 ——
+# 用户照着屏幕上的账号去登录，登不进去，只能怪自己记错了。
+# 有效值只有一个来源：**配置文件**（命令行给了的话以命令行为准，见上面那段）。
+# 口令一律不打印：它在配置文件里是明文，但"把口令打在屏幕上"和"把口令打进日志"
+# 只差一个截图。忘了口令就在控制台里改一个新的。
+$effWebUser   = $null
+$effOnvifUser = $null
+$cfgKnown = Test-Path -LiteralPath $cfg
+if ($cfgKnown) {
+    try {
+        $j = Get-Content -LiteralPath $cfg -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($j.web   -and $j.web.user)   { $effWebUser   = [string]$j.web.user }
+        if ($j.onvif -and $j.onvif.user) { $effOnvifUser = [string]$j.onvif.user }
+    } catch {
+        Write-Host "[!] 读不了配置文件 $cfg（$($_.Exception.Message)）" -ForegroundColor Yellow
+        Write-Host '    下面的登录名按**出厂值**显示，未必是程序实际用的那个。' -ForegroundColor Yellow
+    }
+}
+# 命令行显式给了 ONVIF 用户名就以它为准（与 exe 的优先级一致）。
+$shownOnvifUser = if ($onvifUserGiven) { $OnvifUser } elseif ($effOnvifUser) { $effOnvifUser } else { 'admin' }
+# Web 口令没有命令行覆盖（本脚本不传 --http-user/--http-password），所以 Web 那份看配置文件。
+
 Write-Host ''
 Write-Host '  Desk2ONVIF —— 桌面 → RTSP + ONVIF + Web 控制台' -ForegroundColor Cyan
 Write-Host ('  ' + ('-' * 58))
@@ -117,10 +181,20 @@ if ($subPath) {
     Write-Host ("  子码流      rtsp://${hostForUrl}:${RtspPort}/${subPath}   （给 NVR 多画面网格用）")
 }
 Write-Host ("  Web 控制台  http://${hostForUrl}:${HttpPort}/")
-Write-Host  ("  Web 登录    admin / admin   （出厂值；改过就以控制台里配置页那份为准）")
+if ($effWebUser) {
+    Write-Host ("  Web 登录    ${effWebUser} / （口令不显示；忘了就在控制台里改一个新的）")
+} else {
+    Write-Host  ("  Web 登录    admin / admin   （出厂值；${cfg} 还不存在）")
+}
 if (-not $NoOnvif) {
     Write-Host ("  ONVIF       http://${hostForUrl}:${HttpPort}/onvif/device_service")
-    Write-Host  ("  NVR 凭据    ${OnvifUser} / ${OnvifPassword}")
+    if ($effOnvifUser -or $onvifUserGiven) {
+        Write-Host ("  NVR 凭据    用户名 ${shownOnvifUser}（口令不显示，和 Web 那份装完默认相同、之后各自独立）")
+    } elseif ($cfgKnown) {
+        Write-Host  ("  NVR 凭据    用户名 ${shownOnvifUser}（配置里没写 onvif.user，用的是默认值）")
+    } else {
+        Write-Host  ("  NVR 凭据    用户名 ${shownOnvifUser} / 口令 admin   （出厂值；还没有 config.json）")
+    }
 }
 Write-Host ('  ' + ('-' * 58))
 

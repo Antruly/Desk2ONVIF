@@ -2,6 +2,7 @@
 
 #include "app/capture_session.h"
 #include "common/log.h"
+#include "common/version.h"
 #include "encoder/mjpeg_encoder.h"
 #include "onvif/net_identity.h"
 #include "onvif/wsd.h"
@@ -16,8 +17,14 @@
 #include <uvcpp/uvcpp_threadpool.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -32,6 +39,7 @@ using uvcpp::uvcpp_web_app;
 using uvcpp::uvcpp_web_next;
 using uvcpp::uvcpp_web_request;
 using uvcpp::uvcpp_web_response;
+using uvcpp::uvcpp_web_sent_info;
 using uvcpp::uvcpp_web_static;
 using uvcpp::uvcpp_web_static_options;
 using uvcpp::uvcpp_web_ws_request;
@@ -105,6 +113,27 @@ uvcpp_json stats_json(SessionStats const& s) {
   j["cursor_frames"] = s.cursor_frames;
   j["pointer_only_frames"] = s.pointer_only_frames;
 
+  // --- 自适应降载 ---------------------------------------------------------
+  // `drops_recent` 和上面那些累计量**并列但不同量纲**：它数的是"最近 10 秒
+  // 丢了多少"，所以它回到 0 是常态。只有累计的 `queue_dropped` 时，用户看到
+  // 一个四位数会以为一直在丢，而那个数多半是启动那一下（编码器还没热起来）
+  // 造成的，之后再没涨过 —— 一个不会归零的计数器没法回答"现在还好吗"。
+  j["adaptive_dropped"] = s.adaptive_dropped;
+  j["osd_refresh_frames"] = s.osd_refresh_frames;
+  // 水印热生效的次数（有人改了配置，采集侧真的换上了）。**和上面那个无关**：
+  // 那个数的是"钟在走"，这个数的是"配置变了"。它是 `pending` 里那条否定式
+  // 证据（"`osd.*` 不在 pending 里"）的肯定式伴 —— 见 capture_session.h。
+  j["osd_hot_applied"] = s.osd_hot_applied;
+  j["drops_recent"] = s.drops_recent;
+  j["perf_state"] = s.perf_state;
+  j["perf_duty"] = s.perf_duty;
+  j["perf_target_fps"] = s.perf_target_fps;
+  j["perf_hint"] = s.perf_hint;
+  // 空串 = 没有建议。**不用 "none" 这类哨兵字面量**：前端要判的是"有没有
+  // 一个能点的按钮"，空串在 JS 里就是假值，而多一个字面量等于多一处两边
+  // 必须一致的口头约定。
+  j["perf_suggested_quality"] = s.perf_suggested_quality;
+
   // --- 单路时代的四个键 ---------------------------------------------------
   // 前端的「链路质量」那组卡片读的就是它们，所以**必须继续存在**（改前端是
   // 另一件事，而后端先改字段名的后果是页面上四处数字变成空白，控制台一句
@@ -129,6 +158,16 @@ uvcpp_json stats_json(SessionStats const& s) {
   j["rtsp_url"] = s.rtsp_streams.empty() ? std::string() : s.rtsp_streams[0].url;
 
   // --- 逐路 ---------------------------------------------------------------
+  //
+  // 主码流的**实际编码尺寸**。这一对本来就在进程里（`publish()` 每次都拿它去
+  // 调 `onvif.set_video_size()`，所以 ONVIF 的 profile 一直报的是真值），
+  // 只是从来没有一条路把它送到网页上 —— 子码流的两个数一直在，主码流的没有。
+  //
+  // 它和配置里的 `capture.max_height` **不是一回事**，两个都值得显示：
+  // 配置那个是**上限**（0 = 桌面原生），而桌面比上限小的时候不放大。设备信息
+  // 页要回答的是"现在到底推的是多大的画面"，那只有这个数答得上来。
+  j["video_width"] = s.video_width;
+  j["video_height"] = s.video_height;
   j["sub_width"] = s.sub_width;
   j["sub_height"] = s.sub_height;
   uvcpp_json arr = uvcpp_json::array();
@@ -144,6 +183,38 @@ uvcpp_json stats_json(SessionStats const& s) {
     arr.push_back(std::move(e));
   }
   j["rtsp_streams"] = std::move(arr);
+
+  // --- 音频 ---------------------------------------------------------------
+  // **这一组是"我的麦克风到底有没有在工作"的唯一反馈。** 浏览器预览是**没有
+  // 声音的**（fMP4 那一路是单流 + H.264 专用），而这条取舍是明说过的
+  // （README 的"没做的"）—— 于是如果状态页也不显示电平，用户打开音频之后
+  // 就只能靠去 NVR 那边拉一次流才知道成没成，而那正是他最可能出问题的一步。
+  //
+  // `audio_state` 的四档各指一件事，**不能合成一个布尔值**：
+  //   off      没开（默认就是这个，不是故障）
+  //   ok       音轨在，源也按时在给
+  //   nosignal 音轨在，但源这边一直没数据 —— 麦克风拔了/被独占，或者环回
+  //            在系统不出声时本来就不产数据（那是**正常**的，见陷阱 81）
+  //   error    编码器出错，音轨从这里断掉（视频不受影响）
+  j["audio_state"] = s.audio_state;
+  // 峰值电平，0..1，已经过释放（不是瞬时值 —— 瞬时值在界面上是一串看不清的
+  // 跳动数字）。L/R 分开给：混成一路再显示的话，"只有左声道有声音"这种
+  // 接线问题会看起来完全正常。
+  j["audio_level_l"] = s.audio_level_l;
+  j["audio_level_r"] = s.audio_level_r;
+  // 音轨已有的**样本帧数**。除以 `audio_sample_rate` 就是音轨时长 ——
+  // 前端要判"音轨是不是明显比视频短"就靠这两个数，而那是 A/V 同步出问题时
+  // 最先看得出来的形状。
+  j["audio_frames"] = s.audio_frames;
+  j["audio_sample_rate"] = s.audio_sample_rate;
+  // 编出来的 AAC 包数（含 flush 出来的那几个）。`audio_frames` 是**时间轴**，
+  // 这个是**实际产出**：两个数严重对不上（比如音轨 8.000s 而包只有 3 个）
+  // 就是编码器那条路出了问题，而不是采集那条路。
+  j["audio_packets"] = s.audio_packets;
+  // 其中由我们补零的帧数。**系统安静时它本来就涨**，所以它涨不等于故障；
+  // 它持续**不涨**而电平也是 0 才说明源那边真的出了问题（补零是兜底，
+  // 不是"一切正常"的证据）。分开放正是为了让这两件事分得开。
+  j["audio_zero_filled"] = s.audio_zero_filled;
   return j;
 }
 
@@ -192,6 +263,14 @@ struct WebServer::Impl {
   std::vector<std::shared_ptr<PreviewConn>> preview_conns;
   /// 最近一份 fMP4 初始化段。中途连上来的客户端靠它才能解码。
   std::shared_ptr<std::vector<std::uint8_t> const> preview_init;
+  /// 媒体时间 0 点对应的**墙钟**（Unix 毫秒），0 = 还不知道。
+  ///
+  /// 它随初始化段一起在连接建立时发给客户端（见 `send_preview_t0`），前端的
+  /// "真实延迟"尺子靠它把 `currentTime` 换算成墙钟。**留存一份是必需的**：
+  /// 0 点是在采集侧第一个包进封装器那一刻定下来的，而那可能比第一个浏览器
+  /// 连上来早得多（也可能是之后 —— 首页一加载就连，那时还没有 0 点）。
+  /// 两种情况都要能答，所以"存一份 + 连上时发"和"定下来时广播"两件都得做。
+  std::int64_t preview_t0_ms = 0;
   /// 计数器：封装器投了几块分片。前两个是**正常**的量，第三个才是故障。
   ///
   /// 这三个数以前是两个，而那个被叫做 `preview_dropped` 的其实在数"没有观看者
@@ -240,6 +319,28 @@ struct WebServer::Impl {
   int onvif_video_h = 0;
   int onvif_sub_w = 0;
   int onvif_sub_h = 0;
+
+  /// 把尺寸写进 ONVIF 的 profile（变了才写）。**只在循环线程上跑。**
+  ///
+  /// 单拎出来是因为它有**两个**入口：`publish()`（通道 1，每秒一份完整统计）
+  /// 和 `publish_video_size()`（通道 2 起，只有尺寸这一条窄管道）。两份逻辑
+  /// 各写一遍的话，"只报真值"这件事就有了两个会各自漂的版本。
+  void apply_video_size(int w, int h, int sw, int sh) {
+    // 只在变了的时候写，因为这是每秒一次的路径而分辨率是常量：正常情况下
+    // 这里一次都不会进去。
+    if (w > 0 && h > 0 && (w != onvif_video_w || h != onvif_video_h)) {
+      onvif_video_w = w;
+      onvif_video_h = h;
+      onvif.set_video_size(0, w, h);
+    }
+    // 子码流同理。`sw > 0` 就是"子码流真的开着"—— 采集侧推不出更小的尺寸
+    // 时会把它报成 0，那时 profile 1 根本不存在，写它没有意义。
+    if (sw > 0 && sh > 0 && (sw != onvif_sub_w || sh != onvif_sub_h)) {
+      onvif_sub_w = sw;
+      onvif_sub_h = sh;
+      onvif.set_video_size(1, sw, sh);
+    }
+  }
 
   /// 快照编码器。**只有一个实例、且只在循环线程上用**，所以它内部不需要
   /// 加锁 —— 这恰好也是把它当成员而不是每次请求现建的理由：MJPEG 的
@@ -309,6 +410,13 @@ struct WebServer::Impl {
   /// 给一个预览客户端发一块。积压超限就把它从表里摘掉并断开。只在 loop 线程上跑。
   void send_preview_block(std::shared_ptr<PreviewConn> conn,
                           std::shared_ptr<std::vector<std::uint8_t> const> bytes);
+  /// 给一个预览客户端发一帧**文本**控制消息，说明媒体时间 0 点对应哪个墙钟。
+  ///
+  /// 走文本帧而不是塞进二进制流里：二进制那一路是 fMP4 字节，MSE 只认它，
+  /// 中间混进任何别的东西都会让 SourceBuffer 报错。WS 本来就分文本/二进制
+  /// 两种帧类型，用它区分是框架自带的能力，不需要自己在字节流里做分帧。
+  /// 只在 loop 线程上跑。
+  void send_preview_t0(std::shared_ptr<PreviewConn> conn);
 };
 
 void WebServer::Impl::start_wsd(WebOptions const& o) {
@@ -333,6 +441,7 @@ void WebServer::Impl::start_wsd(WebOptions const& o) {
     return;
   }
   wo.scopes = o.device_scopes;
+  wo.extra = o.wsd_extra_endpoints;
   if (wo.scopes.empty()) {
     // 类型 scope 必须带：NVR/ONVIF Device Manager 主要靠它认出"这是一台摄像机"。
     // Network_Video_Transmitter 的写法（含大写和下划线）是 ONVIF 规范里定死的。
@@ -438,6 +547,14 @@ void WebServer::Impl::on_stats_socket(uvcpp_web_ws_request& ws) {
 }
 
 void WebServer::Impl::patch_live_counters(uvcpp_json& j) {
+  // 版本号补在**这里**，和 web_port 是同一个理由：`/api/status` 与 `/ws/stats`
+  // 两条路的字段集合被 `tests\web_contract.py` 的 [4] 段用**相等断言**钉着，
+  // 所以任何新字段都必须落在这个两条路共用的补丁点上。只加在 handler 里
+  // 会让那条断言变红，而这个字段本身还"看起来是有的"（单看 HTTP 那条路全对）。
+  //
+  // 值来自 `project(... VERSION)`（见 common/version.h），和 exe 的
+  // VersionInfo、安装包的文件名是同一个来源 —— 三方一致由两个验收脚本盯着。
+  j["version"] = d2o::kVersion;
   j["web_port"] = port.load(std::memory_order_relaxed);
   // 订阅数在**这里**补，不能在 publish() 里补：publish 跑在采集线程上，它看到
   // 的订阅数最多滞后一秒，而且新连上来的第一个客户端会看到"订阅者 0" ——
@@ -466,6 +583,109 @@ void WebServer::Impl::patch_live_counters(uvcpp_json& j) {
   // 根本不存在的丢包问题。
   j["preview_fragments_unwatched"] = preview_unwatched;
   j["preview_clients_kicked"] = preview_kicked;
+
+  // --- 时间设置（Phase U）--------------------------------------------------
+  //
+  // 补在**这里**的理由与 `version` 一字不差：两条路的字段集合被
+  // `tests\web_contract.py` 的 [4] 段相等断言钉着。
+  //
+  // 但值的来源与文件里其它字段都不同：**这台设备此刻的钟不在 web 这边** ——
+  // 一半在 `DeviceState`（设备时间 = 主机时间 + 偏移），一半在 `NtpSyncer`
+  // （对时线程的状态），两者都归 main.cpp 管。所以只能问一次 `opt.time_get`，
+  // 把它的 JSON 里那几个键搬过来。
+  //
+  // **必须一次调用取齐**（而不是分几个 accessor 各问一次）：这六个值合起来
+  // 描述同一个瞬间，分开问就可能拼出"模式是 NTP、而 last_sync_* 还是手动那次
+  // 留下的"这种自相矛盾的一帧。陷阱 88 那一族说的正是这件事。
+  //
+  // 每帧解一次小 JSON 的代价可以忽略（一秒一次、六个键），而换成"main 那边
+  // 定期推一份缓存进来"要多一条跨线程推送路径 —— 项目里已经有 `post()`
+  // 那条纪律（陷阱 14 的"就地执行"），为省这一次解析去碰它不划算。
+  //
+  // ⚠️ **这一句是在持有 WS 表锁的情况下跑的**（两个调用点都如此）。能这么做
+  // 是因为 `time_get` 只碰 `DeviceState` 与 `NtpSyncer` 的锁，而那两把锁的
+  // 持有者从不回头去拿 web 的表锁 —— 没有环。哪天要给 `time_get` 加"顺带问问
+  // web 侧"的活，这个前提就没了。
+  //
+  // 回调没注册时**照样发这几个键的默认值**：状态页读的是一组固定的字段，缺一个
+  // 就是那一格显示空白，而"这条路没接"和"时间就是 0 偏移"在界面上长得一样。
+  // 发默认值至少让后一个解释成立。
+  {
+    std::string mode = "manual";
+    std::int64_t offset_s = 0;
+    std::int64_t last_at = 0;
+    bool synced = false;
+    std::string last_state;
+    std::string last_error;
+
+    // 取值一律**先问类型再取**：`nlohmann::json::value()` 在"键在、类型不对"
+    // 时是**抛异常**而不是回退到默认值，而这里跑在循环线程上、还持着 WS 表锁
+    // —— 一次抛出去就是整个 WS 推送停摆，而症状（页面数字冻住）与"采集卡了"
+    // 长得一样。几行样板换这条路不可能断，值。
+    if (opt.time_get) {
+      uvcpp_json const t = uvcpp_json::parse(opt.time_get(), nullptr, false);
+      if (!t.is_discarded() && t.is_object()) {
+        auto const num = [&t](char const* k) -> std::int64_t {
+          return (t.contains(k) && t[k].is_number()) ? t[k].get<std::int64_t>() : 0;
+        };
+        auto const str = [&t](char const* k) -> std::string {
+          return (t.contains(k) && t[k].is_string()) ? t[k].get<std::string>()
+                                                     : std::string();
+        };
+        auto const boolean = [&t](char const* k) -> bool {
+          return (t.contains(k) && t[k].is_boolean()) ? t[k].get<bool>() : false;
+        };
+        mode = str("mode");
+        offset_s = num("offset_s");
+        synced = boolean("synced");
+        last_at = num("last_sync_at");
+        last_state = str("last_sync_state");
+        last_error = str("last_sync_error");
+      } else {
+        D2O_WARN("时间的 JSON 解不动，`/api/status` 与 `/ws/stats` 上的时间字段"
+                 "这一帧发的是默认值（模式 manual、偏移 0）。");
+      }
+    }
+    if (mode.empty()) mode = "manual";
+    j["time_mode"] = mode;
+    j["device_offset_s"] = offset_s;
+    j["time_synced"] = synced;
+    j["last_sync_at"] = last_at;
+    j["last_sync_state"] = last_state;
+    j["last_sync_error"] = last_error;
+  }
+
+  // --- 多通道（第五轮 Phase AD）--------------------------------------------
+  //
+  // 补在**这里**的理由与 `version` / 时间那一块一字不差：两条路的字段集合被
+  // `tests\web_contract.py` 的 [4] 段相等断言钉着，所以新字段只能落在这个
+  // 两条路共用的补丁点上。只加在 handler 里会让那条断言变红，而这个字段本身
+  // 还"看起来是有的"（单看 HTTP 那条路全对）。
+  //
+  // 值来自 `opt.channels_json`：通道状态一半在采集线程（fps / 字节数、每秒
+  // 更新），一半在主线程（这一趟建起了哪几路、录到哪个文件），而 web 循环
+  // 线程两边都不是 —— 所以由 `main.cpp` 那边攒成一份 JSON 交过来（与
+  // `time_get` 同一条纪律：**一次取齐**，免得拼出"状态是运行中、fps 却是上
+  // 一次的 0"这种自相矛盾的一帧）。
+  //
+  // ⚠️ 这一句同样是**持着 WS 表锁**跑的（两个调用点都如此）。填这个回调的
+  // 一方因此只能碰它自己那把锁，**绝不能回头调 web 的任何东西** —— 那才有环。
+  {
+    uvcpp_json arr = uvcpp_json::array();
+    if (opt.channels_json) {
+      uvcpp_json const parsed =
+          uvcpp_json::parse(opt.channels_json(), nullptr, false);
+      // 解不动就发空数组，**不是不发这个键**：前端那一格于是显示"没有通道"
+      // （一个能自己解释的读数），而不是一个 JSON 里根本不存在的键 —— 后者
+      // 在前端读出来是 `undefined`，页面上是一片空白，看着像页面坏了。
+      if (!parsed.is_discarded() && parsed.is_array()) {
+        arr = parsed;
+      } else {
+        D2O_WARN("通道状态的 JSON 解不动，这一帧 `channels` 发的是空数组。");
+      }
+    }
+    j["channels"] = std::move(arr);
+  }
 }
 
 void WebServer::Impl::broadcast_stats(std::string text) {
@@ -541,6 +761,38 @@ void WebServer::Impl::send_preview_block(
   }
 }
 
+void WebServer::Impl::send_preview_t0(std::shared_ptr<PreviewConn> conn) {
+  if (!conn || conn->dropped || conn->c == nullptr) return;
+  if (preview_t0_ms <= 0) return;  // 还不知道 0 点，什么都不发
+
+  // `server_now_ms` 用的是**同一台机器的同一个钟**（Unix 毫秒）。前端拿它算
+  // 一次 `skew = Date.now() - server_now_ms` 就够：两个钟的差是这台设备与
+  // 浏览器所在机器之间的偏差，而"延迟"是个**差值**，同一条式子里的 skew 会
+  // 被减掉 —— 前提是它是**常数**，所以只在连上的那一刻量一次、之后不再更新
+  // （每次推送都重算的话，量到的差里会混进网络往返时间，反而抖起来）。
+  //
+  // **这是参考、不是授权**：它只让浏览器知道"服务端现在几点"，不改变任何
+  // 事实。设备时间（主机 + NVR 下发的偏移）在这里一个字都不出现 —— 那正是
+  // 这条链上最容易搞混的地方（见 capture_session.cpp 里播 t0 时那段注释）。
+  std::int64_t const now_ms = static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+
+  char buf[160];
+  int const n = std::snprintf(buf, sizeof(buf),
+                              "{\"type\":\"t0\",\"t0_wall_ms\":%lld,"
+                              "\"server_now_ms\":%lld}",
+                              static_cast<long long>(preview_t0_ms),
+                              static_cast<long long>(now_ms));
+  if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(buf)) return;
+
+  // 不计 inflight：这一帧只有一百来个字节，而背压那道闸门是给几百 KB 的分片
+  // 准备的。为它去走一遍 inflight 的加减只会让那条路径多一个能算错的地方。
+  int const rc = conn->c->send_text(buf, static_cast<std::size_t>(n));
+  if (rc != 0) D2O_DEBUG("预览时间原点发送失败（%d），等 on_close 收拾", rc);
+}
+
 void WebServer::Impl::on_preview_socket(uvcpp_web_ws_request& ws) {
   uvcpp_ws_connection* c = ws.connection();
   if (c == nullptr) return;
@@ -562,6 +814,11 @@ void WebServer::Impl::on_preview_socket(uvcpp_web_ws_request& ws) {
     // 下一个关键帧，而在此之前客户端手里只有一个空的 SourceBuffer ——
     // 前端的 3 秒就绪计时器会先超时，报"连上了但没数据"。
     if (preview_init) send_preview_block(conn, preview_init);
+    // 时间原点**不挂在上面那条 `if` 上**：0 点是采集侧第一个包进封装器那一刻
+    // 定下来的，而初始化段要等第一个关键帧 —— 默认 2 秒的 GOP 下，这中间隔着
+    // 整整一个 GOP，很多时候 0 点比初始化段**先**到。挂在 `if` 里面就会让这段
+    // 窗口里的客户端拿不到原点，而它们正是刚打开页面、最盯着延迟看的那批人。
+    send_preview_t0(conn);
   }
 
   D2O_DEBUG("WS /ws/preview 接入：%s:%u", ws.peer_ip().c_str(), ws.peer_port());
@@ -683,6 +940,21 @@ void WebServer::Impl::register_auth_routes() {
 
     if (!sessions.check_password(user, pass)) {
       sessions.note_failure(ip, t);
+      // 操作日志：**记录失败，但永远不含口令**。
+      //
+      // 这里的写入量不需要自己再限流一次，理由是**上面那个 `throttled` 分支**
+      // 已经把上限压住了：`kMaxFailures = 5` / `kWindowSeconds = 300`，
+      // 而冷却期内的请求在第 816 行就 429 返回、**根本走不到这一行**。
+      // 所以同一个 IP 最多每 5 分钟写 5 行 —— 也就是用户要的"同 IP 一分钟一条"
+      // 那个量级，而且这个上限是**既有限速机制的副产品**，不是又一处要自己维护
+      // 的计数（那种计数迟早会和真限速漂开）。
+      //
+      // 身份写**提交上来的那个用户名**，不是"未知"：审计要回答的正是"有人在拿
+      // 哪个账号试"。口令一个字都不写 —— 这一个字都不能有。
+      if (opt.audit) {
+        opt.audit(AuditWho{ip, "web:" + (user.empty() ? std::string("(空)") : user)},
+                  "login.fail", "用户名或口令不对，未签发会话");
+      }
       uvcpp_json j;
       j["ok"] = false;
       j["error"] = "用户名或口令不对。";
@@ -695,6 +967,11 @@ void WebServer::Impl::register_auth_routes() {
     }
 
     sessions.note_success(ip);
+    if (opt.audit) {
+      opt.audit(AuditWho{ip, "web:" + sessions.user()}, "login.ok",
+                "登录成功，签发会话（有效期 " +
+                    std::to_string(SessionStore::kTtlSeconds) + " 秒）");
+    }
     std::string const token = sessions.issue(t);
     // httpOnly：中间那个 XSS 想偷 cookie 就偷不到了，而前端本来也不需要读
     // 它（要问"我登录了吗"就调 /api/session）。
@@ -797,14 +1074,60 @@ void WebServer::Impl::register_routes() {
     a.get("/api/config", [this](uvcpp_web_request&, uvcpp_web_response& resp,
                                 uvcpp_web_next) {
       std::string text = opt.config_get();
-      // 把"还没生效的那几项"挂上去。**这一步失败不改变响应本身** ——
-      // 一份前端读得懂的配置，远好过因为加不上一个附加字段而整条 500。
-      if (opt.config_pending) {
+      // 挂两样**关于配置的元信息**：还没生效的那几项，和画质档位表。
+      // **这一步失败不改变响应本身** —— 一份前端读得懂的配置，远好过因为
+      // 加不上一个附加字段而整条 500。
+      //
+      // 档位表**从后端发**，而不是让前端写死一份。那份表在 `config.cpp` 的
+      // `quality_tiers()` 里，每个档位的 fps / 码率 / 分辨率上限都在那儿；前端
+      // 照抄的后果是改了表而界面上写的还是旧数值 —— 而界面上那几句话正是用户
+      // 判断"降到这一档会牺牲什么"的唯一依据。`QualityTier::label` 的注释从
+      // 一开始就写着"界面直接显示"，那就得真的发出去。
+      {
         uvcpp_json j = uvcpp_json::parse(text, nullptr, false);
         if (!j.is_discarded() && j.is_object()) {
-          uvcpp_json arr = uvcpp_json::array();
-          for (std::string const& f : opt.config_pending()) arr.push_back(f);
-          j["pending"] = arr;
+          if (opt.config_pending) {
+            uvcpp_json arr = uvcpp_json::array();
+            for (std::string const& f : opt.config_pending()) arr.push_back(f);
+            j["pending"] = arr;
+          }
+          uvcpp_json tiers = uvcpp_json::array();
+          for (QualityTier const& t : quality_tiers()) {
+            uvcpp_json e;
+            e["key"] = t.key;
+            e["label"] = t.label;
+            e["fps"] = t.fps;
+            e["bitrate_kbps"] = t.bitrate_kbps;
+            e["max_height"] = t.max_height;
+            e["sub_enabled"] = t.sub_enabled;
+            tiers.push_back(e);
+          }
+          j["quality_tiers"] = tiers;
+
+          // 延时档位表，**同理从后端发**。
+          //
+          // 前端那三张卡片上写的每一句话几乎都是算出来的：流水线几帧、
+          // 在某个帧率下约等于多少毫秒、关键帧几秒一个。现算自这张表，
+          // 界面就不可能和 `latency_tiers()` 漂移 —— 而"界面上那个数字"
+          // 恰好是用户唯一能拿去对账的东西（陷阱 90 那一族：档位选下去、
+          // 界面显示已生效、每一处代码都做到了它承诺的事，只有用户关心的
+          // 那个数字没动）。
+          //
+          // ⚠️ **表里没有 `custom`，这里也不许补。** `custom` 的语义是
+          // "谁都不动"，而它的四个数字（当前 threads / gop）是**手填的**、
+          // 不是表里的常数 —— 补进这张表就等于让 `find_latency_tier("custom")`
+          // 命中，展开那一段随后会拿表里的值把用户手填的盖掉。
+          // 界面上第四张卡是前端自己补的（`ConfigView.vue` 的 `customLatencyNote`）。
+          uvcpp_json ltiers = uvcpp_json::array();
+          for (LatencyTier const& t : latency_tiers()) {
+            uvcpp_json e;
+            e["key"] = t.key;
+            e["label"] = t.label;
+            e["threads"] = t.threads;
+            e["gop_seconds"] = t.gop_seconds;
+            ltiers.push_back(e);
+          }
+          j["latency_tiers"] = ltiers;
           text = j.dump(2);
         }
       }
@@ -844,6 +1167,42 @@ void WebServer::Impl::register_routes() {
       uvcpp_json arr_pending = uvcpp_json::array();
       for (std::string const& f : res.pending) arr_pending.push_back(f);
 
+      // ---- 操作日志（Phase V）：改配置这一条 -------------------------------
+      //
+      // **细节里只有字段名，一个值都没有。** 这不是顺手省略，是这一段的全部
+      // 要点：`applied`/`pending` 里装的恰好就是"改过哪些字段"，而"改了哪些
+      // 字段"已经足够回答用户那句"谁在什么时候改了什么"。值里会有口令
+      // （`web.password` / `onvif.password` 都在可改字段集合里），一旦记进去
+      // 就是事故 —— 而且是一份要留 180 天、界面上还提供"复制一行"的事故。
+      //
+      // 只在**成功**这条路上写：上面 `config_set` 返回 false 时已经 400 返回，
+      // 那次什么都没改，记一条"改过什么"反而是假的。
+      //
+      // 来源与身份走 `who` 的两列，与审计行 `时间 | 来源 | 身份 | 动作 | 细节`
+      // 一一对应（IP 用 `req.peer_ip()`，与登录风控同一个取法）。
+      if (opt.audit) {
+        std::string detail;
+        if (res.applied.empty() && res.pending.empty()) {
+          detail = "没有字段发生变化";
+        } else {
+          auto const join = [](std::vector<std::string> const& v) {
+            std::string s;
+            for (std::string const& f : v) {
+              if (!s.empty()) s += ", ";
+              s += f;
+            }
+            return s;
+          };
+          if (!res.applied.empty()) detail = "已生效[" + join(res.applied) + "]";
+          if (!res.pending.empty()) {
+            if (!detail.empty()) detail += " ";
+            detail += "待重启[" + join(res.pending) + "]";
+          }
+        }
+        opt.audit(AuditWho{req.peer_ip(), "web:" + sessions.user()}, "config.set",
+                  detail);
+      }
+
       // 回读一次而不是把入参回显回去：回读的是**真的落盘并被接受**的那份，
       // 而回显只是"我以为写进去了什么"。前端拿它刷新表单也就自然是准的。
       uvcpp_json j;
@@ -860,6 +1219,12 @@ void WebServer::Impl::register_routes() {
       } else {
         j["note"] = "配置已保存。applied 里的已经生效，pending 里的需要重启程序。";
       }
+      // 被拒绝的字段（目前只有硬件码那三个）。**拼进同一句话**而不是新加一个
+      // 字段：`note` 已经是这条路上"给用户看的那句话"，前端也已经在渲染它 ——
+      // 再加一个平行的 `notes` 数组，就会出现"有的提示在前端、有的没人显示"。
+      for (std::string const& n : res.notes) {
+        j["note"] = j["note"].get<std::string>() + " " + n;
+      }
       if (opt.config_get) {
         uvcpp_json c = uvcpp_json::parse(opt.config_get(), nullptr, false);
         if (!c.is_discarded()) j["config"] = c;
@@ -867,6 +1232,75 @@ void WebServer::Impl::register_routes() {
       send_json(resp, j);
     });
   }
+
+  // GET /api/sources —— 本机**有什么可以当通道**（显示器 + 摄像头）。
+  //
+  // 配置页的「通道」那一段要摆出"能加哪些"，所以得先知道有哪些。这份数据
+  // 只能由主程序给：枚举显示输出要 DXGI、枚举摄像头要 Media Foundation，而
+  // Web 层对这两个东西一无所知，也不该知道。
+  //
+  // ⚠️ **它回的是启动时算好的一份快照，不是现枚举。** 详见 `WebOptions::
+  // sources_json` 的注释：探"这块屏能不能抓"要真建一个 `IDXGIOutputDuplication`，
+  // 而一块屏同时只允许一个 —— 现枚举会让正在采集的那一路失败。
+  //
+  // 恒注册、`sources_json` 为空就回两张空表：前端于是不需要处理 404，
+  // 单通道/测试构建下那个界面只会显示"没发现可加的通道"，这是个准确的描述。
+  a.get("/api/sources", [this](uvcpp_web_request&, uvcpp_web_response& resp,
+                               uvcpp_web_next) {
+    std::string text = opt.sources_json ? opt.sources_json() : std::string();
+    uvcpp_json j = uvcpp_json::parse(text, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) j = uvcpp_json::object();
+    if (!j.contains("displays")) j["displays"] = uvcpp_json::array();
+    if (!j.contains("cameras")) j["cameras"] = uvcpp_json::array();
+    send_json(resp, j);
+  });
+
+  // 网页预览"现在看第几路" —— GET 读、POST 写。
+  //
+  // 为什么是**全机一份**的状态而不是每个连接各一份：控制台只有一个（绑
+  // `web.port` 那个），画面有 N 路。而 `/api/snapshot.jpg` 是一条无状态的
+  // GET，界面上按的是"通道 2 的快门"、存下来的却是通道 1 —— 只可能是这个
+  // 状态没被两边共用。所以它落在进程里，Web 层只负责转手。
+  //
+  // 校验权**在后端**（`preview_channel_set` 回 false）：哪几个通道现在真的
+  // 存在，是运行期才知道的事（配置里关着的、被挡住的都不算），Web 层手里
+  // 只有一份字符串。
+  a.get("/api/preview-channel", [this](uvcpp_web_request&, uvcpp_web_response& resp,
+                                       uvcpp_web_next) {
+    uvcpp_json j;
+    j["channel"] = opt.preview_channel_get ? opt.preview_channel_get() : 1;
+    send_json(resp, j);
+  });
+
+  a.post("/api/preview-channel", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                                        uvcpp_web_next) {
+    std::string const body(req.body_data(), req.body_size());
+    uvcpp_json in = uvcpp_json::parse(body, nullptr, false);
+    // 只认 JSON 里的数字。`"channel": "2"` 这种字符串**故意不收** ——
+    // 它多半意味着前端把某个 DOM 的 `value` 原样发了过来，而那种错误
+    // 静默接受一次，就会在下一个字段上变成"看着像 2、其实是 NaN"。
+    int want = 0;
+    if (!in.is_discarded() && in.is_object() && in.contains("channel") &&
+        in["channel"].is_number_integer()) {
+      want = in["channel"].get<int>();
+    }
+    if (want <= 0) {
+      uvcpp_json j;
+      j["ok"] = false;
+      j["error"] = "请求体要是 {\"channel\": <正整数>}。";
+      send_json(resp, j, 400);
+      return;
+    }
+    bool const ok = opt.preview_channel_set && opt.preview_channel_set(want);
+    uvcpp_json j;
+    j["ok"] = ok;
+    j["channel"] = opt.preview_channel_get ? opt.preview_channel_get() : 1;
+    if (!ok) {
+      j["error"] = "没有这个通道 —— 它可能没建起来（配置里关着、或者被别的"
+                   "通道挡住了）。";
+    }
+    send_json(resp, j, ok ? 200 : 400);
+  });
 
   // 快照 —— 最近一帧的 JPEG。**两条路径、两套凭据，故意分开。**
   //
@@ -946,6 +1380,392 @@ void WebServer::Impl::register_routes() {
     send_json(resp, j);
   });
 
+  // POST /api/reload —— 用**当前保存的配置**重开采集/推流管线。
+  //
+  // **和上一条不是一回事，名字像而已。** `/api/onvif/restart` 只重播一次
+  // WS-Discovery 组播（NVR 那边重新收录设备，画面一秒都不中断）；这条是真的
+  // 把采集链拆了重建（录制分段、RTSP 客户端断开重连）。所以路径也刻意不叫
+  // `restart` —— 前端两个按钮挨着放的时候，`reload` 和 `restart` 至少还能
+  // 让人停下来看一眼。
+  //
+  // **回 202 而不是 200。** 重开这件事发生在采集线程上，响应发出去的这一刻
+  // 它还没发生 —— 回 200 等于宣称"已经重开了"，而客户端下一毫秒去拉流可能还
+  // 连着旧的那一条。202 的意思是"收到了、正在做"，这是实话，前端也正好据此
+  // 开始转圈。
+  //
+  // **不需要定时器**（不像重启进程那条要等响应发完）：这里只是置一个原子位，
+  // 采集线程下一拍自己会看到，没有任何理由把响应往后拖。
+  if (opt.reload) {
+    a.post("/api/reload", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                                 uvcpp_web_next) {
+      bool const live = opt.reload();
+      // 这里**同步写**、不进 `on_sent`：`opt.reload()` 只是置一个原子位，
+      // 记一行日志既不会拖住响应，也不像重启那样会让进程消失。
+      if (opt.audit) {
+        opt.audit(AuditWho{req.peer_ip(), "web:" + sessions.user()}, "reload",
+                  live ? "按当前配置重开采集管线（录制分段、RTSP 客户端重连）"
+                       : "当前没有在录制，没有可重开的管线");
+      }
+      uvcpp_json j;
+      j["ok"] = true;
+      j["live"] = live;
+      if (live) {
+        j["note"] =
+            "正在按当前配置重开采集管线：录制会分段，已连上的 RTSP 客户端会断开、"
+            "数秒后重连。";
+      } else {
+        j["note"] =
+            "当前没有在录制，没有可重开的管线；配置会在下一次开始录制时生效。";
+      }
+      send_json(resp, j, 202);
+    });
+  }
+
+  // POST /api/restart —— **真的重启这个进程**。
+  //
+  // 三个名字的分工在前端是挨着放的，所以这里再说一遍：
+  //   * `/api/onvif/restart` —— 只重播一次 WS-Discovery 组播（画面一秒不断）
+  //   * `/api/reload`        —— 重开采集管线（录制分段、RTSP 重连，进程还在）
+  //   * `/api/restart`（这条）—— 进程本身退出再起来，上面两样都会发生
+  //
+  // **先回 202，再用 `resp.on_sent` 在响应真的发出去之后动手。** 在 handler 里
+  // 退进程的话这个 202 永远到不了前端，用户看到的是"网络错误"，而它和"服务崩
+  // 了"长得一模一样（陷阱 73）。框架对**整包**响应是在 body 入队之后同步触发
+  // `on_sent` 的（`uvcpp_web_app.cpp` 里 `send_response()` 之后紧跟那句
+  // `notify_sent(info)`），而真正把它写上线是 libuv 的事，几十微秒。主线程至少
+  // 要等一拍采集循环（40 ms）才会看到那个原子位 —— 余量是这么来的，不是猜的。
+  // 需要知道边界的话："入队"不等于"已上网络"，所以严格地说这一刻是"响应已经
+  // 交给网络层"，不是"客户端已经收到"。测试里那条"客户端真的收到了一个能解析
+  // 的 202"就是这件事的实测判据。
+  //
+  // **回调里只置位。** 它跑在 web 循环线程上，而收尾是主线程那条分段循环的活
+  // （陷阱 14：`app.post` 在循环线程上是就地执行的，"投递"本身就不可靠）。
+  if (opt.restart) {
+    a.post("/api/restart", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                                  uvcpp_web_next) {
+      // **这一行写在 `on_sent` 外面，是有意的。** 上面刚写过：客户端提前走了
+      // 也照样重启。既然如此，"谁在什么时候点了重启"这件事在请求到达并过了
+      // 鉴权的那一刻就已经成立，把它挂在"响应送达"上会让一次真的重启没有记录
+      // —— 而重启恰恰是排查"那天几点断过流"要对着看的那一行。
+      if (opt.audit) {
+        opt.audit(AuditWho{req.peer_ip(), "web:" + sessions.user()}, "restart",
+                  "重启服务进程（录制中断并分段、RTSP 客户端断开、所有网页会话失效）");
+      }
+      resp.on_sent([this](uvcpp_web_sent_info const& info) {
+        // **客户端提前走了也照样重启。** 请求已经到达、也已经过了鉴权，那两件
+        // 事都发生过；"响应没送达"改变不了它。反过来（因为对方断线就不重启）
+        // 会让一次点击石沉大海，而用户看到的只是"点了没反应"。
+        if (!info.ok) {
+          D2O_WARN("重启请求的 202 没能送达（连接已断），照常执行。");
+        }
+        opt.restart();
+      });
+      uvcpp_json j;
+      j["ok"] = true;
+      j["restarting"] = true;
+      // 三条代价都要写出来，而不是一个干巴巴的"重启"：用户点之前必须知道
+      // 自己会失去什么。
+      j["note"] =
+          "正在重启服务：当前录制会中断并分段、已连上的 RTSP 客户端会断开重连、"
+          "所有网页会话失效（会话令牌是每进程一份的随机密钥，重启必然踢掉所有人），"
+          "稍后需要重新登录。";
+      send_json(resp, j, 202);
+    });
+  }
+
+  // POST /api/factory-reset —— 回到全新状态（删掉 config.json）然后重启。
+  //
+  // **body 必须恰好是 `{"confirm":"RESET"}`**，形状对不上就 400 什么都不做。
+  // 只认这一个字面量：前端那个二次确认框是**给人看的**，服务端不能信"我点了
+  // 确认"这种说法 —— 发出这个请求的可以是任何东西，包括一个手滑的脚本。
+  //
+  // 动作本身（备份 `.bak`、删配置、清日志、复位设备状态）**不在这一层**：
+  // Web 层够不到配置文件路径、`DeviceState`、`Log` 的文件句柄，而且那些事必须
+  // 在主线程做（和重启同一条收尾路径）。这里只认形状、回 202、置位。
+  if (opt.factory_reset) {
+    a.post("/api/factory-reset", [this](uvcpp_web_request& req,
+                                        uvcpp_web_response& resp, uvcpp_web_next) {
+      // 和 SOAP 一样用 body_data()/body_size()：`content_length()` 是声明值。
+      std::string const body(req.body_data(), req.body_size());
+      uvcpp_json const c = uvcpp_json::parse(body, nullptr, false);
+      if (c.is_discarded() || !c.is_object() ||
+          c.value("confirm", std::string()) != "RESET") {
+        uvcpp_json j;
+        j["ok"] = false;
+        j["error"] =
+            "恢复出厂设置需要请求体恰好是 {\"confirm\":\"RESET\"}。"
+            "这是防手滑的第二道闸，不是给人看的确认框。";
+        send_json(resp, j, 400);
+        return;
+      }
+      // **「谁点的」要在这里取出来、并且按值捕获。** 两件事都不能省：
+      //   * 取的时刻 —— 请求对象 `req` 只在这次 handler 里有效，而 `on_sent`
+      //     是几十微秒之后才跑的；那时再去问 `req.peer_ip()` 是碰一个已经收了
+      //     的对象。所以先算成 `std::string` 再进 lambda。
+      //   * 按值捕获 —— 恢复出厂会把**整份审计日志**清空（这正是用户要的），
+      //     而主线程清完还要写一行「谁恢复了出厂」。这一行只能是**清空之前**
+      //     截下来的那份 who，所以它必须已经在手上。
+      //
+      // 身份写成 `web:<用户名>`，与审计行的第二列同一个惯例（`onvif:<用户名>` /
+      // `system` 是另外两种来源）。口令**永远不在这里**，也不需要 —— 能走到这一
+      // 行的请求已经过了会话校验，用户名就是"是谁"的全部答案。
+      std::string const ip = req.peer_ip();
+      std::string const ident = "web:" + sessions.user();
+      resp.on_sent([this, ip, ident](uvcpp_web_sent_info const& info) {
+        if (!info.ok) {
+          D2O_WARN("恢复出厂请求的 202 没能送达（连接已断），照常执行。");
+        }
+        opt.factory_reset(ip, ident);
+      });
+      uvcpp_json j;
+      j["ok"] = true;
+      j["resetting"] = true;
+      // **诚实边界写在回应里**，不只写在文档里：恢复出厂恢复的是**配置文件**。
+      j["note"] =
+          "正在恢复出厂设置：config.json 会先备份成 config.json.bak 再删除，"
+          "日志会被清空，设备时间偏移归零，然后服务重启。"
+          "注意：恢复的是配置文件 —— 命令行上带的参数（端口、口令等）重启后照样生效，"
+          "因为重启用的是同一条命令行。";
+      send_json(resp, j, 202);
+    });
+  }
+
+  // ---- 时间设置（Phase U）--------------------------------------------------
+  //
+  // 四条路与 `opt.time_*` 一一对应，**每一条都按 `if (opt.time_*)` 注册**
+  // （同 `/api/config` 那条纪律：注册了一条功能不可用的路，请求会落到静态兜底
+  // 上，SPA 模式下拿到 200 + 一份 index.html，前端 `JSON.parse` 报的错和真正的
+  // 原因毫无关系）。
+  //
+  // **这里没有一条会改系统时钟。** 改的是 `DeviceState` 里那个"设备时间"
+  // （= 主机时间 + 偏移），也就是水印上和 ONVIF 报出去的那个时间。理由见
+  // `TimeConfig` 的注释与 README：动 Windows 的系统时钟要管理员权限、会连累
+  // 这台机器上别的程序，而且那是用户的钟不是我们的。
+  //
+  // 三条 POST 的分工也值得写在这里，因为它们长得像而代价完全不同：
+  //   * `/api/time`（手动校准）—— 同步做完：写 `DeviceState` + 落盘 + 重算
+  //     pending。它慢不到哪去（一次写盘），所以**不用** 202。
+  //   * `/api/time/reset`     —— 同上，但多一步 `reset_time()`。
+  //   * `/api/time/sync`      —— **回 202**，因为真正的 UDP 查询在后台线程上
+  //     （最长 2 秒 × 地址数）。这一条与 `/api/reload` 同源，不是新发明的形状。
+  if (opt.time_get) {
+    a.get("/api/time", [this](uvcpp_web_request&, uvcpp_web_response& resp,
+                              uvcpp_web_next) {
+      // 回调给的是**字符串**（时间与对时状态在 main.cpp 那边，它同时握着
+      // `DeviceState` 和 `NtpSyncer`），这里解一遍再发 —— 解不动说明那份 JSON
+      // 是坏的，而"坏"必须在**这里**变成一句能读的错，不能原样发给前端：
+      // 前端 `JSON.parse` 抛出来的异常落在读字段那一行上，报的错和真正的原因
+      // 毫无关系（陷阱 39 的形状，与 `/api/audio/devices` 那条同一个理由）。
+      uvcpp_json j = uvcpp_json::parse(opt.time_get(), nullptr, false);
+      if (j.is_discarded()) {
+        D2O_ERROR("GET /api/time：时间的 JSON 自己就是坏的，发出去只会让前端"
+                  "在一个解析错误上找原因。");
+        uvcpp_json e;
+        e["ok"] = false;
+        e["error"] = "服务端组装的时间信息不是合法 JSON，这是本程序的缺陷。";
+        send_json(resp, e, 500);
+        return;
+      }
+      send_json(resp, j);
+    });
+  }
+
+  if (opt.time_set) {
+    a.post("/api/time", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                               uvcpp_web_next) {
+      // 和 SOAP 一样用 `body_data()`/`body_size()`：`content_length()` 是声明值。
+      std::string const body(req.body_data(), req.body_size());
+      std::string err;
+      if (!opt.time_set(body, err)) {
+        uvcpp_json j;
+        j["ok"] = false;
+        j["error"] = err.empty() ? std::string("手动校准被拒绝了，但没有给出原因。")
+                                 : err;
+        send_json(resp, j, 400);
+        return;
+      }
+      uvcpp_json j;
+      j["ok"] = true;
+      j["note"] = "设备时间已校准。这是**设备时间**（水印与 ONVIF 报出去的那个），"
+                  "本机的 Windows 系统时钟没有被改动。";
+      // 顺带把新状态一起回去：不这样的话前端还得再拉一次 `/api/time`，而那一拍
+      // 里它显示的还是旧偏移 —— 用户会看到"保存成功了，但数字没变"。
+      bool have_offset = false;
+      long long new_offset = 0;
+      if (opt.time_get) {
+        uvcpp_json const t = uvcpp_json::parse(opt.time_get(), nullptr, false);
+        if (!t.is_discarded()) {
+          j["time"] = t;
+          // 审计记的是**结果**（落盘之后那个偏移），不是请求体。请求体可以是
+          // `offset_s` 也可以是 `device_now`，而后者要服务端算一遍才知道偏移是
+          // 多少 —— 记请求体的话，唯一能回答"到底调成了几点"的原始数字就丢了。
+          if (auto const it = t.find("offset_s");
+              it != t.end() && it->is_number_integer()) {
+            new_offset = it->get<long long>();
+            have_offset = true;
+          }
+        }
+      }
+      if (opt.audit) {
+        std::string detail = "手动校准设备时间";
+        detail += have_offset ? "，新偏移 " + std::to_string(new_offset) + " 秒"
+                              : "（读回新偏移失败，见日志）";
+        opt.audit(AuditWho{req.peer_ip(), "web:" + sessions.user()}, "time.set",
+                  detail);
+      }
+      send_json(resp, j);
+    });
+  }
+
+  if (opt.time_reset) {
+    a.post("/api/time/reset", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                                     uvcpp_web_next) {
+      std::string err;
+      if (!opt.time_reset(err)) {
+        uvcpp_json j;
+        j["ok"] = false;
+        j["error"] = err.empty() ? std::string("归零被拒绝了，但没有给出原因。") : err;
+        send_json(resp, j, 400);
+        return;
+      }
+      if (opt.audit) {
+        opt.audit(AuditWho{req.peer_ip(), "web:" + sessions.user()}, "time.reset",
+                  "设备时间归零（= 主机时间），偏移写回配置");
+      }
+      uvcpp_json j;
+      j["ok"] = true;
+      j["note"] = "设备时间已恢复成主机时间（偏移归零）。";
+      if (opt.time_get) {
+        uvcpp_json const t = uvcpp_json::parse(opt.time_get(), nullptr, false);
+        if (!t.is_discarded()) j["time"] = t;
+      }
+      send_json(resp, j);
+    });
+  }
+
+  if (opt.time_sync) {
+    a.post("/api/time/sync", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                                    uvcpp_web_next) {
+      // **不需要 `resp.on_sent`**（和 `/api/restart` 那条的差别就在这里）：
+      // 这个回调只是往对时线程上放一个位（一把锁 + 一次 notify），不等任何
+      // 网络、也不会让进程消失。所以"先回 202 再动手"那套在这里没有对象 ——
+      // 照抄那个形状只会多一个解释不清的延迟。
+      opt.time_sync();
+      // 这一行记的是**请求**，不是结果 —— 结果还没发生（查询在后台线程上，
+      // 最长 2 秒）。真对完之后由 main.cpp 那边再补一条 `ntp.sync`，两条一起
+      // 回答"谁点的"和"对上了没有"。指望在这一行里写出偏移，就只能去猜。
+      if (opt.audit) {
+        opt.audit(AuditWho{req.peer_ip(), "web:" + sessions.user()}, "time.sync",
+                  "请求立刻发起一次 NTP 对时查询（结果见随后的 ntp.sync 一行）");
+      }
+      uvcpp_json j;
+      j["ok"] = true;
+      j["syncing"] = true;
+      // **两种模式的区别写进回应里**，因为"点了一下、什么都没变"和"对时失败"
+      // 在前端长得一样：手动模式下这次查询只报结果、**不改设备时间**（否则
+      // 配置里那个 `offset_s` 立刻就对不上，而下次重启又弹回去），NTP 模式下
+      // 才会同时把设备时间对齐。界面照这句话说话，用户就不会去查一个不存在
+      // 的故障。结果去 `GET /api/time` 的 `last_sync_state` / `last_sync_error` 看。
+      j["note"] =
+          "正在向 NTP 服务器发起一次对时查询（UDP 查询最长 2 秒）。"
+          "当前是手动模式时，这次只报结果、不会改动设备时间；"
+          "NTP 模式下会同时把设备时间对齐。结果见 GET /api/time 的 "
+          "last_sync_state / last_sync_error。";
+      send_json(resp, j, 202);
+    });
+  }
+
+  // GET /api/audio/devices —— 音频设备列表（给配置页那个麦克风下拉框）。
+  //
+  // **注册与否由调用方决定**（`opt.audio_devices` 为空就是不注册），和
+  // `/api/config` / `/api/reload` 是同一条纪律：注册了一条功能不可用的路，
+  // 请求会落到静态兜底上，SPA 模式下拿到 200 + 一份 index.html，前端
+  // `JSON.parse` 报的错和真正的原因毫无关系。
+  if (opt.audio_devices) {
+    a.get("/api/audio/devices", [this](uvcpp_web_request&, uvcpp_web_response& resp,
+                                       uvcpp_web_next) {
+      // 回调给的是**字符串**（枚举在 main.cpp 那边做，它才有 COM 的线程亲和），
+      // 这里解一遍再发 —— 解不动就说明那份 JSON 是坏的，而"坏"必须在**这里**
+      // 变成两个空列表，不能原样发给前端：前端 `JSON.parse` 抛出来的异常
+      // 落在下拉框那一段代码上，报的错和真正的原因毫无关系（陷阱 39 的形状）。
+      uvcpp_json j = uvcpp_json::parse(opt.audio_devices(), nullptr, false);
+      if (j.is_discarded()) {
+        D2O_ERROR("音频设备列表不是合法 JSON，已按空列表返回（下拉框会是空的）。");
+        j = uvcpp_json{{"capture", uvcpp_json::array()},
+                       {"render", uvcpp_json::array()}};
+      }
+      // 插拔一个耳机列表就变，缓存住的话界面会一直显示已经拔掉的设备。
+      // 顺序照 `serve_snapshot`：先 status、再头、最后 body —— 那个顺序是被
+      // 快照那条路验过的，反过来写没有理由，只是多一种没验过的组合。
+      resp.status(200);
+      resp.set_header("Cache-Control", "no-store");
+      resp.json(j);
+      resp.end();
+    });
+  }
+
+  // GET /api/audit?days=7&limit=500&q=关键字 —— 操作日志（只读）。
+  //
+  // **这一层不认识 `AuditLog`。** 回调给的是一整份 JSON 文本（在 main.cpp 那边
+  // 组装，它才握着 `AuditLog`），这里只管解一遍、校验一遍、发出去 —— 与
+  // `/api/audio/devices` 是同一个形状，理由也一样：让"按天分组、倒序、关键字
+  // 过滤、留存策略那句话"这些**呈现**上的决定集中在一处，而不是让 Web 层和
+  // 日志层各持一半、将来漂开（陷阱 52 的形状）。
+  //
+  // **坏 JSON 回 500，不是回空列表。** 空列表在这里有确切含义（"这台设备还没
+  // 发生过任何事"，很可能刚恢复出厂），把组装缺陷报成空列表，等于用一句话回答
+  // 了两种完全不同的问题 —— 用户会去查"为什么没有记录"，而真正该查的是程序
+  // 自己。和 `/api/time` 那条同一个取舍。
+  if (opt.audit_read) {
+    a.get("/api/audit", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                               uvcpp_web_next) {
+      // `days` / `limit` 缺失、写成 `abc`、写成 `-3`，全都退到默认值而不是让
+      // 这次请求失败 —— 界面上那两个框是给人填的，填错了应该还能看见日志。
+      // **上下界在 main.cpp 那边夹**（它要把夹过之后的值回报给分页用），
+      // 这里只做"能不能整串转成整数"这一层。
+      //
+      // ⚠️ `query()` 回的是**指针**（`nullptr` = 没有这个键），不是带默认值的
+      // 字符串 —— 没有这个键和"这个键的值是空串"是两件事，框架特意分开。
+      auto str_param = [&req](char const* name) -> std::string {
+        std::string const* const v = req.query(name);
+        return v == nullptr ? std::string() : *v;
+      };
+      auto int_param = [&str_param](char const* name, int fallback) {
+        std::string const v = str_param(name);
+        if (v.empty()) return fallback;
+        try {
+          std::size_t used = 0;
+          int const n = std::stoi(v, &used);
+          // `"12abc"` 也解析得动，但那显然不是用户想输入的 —— 整串都得是数字。
+          return used == v.size() ? n : fallback;
+        } catch (std::exception const&) {
+          return fallback;
+        }
+      };
+      int const days = int_param("days", 7);
+      int const limit = int_param("limit", 500);
+      std::string const keyword = str_param("q");
+
+      uvcpp_json j =
+          uvcpp_json::parse(opt.audit_read(days, limit, keyword), nullptr, false);
+      if (j.is_discarded()) {
+        D2O_ERROR("GET /api/audit：操作日志的 JSON 自己就是坏的，发出去只会让"
+                  "前端在一个解析错误上找原因。");
+        uvcpp_json e;
+        e["ok"] = false;
+        e["error"] = "服务端组装的操作日志不是合法 JSON，这是本程序的缺陷。";
+        send_json(resp, e, 500);
+        return;
+      }
+      // 日志是只增的，但界面会反复刷新它，缓存住只会让人以为"新写的那几条
+      // 没进去"。与音频设备列表同一个头，理由更直白。
+      resp.status(200);
+      resp.set_header("Cache-Control", "no-store");
+      resp.json(j);
+      resp.end();
+    });
+  }
+
   // ONVIF 的两个 SOAP 端点。**分成两条路由，而不是一条按 Body 里的命名空间
   // 分派**：`GetServiceCapabilities` 在两个服务里同名，而"客户端把请求发到
   // 哪个 URL"是它自己明确表达的意图，比从报文体里猜可靠得多。
@@ -953,6 +1773,11 @@ void WebServer::Impl::register_routes() {
   // `onvif.set_options()` 在这里调是安全的：此刻循环线程还没起来。
   if (opt.onvif_enabled) {
     onvif.set_options(opt.onvif);
+    // 接上设备状态。名称**不在这里推**：启动时那一次由 main.cpp 写（它还要
+    // 覆盖"ONVIF 关着、但水印仍然要显示名称"那条路），运行中那一次由
+    // `set_identity` 写。两个写入方各有明确的分工，这里再来一个的话，将来
+    // 三处里漏掉一处就会表现为"某一条路上名字是旧的"。
+    onvif.set_device_state(opt.device_state);
     a.post("/onvif/device_service",
            [this](uvcpp_web_request& req, uvcpp_web_response& resp, uvcpp_web_next) {
              onvif.handle(req, resp, false);
@@ -1125,23 +1950,19 @@ void WebServer::publish(SessionStats const& s) {
     // 画面尺寸从采集线程跟着统计一起过来。放在**这条已经存在的通道**上
     // 而不是另开一个钩子：它和统计一样是"每秒一份的采集侧真实状态"，
     // 多一条管道只是多一处要记得接。
-    //
-    // 只在变了的时候写，因为这是每秒一次的路径而分辨率是常量：正常情况下
-    // 这里一次都不会进去。
-    if (w > 0 && h > 0 && (w != d.onvif_video_w || h != d.onvif_video_h)) {
-      d.onvif_video_w = w;
-      d.onvif_video_h = h;
-      d.onvif.set_video_size(0, w, h);
-    }
-    // 子码流同理。`sw > 0` 就是"子码流真的开着"—— 采集侧推不出更小的尺寸
-    // 时会把它报成 0，那时 profile 1 根本不存在，写它没有意义。
-    if (sw > 0 && sh > 0 && (sw != d.onvif_sub_w || sh != d.onvif_sub_h)) {
-      d.onvif_sub_w = sw;
-      d.onvif_sub_h = sh;
-      d.onvif.set_video_size(1, sw, sh);
-    }
+    d.apply_video_size(w, h, sw, sh);
     d.broadcast_stats(std::move(text));
   });
+}
+
+void WebServer::publish_video_size(int w, int h, int sub_w, int sub_h) {
+  Impl& d = *impl_;
+  if (!d.app) return;
+  // 和 `publish()` 同一套停机会合：`stop()` 拿到这把锁之后就能确定没有任何
+  // 一次投递停在"投出去"和"返回"之间了（见 `publish()` 顶上那段）。
+  std::lock_guard<std::mutex> lk(d.post_mu);
+  if (d.stopping || !d.app->loop_started()) return;
+  d.app->post([&d, w, h, sub_w, sub_h]() { d.apply_video_size(w, h, sub_w, sub_h); });
 }
 
 int WebServer::port() const { return impl_->port.load(std::memory_order_relaxed); }
@@ -1187,6 +2008,36 @@ void WebServer::publish_preview(bool is_init,
   });
 }
 
+void WebServer::publish_preview_t0(std::int64_t t0_wall_ms) {
+  Impl& d = *impl_;
+  if (t0_wall_ms <= 0) return;  // 采集侧没给（预览没封装，或第一个包的 wall_ms 是 0）
+
+  // 和 publish_preview 同一套会合逻辑，理由也同一句：拿到 post_mu 之后看到的
+  // stopping 是最终值，所以不会有一次投递落进正在被释放的循环里。
+  std::lock_guard<std::mutex> lk(d.post_mu);
+  if (d.stopping || !d.app || !d.app->loop_started()) return;
+
+  d.app->post([&d, t0_wall_ms]() {
+    // **存一份 + 广播，两件都要做，缺一件就有一半客户端拿不到。**
+    //
+    // 存：0 点是采集侧第一个包进封装器那一刻定的，而它几乎总在第一个浏览器
+    // 连上来**之前**（首页一加载就连，但那之前采集早跑起来了）。没有这一份，
+    // 之后每一个连上来的客户端都要等到下一次会话重开才有原点。
+    //
+    // 广播：首页一加载就连，那时 0 点可能还没定（采集刚起来、第一个包还没进
+    // 封装器）。只存不广播的话，这批"第 0 秒就连上"的客户端 —— 也就是最盯着
+    // 这个数字看的人 —— 反而永远收不到。
+    //
+    // 覆盖而不比较：一次会话只有一个 0 点，重开会话会再报一次（新的 0 点）。
+    // 让"同一次会话重复报同一个值"走正常路径，比在这里判"变了没有"少一个
+    // 能算错的地方 —— 这个钩子按设计每次会话只调一次，没有抖动的可能。
+    d.preview_t0_ms = t0_wall_ms;
+
+    std::vector<std::shared_ptr<PreviewConn>> const snapshot = d.preview_conns;
+    for (auto const& pc : snapshot) d.send_preview_t0(pc);
+  });
+}
+
 unsigned long long WebServer::wsd_probes_seen() const {
   return impl_->wsd.probes_seen();
 }
@@ -1204,11 +2055,24 @@ unsigned long long WebServer::onvif_auth_failures() const {
 }
 
 bool WebServer::apply_onvif_identity(OnvifIdentity const& id) {
-  // ONVIF 没开时什么都不做。理由见头文件：没有服务实例可改不是错误，
-  // 而这里**不能**顺手把身份记下来等以后用 —— 那就是第二份真相。
-  if (!impl_->opt.onvif_enabled) return false;
+  // 身份**总是**推下去，哪怕 ONVIF 没开。理由：这几个字段不只是 SOAP 的字段 ——
+  // `device_name` 同时是画面水印上那个名称（经 `DeviceState`），而水印不依赖
+  // ONVIF 开不开。ONVIF 关着却不让改名，会用的人第一反应是"改名坏了"。
+  //
+  // 这**不是**"记下来等以后用"（头文件里禁止的那个）：`DeviceState` 此刻就是
+  // 活的，采集线程下一帧就读到新名字。ONVIF 自己那份 `options()` 跟着变了也没
+  // 关系 —— 它没有路由，是惰性的；而返回值仍然是 false，于是调用方不会把
+  // `onvif.*` 记进 `applied`，正确地说"要重启才有 SOAP 上的新名字"。
   impl_->onvif.set_identity(id);
-  return true;
+  return impl_->opt.onvif_enabled;
+}
+
+void WebServer::apply_osd_config(OsdConfig const& c) {
+  // 没有返回值，理由（以及从前那个恒 false 的 bool 为什么被拿掉）写在头文件里。
+  // 这里只补一句实现上的：`set_osd` **不会**回调 `on_osd_patch`，所以这条路上
+  // 不存在"保存 → 回调 → 再保存"的递归（`app.post` 在 loop 线程上是就地执行的，
+  // 那种递归会当场栈溢出而不是死循环，表现完全不同）。
+  impl_->onvif.set_osd(c);
 }
 
 bool WebServer::apply_web_credentials(bool enabled, std::string const& user,

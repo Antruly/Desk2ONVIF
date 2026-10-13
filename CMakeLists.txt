@@ -78,7 +78,7 @@ endif()
 # 不加的话任务栏和资源管理器显示的是 Windows 默认图标 —— 安装包和快捷方式
 # 各自有图标，唯独跑起来的程序没有，而这三处互不相干。
 project(Desk2ONVIF
-  VERSION 0.1.0
+  VERSION 0.1.9
   DESCRIPTION "Windows desktop screen as an ONVIF Profile S IP camera"
   LANGUAGES C CXX RC)
 
@@ -171,18 +171,29 @@ target_link_libraries(desk2onvif_deps INTERFACE
 # ---------------------------------------------------------------------------
 add_library(desk2onvif_core STATIC
   src/common/log.cpp
+  src/common/audit_log.cpp
   src/common/text.cpp
   src/common/config.cpp
+  src/common/adaptive.cpp
+  src/common/device_state.cpp
+  src/common/ntp_client.cpp
+  src/common/ntp_syncer.cpp
   src/common/firewall.cpp
   src/capture/display_info.cpp
   src/capture/desktop_capture.cpp
   src/capture/cursor_overlay.cpp
+  src/capture/osd_overlay.cpp
+  src/capture/display_source.cpp
+  src/capture/frame_source.cpp
+  src/capture/webcam_capture.cpp
   src/encoder/x264_encoder.cpp
   src/encoder/mp4_writer.cpp
   src/encoder/mjpeg_encoder.cpp
   src/encoder/fmp4_muxer.cpp
+  src/encoder/aac_encoder.cpp
   src/rtsp/nalu.cpp
   src/rtsp/h264_live_source.cpp
+  src/rtsp/aac_live_source.cpp
   src/rtsp/rtsp_server.cpp
   src/onvif/digest.cpp
   src/onvif/net_identity.cpp
@@ -190,14 +201,67 @@ add_library(desk2onvif_core STATIC
   src/onvif/onvif_service.cpp
   src/web/web_server.cpp
   src/web/web_session.cpp
+  src/service/service_host.cpp
+  src/audio/audio_device.cpp
+  src/audio/wasapi_capture.cpp
+  src/audio/audio_mixer.cpp
+  src/app/audio_track.cpp
+  src/app/channel_plan.cpp
   src/app/capture_session.cpp)
 
 target_include_directories(desk2onvif_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(desk2onvif_core PUBLIC desk2onvif_deps)
+
+# 版本号编进代码里（`src/common/version.h` 的 `d2o::kVersion`）。
+#
+# **PUBLIC，不是 PRIVATE**：`tests/` 链的是 desk2onvif_core，而"版本号在
+# `/api/status` 与 `/ws/stats` 两条路上都在"这类断言要拿它做对账。
+# 另外 `resources/desk2onvif.rc.in` 用的是同一个 `PROJECT_VERSION`，
+# 所以 exe 属性和程序自己报的数**不可能**各写一份 —— 那正是这一轮要修的病。
+target_compile_definitions(desk2onvif_core PUBLIC D2O_VERSION="${PROJECT_VERSION}")
 # d3d11/dxgi 是采集的；iphlpapi 是 GetAdaptersAddresses（net_identity 枚举网卡）——
 # 它在 iphlpapi.dll 里，不在默认的系统库集合里，缺了就是一句
 # `undefined reference to 'GetAdaptersAddresses'`，看不出该链什么。
-target_link_libraries(desk2onvif_core PUBLIC d3d11 dxgi iphlpapi)
+#
+# gdi32 是 OSD 水印的：它用 CreateDIBSection + TextOutW 把文字栅格成掩码。
+# **必须是 PUBLIC** —— tests\ 里的 osd_check 直接链 desk2onvif_core 并调
+# OsdOverlay，PRIVATE 的话它那边会报一串 `undefined reference to 'CreateDIBSection'`。
+#
+# 服务形态那四个（advapi32 / wtsapi32 / userenv / shell32）：
+#   advapi32 —— SCM 全套（OpenSCManager/CreateService/StartService/QueryService*）
+#                + RegisterServiceCtrlHandlerEx + DuplicateTokenEx + OpenProcessToken
+#   wtsapi32 —— WTSGetActiveConsoleSessionId / WTSQueryUserToken
+#   userenv  —— CreateEnvironmentBlock / DestroyEnvironmentBlock
+#   shell32  —— ShellExecuteExW（--service install 的自我提权）
+# MinGW 的系统库都不在默认集合里，缺哪个就是一句 undefined reference，
+# 而报错只给函数名不给库名（同 iphlpapi 那条）。
+#
+# 音频那两组：
+#   ole32  —— CoInitializeEx / CoCreateInstance / CoTaskMemFree / PropVariantClear。
+#             **不需要 uuid**：MMDevice 那几个 GUID 走 `__uuidof`（mingw 的
+#             `__CRT_UUID_DECL` 模板模拟），是编译期常量、不引用任何符号 ——
+#             已实测只链 ole32 就能枚举出端点。手抄 GUID 字节是"抄错一个就
+#             静默拿不到设备"的那类缺陷，能不用就不用。
+#   mmdevapi / avrt —— wasapi_capture 用的（IMMDevice 的 Activate 不需要符号，
+#             但 `AvSetMmThreadCharacteristics` 在 avrt 里）。
+#
+# 摄像头那一组（第五轮 Phase AE，Media Foundation）：
+#   mfcore     —— `MFEnumDeviceSources` / `MFCreateDeviceSource`。**实测这两个
+#                 只在这个库里**（libmfplat.a 里一个都没有），而报错只给函数名
+#                 不给库名 —— 和上面 iphlpapi 那条是同一类坑。
+#   mfplat     —— `MFStartup` / `MFCreateAttributes` / `MFCreateMediaType` /
+#                 `MFGetAttributeSize` / `MFGetAttributeRatio`。
+#   mfreadwrite—— `MFCreateSourceReaderFromMediaSource`。
+#   mfuuid     —— Media Foundation 那几个 CLSID/接口 IID 的符号。**要它**：
+#                 `__uuidof` 对 MF 的接口不成立（那些是 `__declspec(uuid)` 声明的
+#                 MIDL 接口，mingw 的头里没有 `__CRT_UUID_DECL`），所以
+#                 `MFCreateSourceReaderFromMediaSource` 那些 `REFIID` 参数是
+#                 **真实的符号引用**，不像 MMDevice 那样能白拿。
+#   ole32 已经在上面 —— MF 的 `MFStartup` 不碰 COM，但 `MFEnumDeviceSources`
+#                 内部要初始化设备枚举器，实测少了它不一定当场报错，不额外加。
+target_link_libraries(desk2onvif_core PUBLIC d3d11 dxgi iphlpapi gdi32
+  advapi32 wtsapi32 userenv shell32 ole32 mmdevapi avrt
+  mfcore mfplat mfreadwrite mfuuid)
 
 # ---------------------------------------------------------------------------
 # 可执行文件
@@ -206,9 +270,24 @@ target_link_libraries(desk2onvif_core PUBLIC d3d11 dxgi iphlpapi)
 # 和 --record。三者共用同一个 exe 是刻意的：录制依赖的东西和自检依赖的完全
 # 一样，分成两个 exe 反而会让"DLL 部署对不对"这件事有两套答案。
 # ---------------------------------------------------------------------------
+# 资源脚本由**模板**生成，好让版本号只有 `project(... VERSION x.y.z)` 一个来源。
+#
+# 生成到构建目录是有代价的：windres 解析 `.rc` 引用的文件时按 **`.rc` 自己的
+# 目录**找（陷阱 55），所以模板里那个图标路径必须是绝对的 —— 写相对的话它会
+# 去构建目录里找一个不存在的 `.ico`。理由写在 `resources/desk2onvif.rc.in`
+# 的文件头里。
+#
+# `@ONLY` 是必须的：模板里有 `@PROJECT_VERSION@` 这种占位符，而 CMake 默认还会
+# 顺手展开 `${...}` —— 万一将来模板里出现一个 `${}`（比如注释里举例），
+# 那是**静默**改掉文件内容。
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/desk2onvif.rc.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/desk2onvif.rc"
+  @ONLY)
+
 add_executable(desk2onvif
   src/main.cpp
-  resources/desk2onvif.rc)   # 图标 + 版本信息，见该文件开头的说明
+  "${CMAKE_CURRENT_BINARY_DIR}/desk2onvif.rc")   # 图标 + 版本信息，见模板的说明
 target_link_libraries(desk2onvif PRIVATE desk2onvif_core)
 
 # ---------------------------------------------------------------------------

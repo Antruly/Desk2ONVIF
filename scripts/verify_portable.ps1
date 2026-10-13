@@ -49,23 +49,8 @@ if (-not $ExtractDir) {
     $ExtractDir = Join-Path $env:TEMP ('d2o-portable-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 }
 $apDir = Join-Path $env:APPDATA 'Desk2ONVIF'
-
-# 运行前后各拍一张 %APPDATA%\Desk2ONVIF 的快照，比对即"有没有往那里写东西"。
-#
-# 为什么不是直接断言"这个目录不存在"：那种判据在**已经用过安装版**的机器上
-# 恒真 —— 目录本来就在，里面写没写新东西它都"存在"，于是这一条永远通过，
-# 等于没验。而那恰恰是最需要它生效的机器。快照比法对两种初始状态都成立：
-# 目录原先没有，跑完还得没有；原先有，跑完得**一个字节都没变**。
-function Get-TreeSnapshot([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return '<不存在>' }
-    $items = @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
-               Sort-Object FullName | ForEach-Object {
-                   $rel = $_.FullName.Substring($Path.Length + 1)
-                   if ($_.PSIsContainer) { "D $rel" }
-                   else { "F $rel $($_.Length) $($_.LastWriteTimeUtc.Ticks)" }
-               })
-    return ($items -join "`n")
-}
+# 运行前后各拍一张 %APPDATA%\Desk2ONVIF 的快照（Get-TreeSnapshot 在
+# _verify_common.ps1 里，安装凭据那一路也用同一份判据）。
 
 Write-Host ''
 Write-Host '=== 绿色版 zip 验收 ===' -ForegroundColor Cyan
@@ -153,6 +138,32 @@ Check ($sc.ExitCode -eq 0) "--selfcheck 退出码 = $($sc.ExitCode)"
 Check ($sc.Stdout -match '全部通过') '--selfcheck 报告"全部通过"'
 Check ([D2oPeRes]::Size($exe, 1, 14) -gt 0) 'exe 里有图标组（RT_GROUP_ICON）'
 
+# --- 版本号：三方一致（第 1、2 处）-------------------------------------
+#
+# 同一个数在四处会出现：zip 名、exe 的文件属性、`--version` / `--selfcheck`
+# 头部打出来的、以及运行期 `/api/status` 报的。四处全来自 CMakeLists.txt 的
+# `project(... VERSION)` 一行。
+#
+# 但"全都来自一处"是一句**承诺，不是检查**（安装包那边同一条断言的注释里
+# 记着这条账：`package.ps1` 白纸黑字写着"必须是同一个"，而 exe 的 VersionInfo
+# 当时是硬编码的 0.1.0、压根没接上）。绿色版这边尤其要量，因为它和安装包走的
+# 是**不同的**两条打包路（`Compress-Archive` vs Inno 的 [Files]），任何一条
+# 路自己多写一份版本号都不会有人发现。
+#
+# zip 名当锚：它是唯一一个不依赖任何构建产物、用户下载到手里的那个名字。
+$nameVer = [regex]::Match((Split-Path $Zip -Leaf),
+                          'Desk2ONVIF-(\d+\.\d+\.\d+)-win64\.zip').Groups[1].Value
+Check (-not [string]::IsNullOrEmpty($nameVer)) "zip 名里有版本号（$nameVer）"
+$vi = (Get-Item -LiteralPath $exe).VersionInfo
+Check ($vi.FileVersion -ceq $nameVer) `
+      "exe 的文件属性版本 = zip 名里的版本（属性 $($vi.FileVersion)，包名 $nameVer）" `
+      '对不上说明 resources\desk2onvif.rc.in 没接上 project(... VERSION)，或者包是用旧 exe 打的。'
+# `--selfcheck` 头部那行正是给这一刻用的：它证明那个常量真的编进了**这个**
+# 二进制，而不只是"exe 的资源段里有"（两者是两条独立的写入路径）。
+Check ($sc.Stdout -match ("Desk2ONVIF " + [regex]::Escape($nameVer) + " 自检")) `
+      "--selfcheck 头部报的版本 = zip 名里的版本" `
+      '对不上说明 common\version.h 那条 D2O_VERSION 没接上 target_compile_definitions。'
+
 # --- [5] 用 start.ps1 跑起来 ------------------------------------------
 Section "[5] start.ps1 -Portable：配置落在 exe 旁边"
 $appOut = Join-Path $env:TEMP 'd2o-portable.out'
@@ -198,7 +209,29 @@ try {
             Check (-not $wc.TimedOut) 'web_contract.py 在 180 秒内结束'
             Check ($wc.ExitCode -eq 0) "web_contract.py 退出码 = $($wc.ExitCode)"
             Check ($wc.Stdout -match '失败 0 项') 'web_contract.py 报告"失败 0 项"'
-            Show $wc.Stdout 4
+            # 见 _verify_common.ps1 里 Show-Failures 的说明：只打尾巴会把红的那条
+            # 挤掉，报告上只剩"退出码 = 1"。
+            if (-not $wc.TimedOut -and $wc.ExitCode -ne 0) {
+                Show-Failures $wc.Stdout (Join-Path $root 'out\web_contract.txt')
+                Show $wc.Stdout 4
+            }
+        }
+
+        # 三方一致的第 3 处：**运行期**报出来的版本。
+        #
+        # 前两处（包名、exe 属性）量的都是"文件里写着什么"，这一处量的是
+        # "程序在网络上报什么" —— `patch_live_counters` 里那一行没接上的话，
+        # 前两处照样全绿，而界面上的版本号是一片空白。
+        # 绿色版这份配置由首次运行生成，`web.user`/`web.password` 走默认的
+        # admin/admin（见 config.h 的 WebConfig）。
+        $apiVer = Get-StatusVersion -Port $HttpPort
+        if ($null -eq $apiVer) {
+            Check $false '能从 /api/status 读到 version' `
+                  '登录或请求失败了。绿色版这份配置是首次运行生成的，走默认的 admin/admin。'
+        } else {
+            Check ($apiVer -ceq $nameVer) `
+                  "运行期 /api/status 的 version = zip 名里的版本（接口 $apiVer，包名 $nameVer）" `
+                  '对不上说明 common\version.h 那条 D2O_VERSION 没接上，或者包是拿旧 exe 打的。'
         }
     }
 } finally {
