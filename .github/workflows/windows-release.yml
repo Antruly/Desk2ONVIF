@@ -1,0 +1,394 @@
+name: Windows · 构建与发布
+
+# 这条流水线做的事，就是本机 scripts\ 下那三条命令按同一顺序再跑一遍：
+#
+#   fetch_ffmpeg.ps1 / build_live555.ps1 / fetch_uvcpp.ps1   ← 供给依赖
+#   package.ps1 -NoBump -Zip                                 ← 构建 + 出两个交付物
+#   verify_installer.ps1 / verify_portable.ps1               ← 验收
+#
+# **不重新发明任何一步。** 依赖供给和打包的逻辑只存在于 scripts\ 里，这里只负责
+# 摆好它们要求的环境（MSYS2 在 C:\msys64、Inno Setup、7-Zip、Node）并把参数
+# 传对。往工作流里抄一份构建逻辑，等于让"本机验过的那套"和"发出去的那套"
+# 变成两份会各自漂移的东西 —— 而这个项目所有的验收脚本都建立在它们同一份上。
+#
+# 触发：
+#   · push tag v*        → 构建 + 打包 + 验收 + 建 Release（附件是安装包和绿色版）
+#   · workflow_dispatch  → 只构建 + 打包 + 验收，产物留在 Actions 的 Artifacts 里
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      skip_verify:
+        description: '跳过两个验收脚本（只在确认它们与 runner 环境无关地坏掉时用）'
+        type: boolean
+        default: false
+      uvcpp_ref:
+        description: '覆盖 libuvcpp 的 tag/commit（留空 = 用下面钉死的那个）'
+        type: string
+        default: ''
+
+# 建 Release 要 contents: write。除此之外不需要任何权限。
+permissions:
+  contents: write
+
+env:
+  # libuvcpp 的 ref —— 取**最新的正式 release tag**，不是 master。
+  #
+  # 这一条不是"求稳"，是功能上的硬要求：Desk2ONVIF 的 ONVIF 层调的是
+  # `uvcpp_soap_*` / `uvcpp_wsdl_*`，而 Windows 动态库下**一个 SOAP 符号都不导出**
+  # 那个 bug 是先修在 release 分支上、再合进 tag 的：
+  #
+  #   v1.6.2 / v1.6.3 / v1.6.4  → 含该修复
+  #   master (c8950ae)          → **不含**
+  #
+  # 也就是说钉 master 会编出一个 import 表里没有 uvcpp_soap_* 的 DLL，症状是
+  # Desk2ONVIF 链接期一串 `undefined reference to 'uvcpp_soap_...'`，而报错指向
+  # 我们自己的 .cpp —— 看起来像我们漏了实现，实际是上游 DLL 没导出。
+  # 验证方法：
+  #   objdump -p libuvcpp.dll | grep -c uvcpp_soap
+  #
+  # 钉 tag 而不是 commit：release tag 就是"发出去的那一版"，跟着它走语义清楚，
+  # 升级时改这一行即可。当前 v1.6.4 解析到
+  # faf1e50ade221203e0e86d7eb084bcd21577da23（2026-10-12）。
+  UVCPP_REF: v1.6.4
+
+  # 两个脚本都打印中文。原生 python 写管道时按 locale 选编码（runner 上是
+  # cp1252）⇒ UnicodeEncodeError 直接在打印那行崩掉，看着像脚本 bug。
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
+jobs:
+  windows:
+    name: MinGW64 · 构建 + 打包
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    defaults:
+      run:
+        # pwsh 而不是 powershell：脚本里到处是中文输出，PS 5.1 的默认代码页
+        # 会把它变成乱码，而乱码的报错比没有报错更难查。
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- 版本号：从 CMakeLists.txt 读，并和 tag 对账 -----------------------
+      #
+      # 版本号只有一个来源（CMakeLists.txt 的 project(... VERSION x.y.z)），
+      # 所以这里读它而不是信 tag。tag 和它对不上就直接红 —— 否则会发出一个
+      # "Release 页上写着 v0.1.10、包里每个文件都印着 0.1.9"的包，而两边
+      # 单看都正常。Package.ps1 那条 `-NoBump` 也是为这件事服务的：默认的
+      # "每次打包 +1"在 CI 上会让版本号和 tag 当场错开。
+      - name: 读版本号 / 校准 tag
+        id: ver
+        run: |
+          # 必须 -Raw 整份读进来再匹配：Select-String 是**逐行**的，而
+          # `project(Desk2ONVIF` 和 `VERSION 0.1.9` 分在两行上 —— 逐行匹配永远
+          # 命中不了，症状是"CMakeLists.txt 里没找到 project(...)"这条假报错。
+          $t = Get-Content CMakeLists.txt -Raw
+          $m = [regex]::Match($t,
+                 'project\s*\(\s*Desk2ONVIF\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)')
+          if (-not $m.Success) { throw 'CMakeLists.txt 里没找到 project(Desk2ONVIF VERSION x.y.z)' }
+          $v = $m.Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "CMakeLists.txt 的版本：$v"
+
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($env:GITHUB_REF_NAME -ne "v$v") {
+              throw "tag 是 $($env:GITHUB_REF_NAME)，CMakeLists.txt 是 $v —— 对不上。先把 CMakeLists.txt 改成 $($env:GITHUB_REF_NAME -replace '^v','') 再打 tag。"
+            }
+            Write-Host "tag 与版本号一致：$($env:GITHUB_REF_NAME)"
+          }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # --- 工具链 ------------------------------------------------------------
+      #
+      # setup-msys2 默认装到 C:\msys64，而 scripts\build.ps1 的 -MsysRoot 默认值
+      # 和 build_live555.ps1 里找 bash.exe 的路径都写死了这个地方 —— 所以这里
+      # 不能改安装位置。
+      #
+      # `make` 单独列：Live555 的 genMakefiles 产出的是 POSIX Makefile，
+      # build_live555.sh 里调的是裸 `make`，它得从 /usr/bin 找得到。
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-openssl
+
+      # Inno Setup：package.ps1 会去三个常规位置找 ISCC.exe，找不到就 throw。
+      # runner 镜像上是预装的，但那是镜像的事、不是承诺，所以这里补一道。
+      - name: 准备 Inno Setup 6
+        run: |
+          $c = @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if ($c) { Write-Host "已有：$c"; exit 0 }
+          Write-Host 'runner 上没有 Inno Setup，用 choco 装…'
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco 装 Inno Setup 失败，退出码 $LASTEXITCODE" }
+
+      # 7-Zip：fetch_ffmpeg.ps1 要解 gyan.dev 那个 .7z，只认这两个位置
+      # （它自己不做 PATH 查找）。runner 镜像自带，但同上 —— 补一道。
+      # 注意这不是 package.ps1 的需求：绿色版 zip 走的是 PowerShell 内置的
+      # Compress-Archive，和 7-Zip 无关。
+      - name: 准备 7-Zip
+        run: |
+          $c = @(
+            (Join-Path $env:ProgramFiles '7-Zip\7z.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe')
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+          if ($c) { Write-Host "已有：$c"; exit 0 }
+          Write-Host 'runner 上没有 7-Zip，用 choco 装…'
+          choco install 7zip --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco 装 7-Zip 失败，退出码 $LASTEXITCODE" }
+
+      # --- 依赖缓存 ----------------------------------------------------------
+      #
+      # 只缓存**下载物和已解好的第三方产物**。key 里那个 v1 是手动版本号：
+      # 换 FFmpeg / Live555 版本时把它 +1，否则会一直吃旧缓存，而症状是
+      # "改了下载地址但包里的 DLL 还是老的"——两边都不会报错。
+      - name: 缓存第三方依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/_cache
+            third_party/ffmpeg
+            third_party/live555
+          key: deps-v1-${{ runner.os }}
+
+      # --- libuvcpp：唯一一个要从源码编的依赖 --------------------------------
+      #
+      # 先克隆拿 SHA，再用 SHA 当缓存 key。缓存命中就整段跳过 —— 存的是
+      # third_party/uvcpp（fetch_uvcpp.ps1 的产物），而那个脚本是幂等的，
+      # 东西齐了它自己就返回，所以命中时连搬运都不用做。
+      #
+      # 用完整克隆而不是 `--depth 1`：要 check out 的是一个 **tag**，浅克隆下
+      # `git checkout <tag>` 会失败（除非 `--branch` 指同一个，而那又会和
+      # workflow_dispatch 的覆盖参数打架）。SHA 也从同一个克隆里 rev-parse 出来，
+      # 保证缓存 key 和实际编的那份是同一个东西。
+      - name: 取 libuvcpp 源码
+        id: uvcpp
+        run: |
+          $ref = '${{ inputs.uvcpp_ref }}'
+          if (-not $ref) { $ref = $env:UVCPP_REF }
+
+          $dst = Join-Path $env:RUNNER_TEMP 'libuvcpp'
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+          git clone --quiet https://github.com/Antruly/libuvcpp.git $dst
+          if ($LASTEXITCODE -ne 0) { throw '克隆 libuvcpp 失败' }
+          git -C $dst checkout --quiet $ref
+          if ($LASTEXITCODE -ne 0) { throw "检出 $ref 失败 —— tag/commit 不存在，还是网络？" }
+          $sha = (git -C $dst rev-parse HEAD).Trim()
+
+          # SOAP 导出符号的存在性。上面那段注释解释了这个 bug 和它为什么先修在
+          # release 分支上 —— 但**注释拦不住**"某天把 ref 拨回 master"。
+          # 头文件里补 UVCPP_API 是修复的**一半**，另一半在构建产物里，只有这里
+          # 能在花十五分钟编译之前就问一句。少了这一句，症状会推迟到 Desk2ONVIF
+          # 自己的链接期，并且指向我们的源码。
+          $soapHdr = Join-Path $dst 'src\wsdl\uvcpp_soap_service.h'
+          if ((Test-Path $soapHdr) -and
+              -not (Select-String -Path $soapHdr -Pattern 'UVCPP_API' -Quiet)) {
+            # 用字符串拼接而不是 here-string：here-string 的 `"@` 必须顶格，
+            # 而 YAML 字面块里顶格行会**终止块** —— 两者要同时满足，得让 `"@`
+            # 恰好落在块的缩进上，太脆。拼接没有这个约束。
+            throw ("libuvcpp @ $ref 的 src\wsdl\uvcpp_soap_service.h 里没有 UVCPP_API —— " +
+                   "这个 ref 不含「Windows 动态库下 SOAP 符号不导出」那个修复，" +
+                   "编出来的 DLL import 表里不会有 uvcpp_soap_*，Desk2ONVIF 必然链接失败。" +
+                   "用 release tag（v1.6.2 及以后），别用 master。")
+          }
+          Write-Host "libuvcpp @ $sha"
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "src=$dst" >> $env:GITHUB_OUTPUT
+
+      - name: 缓存 libuvcpp 全量构建
+        id: uvcpp-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/uvcpp
+          key: uvcpp-${{ steps.uvcpp.outputs.sha }}
+
+      # 开关基本照抄 third_party\README.md 里那份（那是实际产出过可用包的那一份），
+      # 只有两处是 CI 强制的偏离，各自在下面写明了理由：
+      #   ① 去掉七条 `-DFETCHCONTENT_SOURCE_DIR_*` —— 它们指向源码树里的
+      #      `_local_deps\`，而那个目录**不进版本库**（本机是离线构建用的，
+      #      CI 上没有）。去掉之后 FetchContent 联网拉，这一点由 libuvcpp 自己的
+      #      ci-mingw64.yml 证明可行：它也是裸 `cmake -S . -B` 走 FetchContent。
+      #   ② 加上 `-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON`。
+      # 这三处尤其不能动：
+      #   · UVCPP_BUILD_SHARED=ON / BUILD_SHARED_LIBS=ON —— Desk2ONVIF 的
+      #     fetch_uvcpp.ps1 要 libuvcpp.dll 和 libllhttp.dll，而官方 CI 用的
+      #     BUILD_SHARED_LIBS=OFF 会让 llhttp 变成 .a，那个文件根本不存在。
+      #   · UVCPP_ENABLE_WSDL=ON —— 全项目的理由：预编译包里 SOAP 恒为 0。
+      #   · UVCPP_BUILD_WEBAPP=ON —— WSDL 模块要求它。
+      # 官方仓库的 _local_deps/ 不进版本库，所以这里让 FetchContent 联网拉
+      # （libuv/llhttp/zlib/nghttp2/ngtcp2/nghttp3/nlohmann/pugixml，全部有
+      # 版本钉住）。下面那一步再从 _deps 里把 nlohmann 挖出来 —— 因为
+      # fetch_uvcpp.ps1 硬性要求 <src>\_local_deps\json-3113\include\nlohmann。
+      #
+      # `-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON` **不能省**，而且它恰恰是"本机会
+      # 过、CI 会挂"的那一类。libuvcpp 的 CMakeLists:280 是
+      # `find_package(ZLIB QUIET)`——找到系统 zlib 就用系统的，**只有找不到时**
+      # 才 FetchContent 编源码那份（v1.3.1）。而 fetch_uvcpp.ps1 的运行期 DLL
+      # 清单是按**精确文件名**找 `zlib1__.dll` 的，那个双下划线是源码版 zlib 在
+      # MinGW 下的产物名，系统那份给不出这个名字。
+      #
+      # 本机的 zlib 是源码版（用户的 MSYS2 里没有 zlib 开发包 ⇒ find_package 失败
+      # ⇒ 走 FetchContent）；而 runner 上我们装了 mingw-w64-x86_64-openssl，
+      # 它会把 zlib 作为依赖一起带进来 ⇒ find_package **命中** ⇒ 不编源码 zlib
+      # ⇒ 构建树里根本没有 zlib1__.dll ⇒ fetch_uvcpp.ps1 在"运行期 DLL 没找到"
+      # 里把它列出来并退出。这一行就是把 CI 拉回本机那条路径。
+      # libuvcpp 自己的 CI 也是这么传的（见其 ci-mingw64.yml）。
+      - name: 构建 libuvcpp（含 SOAP/WSDL）
+        if: steps.uvcpp-cache.outputs.cache-hit != 'true'
+        run: |
+          $src = '${{ steps.uvcpp.outputs.src }}'
+          $env:PATH = "C:\msys64\mingw64\bin;C:\msys64\usr\bin;$env:PATH"
+          cmake -S $src -B "$src\build-mingw" -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe `
+            -DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe `
+            -DCMAKE_MAKE_PROGRAM=C:/msys64/mingw64/bin/ninja.exe `
+            -DBUILD_SHARED_LIBS=ON `
+            -DUVCPP_BUILD_SHARED=ON -DUVCPP_BUILD_STATIC=OFF `
+            -DUVCPP_BUILD_NET=ON -DUVCPP_BUILD_WEB=ON -DUVCPP_BUILD_WEBAPP=ON `
+            -DUVCPP_ENABLE_WSDL=ON -DUVCPP_ENABLE_OPENSSL=ON -DUVCPP_ENABLE_ZLIB=ON `
+            -DUVCPP_ENABLE_NGHTTP2=ON -DUVCPP_ENABLE_QUIC=ON -DUVCPP_ENABLE_HTTP3=ON `
+            -DUVCPP_ENABLE_CAPI=ON `
+            -DUVCPP_BUILD_TESTS=OFF -DUVCPP_BUILD_EXAMPLES=OFF `
+            -DUVCPP_BUILD_LIBUV_FROM_SOURCE=ON -DUVCPP_USE_SYSTEM_LIBUV=ON `
+            -DOPENSSL_ROOT_DIR=C:/msys64/mingw64 -DOPENSSL_USE_STATIC_LIBS=ON `
+            -DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON
+          if ($LASTEXITCODE -ne 0) { throw "libuvcpp 配置失败，退出码 $LASTEXITCODE" }
+          cmake --build "$src\build-mingw" --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "libuvcpp 构建失败，退出码 $LASTEXITCODE" }
+          if (-not (Test-Path "$src\build-mingw\libuvcpp.dll")) {
+            throw "编完了但没有 libuvcpp.dll —— 构建目录里没这个文件。"
+          }
+
+      - name: 铺 nlohmann/json 到 _local_deps
+        if: steps.uvcpp-cache.outputs.cache-hit != 'true'
+        run: |
+          $src = '${{ steps.uvcpp.outputs.src }}'
+          $hit = Get-ChildItem "$src\build-mingw\_deps" -Recurse -Filter 'json.hpp' -File `
+                   -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DirectoryName -like '*nlohmann*' } | Select-Object -First 1
+          if (-not $hit) {
+            throw "在 $src\build-mingw\_deps 下找不到 nlohmann/json.hpp —— fetch_uvcpp.ps1 要求它出现在 _local_deps\json-3113\include\nlohmann。"
+          }
+          $dst = "$src\_local_deps\json-3113\include"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item $hit.Directory.FullName (Join-Path $dst 'nlohmann') -Recurse -Force
+          Write-Host "nlohmann/json ← $($hit.FullName)"
+
+      # --- 供给另外两个依赖 --------------------------------------------------
+      #
+      # build_live555.ps1 **只认缓存里的 tar 包**，自己不会下载（本机流程是
+      # 人手 curl 一次）。所以这一步是 CI 特有的补位，不是重复。
+      - name: 下载 Live555 源码包
+        run: |
+          $cache = 'third_party\_cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $tar = Join-Path $cache 'live555-latest.tar.gz'
+          if (Test-Path $tar) { Write-Host "已有缓存：$tar"; exit 0 }
+          Invoke-WebRequest -Uri 'https://download.live555.com/live555-latest.tar.gz' `
+            -OutFile $tar -UseBasicParsing
+          Write-Host "已下载：$((Get-Item $tar).Length) 字节"
+
+      - name: 供给依赖（FFmpeg / Live555 / libuvcpp）
+        run: |
+          $src = '${{ steps.uvcpp.outputs.src }}'
+          .\scripts\fetch_ffmpeg.ps1
+          .\scripts\build_live555.ps1 -Jobs 4
+          .\scripts\fetch_uvcpp.ps1 -Source $src -BuildDir "$src\build-mingw"
+
+      # --- 构建 + 打包 -------------------------------------------------------
+      #
+      # -NoBump：CI 上版本号必须等于 tag，而 package.ps1 的默认行为是"每次
+      # 打包 +1"。不传它就会打出 0.1.10 的包去挂 v0.1.9 的 Release。
+      # -Jobs 4：runner 是 4 vCPU。本机全核编那几个重模板 TU 会撞 Windows 的
+      # 提交上限（cc1plus 报 out of memory allocating…），package.ps1 内部
+      # 对这种情况有"降到 2 路重试一次"的兜底，所以这个值不是硬要求。
+      - name: 构建 + 打包
+        run: |
+          .\scripts\package.ps1 -NoBump -Zip `
+            -AppUrl 'https://github.com/Antruly/Desk2ONVIF' -Jobs 4
+
+          $v = '${{ steps.ver.outputs.version }}'
+          foreach ($f in @("release\Desk2ONVIF_Setup_$v.exe", "release\Desk2ONVIF-$v-win64.zip")) {
+            if (-not (Test-Path -LiteralPath $f)) { throw "打包跑完了，但没有 $f" }
+            Write-Host ("{0}  {1:N1} MB" -f $f, ((Get-Item -LiteralPath $f).Length / 1MB))
+          }
+
+      # --- 验收 --------------------------------------------------------------
+      #
+      # 两个脚本都要真装一遍 / 真跑起来再验，所以它们在 runner 上**能不能过**
+      # 取决于 runner 有没有可用的显示设备（DXGI 桌面复制）。这一条本机验不了，
+      # 只能靠这条流水线自己回答。真跑不通时用 workflow_dispatch 的
+      # skip_verify 先绕开，但别把它当成"验收不重要"——它是这个项目唯一
+      # 能回答"发出去的包到底能不能用"的东西。
+      - name: 验收 · 安装包
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_verify }}
+        run: .\scripts\verify_installer.ps1
+
+      - name: 验收 · 绿色版
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_verify }}
+        run: .\scripts\verify_portable.ps1
+
+      # --- 留存 --------------------------------------------------------------
+      #
+      # 验收红了也要把包传上来：编一次要十几分钟，产物本身是好的 ——
+      # 红的是"它在 runner 上验不过"，不是"它编不出来"。这两件事得能分开看。
+      - name: 上传交付物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Desk2ONVIF-${{ steps.ver.outputs.version }}-win64
+          path: |
+            release/Desk2ONVIF_Setup_*.exe
+            release/Desk2ONVIF-*-win64.zip
+          if-no-files-found: warn
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Desk2ONVIF ${{ steps.ver.outputs.version }}
+          files: |
+            release/Desk2ONVIF_Setup_${{ steps.ver.outputs.version }}.exe
+            release/Desk2ONVIF-${{ steps.ver.outputs.version }}-win64.zip
+          body: |
+            把 Windows 桌面变成一台标准 **ONVIF Profile S** 网络摄像机。
+
+            | 文件 | 说明 |
+            |---|---|
+            | `Desk2ONVIF_Setup_${{ steps.ver.outputs.version }}.exe` | 安装包。简体中文向导，装到 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，**不弹 UAC** |
+            | `Desk2ONVIF-${{ steps.ver.outputs.version }}-win64.zip` | 绿色版。解压即用，整个目录拷走就能换机器 |
+
+            装完浏览器打开 `http://127.0.0.1:8080` 就是控制台；NVR 那边添加 IP 通道时
+            应该能自动发现它。**首次运行记得放行防火墙**（包里带了 `firewall-allow.bat`）。
+
+            ## ⚠️ 许可证：这里的二进制是 GPL-3.0-or-later，不是 MIT
+
+            **源码是 MIT，但附件里的可执行文件是 GPL-3.0-or-later。** 不是写错了 ——
+            程序链接了带 `--enable-libx264` 的 FFmpeg 构建，而 x264 是
+            GPL-2.0-or-later，链接进二进制即成为 GPL 下的组合作品。所以：
+
+            - 读 / 改 / 复用**源码** → MIT，署名即可
+            - 分发**由它构建出的可执行文件** → 受 GPL-3.0 约束，需提供对应源码
+
+            想要纯 MIT 的二进制，得换 LGPL 版 FFmpeg 并去掉 x264。详见仓库 README。
+
+            仅支持 **Windows 10/11 x64**；Linux 移植是后续计划。
