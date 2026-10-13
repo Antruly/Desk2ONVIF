@@ -477,6 +477,9 @@ jobs:
             - 读 / 改 / 复用**源码** → MIT，署名即可
             - 分发**由它构建出的可执行文件** → 受 GPL-3.0 约束，需提供对应源码
 
-            想要纯 MIT 的二进制，得换 LGPL 版 FFmpeg 并去掉 x264。详见仓库 README。
+            想要纯 MIT 的二进制，得换 LGPL 版 FFmpeg 并去掉 x264。详见
+            [README 的许可证一节](https://github.com/Antruly/Desk2ONVIF#许可证)。
 
-            仅支持 **Windows 10/11 x64**；Linux 移植是后续计划。
+            仅支持 **Windows 10/11 x64**；Linux / macOS 暂不支持（架构上是分层的，
+            `capture/` 是唯一强绑定 Windows 的部分）。用法与从源码构建见
+            [README](https://github.com/Antruly/Desk2ONVIF#readme)。
