@@ -2,10 +2,15 @@
 
 > 把 Windows 桌面变成一台标准的 **ONVIF Profile S** 网络摄像机。
 
+[![Release](https://img.shields.io/github/v/release/Antruly/Desk2ONVIF?label=release&color=blue)](https://github.com/Antruly/Desk2ONVIF/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey)](#运行环境)
 [![ONVIF](https://img.shields.io/badge/ONVIF-Profile%20S-green)](#onvif-协议支持)
 [![License](https://img.shields.io/badge/license-MIT%20(source)%20%2F%20GPL--3.0%20(binary)-blue)](#许可证)
 [![Built on libuvcpp](https://img.shields.io/badge/built%20on-libuvcpp-orange)](https://github.com/Antruly/libuvcpp)
+
+[**⬇ 下载最新安装包**](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.1.9.exe)
+· [绿色版](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.1.9-win64.zip)
+· [全部版本](https://github.com/Antruly/Desk2ONVIF/releases)
 
 Desk2ONVIF 把本机桌面模拟成一台标准 ONVIF 摄像机：海康、大华、Milestone
 XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它**
@@ -81,8 +86,10 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 
 ### 方式一：安装包（推荐）
 
-到 [Releases](https://github.com/Antruly/Desk2ONVIF/releases) 下载
-`Desk2ONVIF_Setup_<版本>.exe`。Inno Setup 简体中文向导，装到
+当前版本 **v0.1.9**，直接下
+[`Desk2ONVIF_Setup_0.1.9.exe`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.1.9.exe)
+（全部版本见 [Releases](https://github.com/Antruly/Desk2ONVIF/releases)）。
+Inno Setup 简体中文向导，装到
 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，**不弹 UAC**。
 
 向导里会让你填一对账号口令 —— 留意它其实写了**两个地方**（网页控制台一份、
@@ -100,8 +107,9 @@ NVR 一份，互相独立），细节见[工程实录](docs/ENGINEERING.md#安�
 
 ### 方式二：绿色版
 
-下载 `Desk2ONVIF-<版本>-win64.zip`，解压即用，整个目录拷走就能换机器。
-跑 `start.ps1`（或 `start-local.bat`）启动。
+下
+[`Desk2ONVIF-0.1.9-win64.zip`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.1.9-win64.zip)，
+解压即用，整个目录拷走就能换机器。跑 `start.ps1`（或 `start-local.bat`）启动。
 
 ### 方式三：从源码
 
@@ -346,6 +354,12 @@ web 服务原型是**一天之内**做出来的，之后在此基础上迭代了
 network camera. Hikvision, Dahua, Milestone XProtect, Pelco and other NVRs
 discover it over WS-Discovery, add it as an IP channel, and pull H.264 over
 RTSP — no hardware encoder needed.
+
+**Download:** [latest release](https://github.com/Antruly/Desk2ONVIF/releases/latest)
+— `Desk2ONVIF_Setup_<version>.exe` (installer, no UAC prompt) or
+`Desk2ONVIF-<version>-win64.zip` (portable, unzip and run). Both are attached
+to the [latest release](https://github.com/Antruly/Desk2ONVIF/releases/latest);
+older versions are on the [Releases page](https://github.com/Antruly/Desk2ONVIF/releases).
 
 It is an **open-source take on what [DeskCamera](https://www.deskcamera.com/)
 (closed-source, commercial) does**: capture the screen, a webcam, or both,
