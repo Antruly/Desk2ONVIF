@@ -126,6 +126,54 @@ jobs:
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-openssl
 
+      # --- 工具链落地核对 ----------------------------------------------------
+      #
+      # 这一步是**诊断**，不修任何东西，存在的唯一理由是：第一次跑的时候
+      # `C:/msys64/mingw64/bin/ninja.exe` 报 "no such file or directory"，
+      # 而 setup-msys2 那步的日志明明写着 `installing mingw-w64-x86_64-ninja...`。
+      # 两种可能分不开：① MSYS2 根不在 C:\msys64（日志里它**新下载解压**了一份，
+      # 没复用 runner 自带的）；② 根在那儿但那个 exe 执行不起来（缺 DLL）。
+      #
+      # 本机看不出这两者的区别 —— 开发机上 MSYS2 就是在 C:\msys64 —— 所以只能
+      # 让 runner 自己回答。跑完这一轮就可以删掉；在此之前，它比再赌一轮便宜。
+      - name: 核对 MSYS2 装在哪
+        run: |
+          Write-Host "MSYS2_LOCATION = '$env:MSYS2_LOCATION'"
+          Write-Host "MSYSTEM        = '$env:MSYSTEM'"
+          Write-Host ''
+          Write-Host '--- 期望路径是否存在 ---'
+          foreach ($p in @('C:\msys64',
+                           'C:\msys64\usr\bin\bash.exe',
+                           'C:\msys64\mingw64\bin\ninja.exe',
+                           'C:\msys64\mingw64\bin\cmake.exe',
+                           'C:\msys64\mingw64\bin\g++.exe')) {
+            Write-Host ("{0,-42} {1}" -f $p, (Test-Path -LiteralPath $p))
+          }
+          Write-Host ''
+          Write-Host '--- 根目录附近找 msys64 ---'
+          foreach ($d in @('C:\', 'D:\', 'D:\a', 'D:\a\_temp')) {
+            Get-ChildItem $d -Directory -Filter 'msys64*' -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
+          }
+          Write-Host ''
+          Write-Host '--- 找 ninja.exe（限深度，别把整个盘扫了）---'
+          foreach ($d in @('C:\msys64', 'D:\a\_temp')) {
+            if (Test-Path $d) {
+              Get-ChildItem $d -Filter 'ninja.exe' -Recurse -Depth 5 -ErrorAction SilentlyContinue |
+                Select-Object -First 5 | ForEach-Object { Write-Host "  $($_.FullName)" }
+            }
+          }
+          Write-Host ''
+          Write-Host '--- 直接试着执行它（PATH 按构建那步一样前置）---'
+          $env:PATH = "C:\msys64\mingw64\bin;C:\msys64\usr\bin;$env:PATH"
+          foreach ($n in @('ninja', 'cmake', 'g++')) {
+            $c = Get-Command $n -ErrorAction SilentlyContinue
+            if (-not $c) { Write-Host "  $n : PATH 里找不到"; continue }
+            Write-Host "  $n : $($c.Source)"
+            try { Write-Host "     -> $(& $n --version 2>&1 | Select-Object -First 1)" }
+            catch { Write-Host "     -> 执行失败：$($_.Exception.Message)" }
+          }
+
       # Inno Setup：package.ps1 会去三个常规位置找 ISCC.exe，找不到就 throw。
       # runner 镜像上是预装的，但那是镜像的事、不是承诺，所以这里补一道。
       - name: 准备 Inno Setup 6
