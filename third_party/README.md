@@ -143,17 +143,23 @@ cmake --build build-mingw64-full -j
   （`uvcpp_web_json.h` 里 `#include <nlohmann/json.hpp>` 是暴露面，
   任何碰 webapp 的编译单元都看得见它，不能指望系统里刚好有）
 - `libuvcpp.dll.a` → `lib/`
-- 六个运行期 DLL → `runtime/`
+- 运行期 DLL（清单见下）→ `runtime/`
 
 `runtime/` 里那份清单不是猜的，是 `objdump -p libuvcpp.dll` 的 import 表
-读出来对过的：`libuvcpp.dll` 自己，加它依赖的 `libuv.dll`、`libllhttp.dll`、
-`zlib1__.dll`（这三个是 libuvcpp 构建时从源码编的，只在它自己的构建树里，
-msys64 的 `mingw64\bin` 下**没有**），加 GCC 运行时的
-`libstdc++-6.dll`、`libgcc_s_seh-1.dll`、`libwinpthread-1.dll`。
-OpenSSL 和 nghttp2/ngtcp2/nghttp3 都是静态链进去的，不需要额外 DLL。
+读出来对过的：`libuvcpp.dll` 自己，加它依赖的 `libuv.dll`、`libllhttp.dll`
+（这两个是 libuvcpp 构建时从源码编的，只在它自己的构建树里，msys64 的
+`mingw64\bin` 下**没有**），加 GCC 运行时的 `libstdc++-6.dll`、
+`libgcc_s_seh-1.dll`、`libwinpthread-1.dll`。OpenSSL 和
+nghttp2/ngtcp2/nghttp3 都是静态链进去的，不需要额外 DLL。
 
-> `zlib1__.dll` 那个双下划线不是笔误 —— 它就是 libuvcpp 的构建产物名，
-> 导入表里要的就是这个名字，改成 `zlib1.dll` 反而找不到。
+`zlib` 那一条**按导入表决定，不写死**（`fetch_uvcpp.ps1` 里就是这么实现的），
+因为它的形态取决于那一次构建链到了什么：libuvcpp 是
+`find_package(ZLIB QUIET)`，命中就动态链系统/第三方那份 zlib —— 本机链到的
+是 winlibs 的 UCRT zlib，模块名 `zlib1__.dll`（双下划线是那个包的产物名，
+不是笔误；导入表里要的就是这个名字，改成 `zlib1.dll` 反而找不到）；miss 才
+FetchContent 编 v1.3.1 并**显式链 zlibstatic**，静态进库，导入表里一个 zlib
+都没有，`runtime\` 里自然也没有它。两种形态都能跑，所以脚本先读导入表、
+要才去找，而不是把某一种的名字当必须项。
 
 消费方式见 `cmake/FindLibuvcpp.cmake`：三个 `-I`（`include`、`include-gen`、
 `include-ext`），定义 `UVCPP_IMPORTS` 和 `UVCPP_C_SHARED` 拿到

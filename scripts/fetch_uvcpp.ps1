@@ -138,6 +138,16 @@ function Find-OneDll {
   return $null
 }
 
+# 看一个 PE 的导入表里有没有某个 DLL。导入表里被依赖的 DLL 名是原样存的
+# ASCII 串，所以按字节找就够了 —— 不必依赖 objdump（本机和 CI 上都不保证在
+# PATH 里，而且它的输出还被本地化过，按标签 grep 更脆）。
+function Test-DllNeeds {
+  param([string]$Binary, [string]$DllName)
+  if (-not (Test-Path $Binary)) { return $false }
+  $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Binary))
+  return $text.Contains($DllName)
+}
+
 # --- 4. 导入库 -------------------------------------------------------------
 $libDst = Join-Path $Dest 'lib'
 New-Item -ItemType Directory -Force -Path $libDst | Out-Null
@@ -159,8 +169,9 @@ Write-Host "[uvcpp] 导入库 → $libDst（libuvcpp + libuv）"
 
 # --- 5. 运行期 DLL ---------------------------------------------------------
 # 这份清单不是猜的，是把 objdump -p libuvcpp.dll 的 import 表读出来对过的。
-# libstdc++ / libgcc / libwinpthread 三个来自 GCC 运行时目录；
-# libuv / libllhttp / zlib1__ 是 libuvcpp 构建时从源码编出来的，只在构建树里。
+# libuv / libllhttp 是 libuvcpp 构建时从源码编出来的，只在构建树里；
+# libstdc++ / libgcc / libwinpthread 三个来自 GCC 运行时目录。
+# zlib 不一样，它**不能写死**，理由见下面那段。
 $rtDst = Join-Path $Dest 'runtime'
 New-Item -ItemType Directory -Force -Path $rtDst | Out-Null
 
@@ -168,11 +179,28 @@ $spec = @(
   @{ Name = 'libuvcpp.dll';         Fixed = $Build;                                Roots = @() },
   @{ Name = 'libuv.dll';            Fixed = (Join-Path $Build '_deps\libuv-build'); Roots = @($Build) },
   @{ Name = 'libllhttp.dll';        Fixed = (Join-Path $Build '_deps\llhttp-build'); Roots = @($Build) },
-  @{ Name = 'zlib1__.dll';          Fixed = '';                                     Roots = @($Build) },
   @{ Name = 'libstdc++-6.dll';      Fixed = $GccBin;                                Roots = @() },
   @{ Name = 'libgcc_s_seh-1.dll';   Fixed = $GccBin;                                Roots = @() },
   @{ Name = 'libwinpthread-1.dll';  Fixed = $GccBin;                                Roots = @() }
 )
+
+# zlib 的形态取决于**那一次构建链到了什么**，所以按导入表决定要不要这条：
+#   libuvcpp 是 `find_package(ZLIB QUIET)` —— 命中就动态链系统/第三方那份
+#   （本机链到的是 winlibs 的 UCRT zlib，模块名 `zlib1__.dll`，双下划线是那个
+#   包的产物名，不是笔误），miss 才 FetchContent 编 v1.3.1 并**显式链
+#   zlibstatic** —— 静态进库，导入表里一个 zlib 都没有，runtime\ 里也就不该有
+#   （传了 -DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON 的构建走的都是后一条路）。
+# 两种形态都能跑，硬找某一种就会在另一种上无谓地失败。
+$vcppDlls = @($dll) + @(
+  Get-ChildItem $Build -Filter 'libuvcpp*.dll' -File -ErrorAction SilentlyContinue |
+    ForEach-Object { $_.FullName })
+foreach ($z in @('zlib1__.dll', 'zlib1.dll')) {
+  $who = $vcppDlls | Where-Object { Test-DllNeeds -Binary $_ -DllName $z } |
+    Select-Object -First 1
+  if (-not $who) { continue }
+  Write-Host "[uvcpp] $([IO.Path]::GetFileName($who)) 的导入表要 $z，随包发"
+  $spec += @{ Name = $z; Fixed = ''; Roots = @($Build) }
+}
 
 $notFound = @()
 foreach ($s in $spec) {

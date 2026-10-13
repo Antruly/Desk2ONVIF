@@ -20,7 +20,7 @@ GPL 要求分发二进制时能让接收者拿到对应源码，所以每一项�
 | libuv | 1.51 | MIT | `libuv.dll` | https://github.com/libuv/libuv |
 | llhttp | 9.x | MIT | `libllhttp.dll` | https://github.com/nodejs/llhttp |
 | OpenSSL | 3.5.x | Apache-2.0 | `libssl-3-x64.dll` `libcrypto-3-x64.dll` | https://www.openssl.org/source/ |
-| zlib | 1.3.x | Zlib | `zlib1__.dll` | https://zlib.net/ |
+| zlib | 1.3.1 | Zlib | 静态链入 `libuvcpp.dll`；构建时若链到系统 zlib，则单独发 `zlib1__.dll` | https://zlib.net/ |
 | GCC 运行库 | GCC 15.1.0 | GPL-3.0-or-later **with GCC Runtime Library Exception** | `libstdc++-6.dll` `libgcc_s_seh-1.dll` `libwinpthread-1.dll` | https://gcc.gnu.org/ |
 
 > **FFmpeg 这个构建是 GPL 的**，不是 LGPL 的。它的 configure 串里有

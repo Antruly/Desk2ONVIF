@@ -325,19 +325,20 @@ jobs:
       # 版本钉住）。下面那一步再从 _deps 里把 nlohmann 挖出来 —— 因为
       # fetch_uvcpp.ps1 硬性要求 <src>\_local_deps\json-3113\include\nlohmann。
       #
-      # `-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON` **不能省**，而且它恰恰是"本机会
-      # 过、CI 会挂"的那一类。libuvcpp 的 CMakeLists:280 是
-      # `find_package(ZLIB QUIET)`——找到系统 zlib 就用系统的，**只有找不到时**
-      # 才 FetchContent 编源码那份（v1.3.1）。而 fetch_uvcpp.ps1 的运行期 DLL
-      # 清单是按**精确文件名**找 `zlib1__.dll` 的，那个双下划线是源码版 zlib 在
-      # MinGW 下的产物名，系统那份给不出这个名字。
+      # `-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON` 留着的理由，和"凑出
+      # `zlib1__.dll`"无关 —— 那个名字是本机的事，不是这套构建的属性：
+      # 它是本机那次链到的 **winlibs UCRT zlib**（GCC 13.2.0）的模块名，
+      # 不是源码版 zlib 在 MinGW 下的产物名（源码那条路静态链 zlibstatic，
+      # 导入表里一个 zlib 都没有）。所以 fetch_uvcpp.ps1 也改成了先读导入表、
+      # 要才去找，不再把某个名字当必须项。
       #
-      # 本机的 zlib 是源码版（用户的 MSYS2 里没有 zlib 开发包 ⇒ find_package 失败
-      # ⇒ 走 FetchContent）；而 runner 上我们装了 mingw-w64-x86_64-openssl，
-      # 它会把 zlib 作为依赖一起带进来 ⇒ find_package **命中** ⇒ 不编源码 zlib
-      # ⇒ 构建树里根本没有 zlib1__.dll ⇒ fetch_uvcpp.ps1 在"运行期 DLL 没找到"
-      # 里把它列出来并退出。这一行就是把 CI 拉回本机那条路径。
-      # libuvcpp 自己的 CI 也是这么传的（见其 ci-mingw64.yml）。
+      # 这个开关真正管的是：libuvcpp 是 `find_package(ZLIB QUIET)`，runner 上
+      # 装了 mingw-w64-x86_64-openssl，它会把 mingw64 的 zlib 一起带进来 ⇒
+      # 命中 ⇒ libuvcpp.dll 的导入表里多一个 `zlib1.dll` ⇒ 发行包要多发一个
+      # DLL，而且正是项目自己在顶层 CMakeLists.txt 里专门防的那种撞名
+      # （别的软件往 PATH 上丢的 zlib1.dll）。关掉它让它静态链进去，这个 DLL
+      # 和那类故障一起消失。libuvcpp 自己的 MinGW64 CI 也这么传
+      # （ci-mingw64.yml:98）。
       - name: 构建 libuvcpp（含 SOAP/WSDL）
         if: steps.uvcpp-cache.outputs.cache-hit != 'true'
         run: |
