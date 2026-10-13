@@ -20,3 +20,10 @@
 # 二进制显式声明，免得 git 去猜（也免得 diff 把图标当文本逐行比）。
 *.ico binary
 *.png binary
+
+# ONVIF 规范原文（onvif_wsdl/ 下三份）。它们**只在注释里被引用**，不参与构建，
+# 但它们是 ONVIF 组织的版权文件 —— 仓库里留的应当是**未修改**的上游副本。
+# 上面那条 `* text=auto eol=lf` 会在入库时把它们的 CRLF 改掉，那就不是原样了，
+# 所以在这里显式豁免。`-text` = 不做任何行尾转换。
+onvif_wsdl/*.xsd  -text
+onvif_wsdl/*.wsdl -text

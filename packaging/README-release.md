@@ -1,4 +1,4 @@
-# Desk2ONVIF 0.1.0
+# Desk2ONVIF
 
 把 Windows 桌面模拟成一台 **ONVIF Profile S 摄像机**：桌面画面 → H.264 → RTSP
 推流，同时让海康/大华等 NVR 能自动发现并作为 IP 通道添加。
@@ -7,8 +7,8 @@
 
 | | 怎么做 | 配置放在哪 |
 |---|---|---|
-| **安装包** `Desk2ONVIF_Setup_0.1.0.exe` | 双击装即可，**不问管理员权限**，装到 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，带开始菜单项和卸载程序 | 装好的目录里的 `config.json` |
-| **绿色版** `Desk2ONVIF-0.1.0-win64.zip` | 解压到任意目录就能跑；想搬到别的机器，**整个目录拷走**即可 | 同上，跟着目录走 |
+| **安装包** `Desk2ONVIF_Setup_<版本>.exe` | 双击装即可，**不问管理员权限**，装到 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，带开始菜单项和卸载程序 | 装好的目录里的 `config.json` |
+| **绿色版** `Desk2ONVIF-<版本>-win64.zip` | 解压到任意目录就能跑；想搬到别的机器，**整个目录拷走**即可 | 同上，跟着目录走 |
 
 两种装法装出来的文件完全一样。绿色版没有安装程序，所以下面「静默安装」那一节可以跳过。
 
@@ -44,10 +44,12 @@
 | 子码流 | `rtsp://<本机IP>:554/live_sub` |
 | ONVIF | `http://<本机IP>:8080/onvif/device_service` |
 
-打开 Web 控制台会**先要你登录**：默认 `admin` / `admin`。**装完请改掉** ——
-这一对是公开的出厂值，而 `start.bat` 默认监听 `0.0.0.0`（怎么改、以及它和 NVR
-那套凭据的区别，见下面「安全」）。登进去的**首页就是预览**，能直接看到桌面
-画面；另有「状态」和「配置」两页，顶栏可以退出登录。
+打开 Web 控制台会**先要你登录**。用**安装向导里你填的那一对** —— 向导里填的
+账号口令会被写进配置，网页和 NVR 两处都用它。**只有绿色版**解压出来是出厂值
+`admin` / `admin`，那一对是公开的，用完请改掉 —— 因为 `start.bat` 默认监听
+`0.0.0.0`（怎么改、以及网页和 NVR 那两套凭据的区别，见下面「安全」）。
+登进去的**首页就是预览**，能直接看到桌面画面；另有「状态」「配置」「设备信息」
+等页面，顶栏可以退出登录。
 
 本机拉流试一下（`ffplay` 随便找个装了的都行）：
 
@@ -85,9 +87,13 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:554/live
 2. 先跑一次 **`firewall-print.bat`**，把打出来的命令在**管理员**命令行里执行
    （它只对同网段放行，不是对全世界开放）
 3. 在 NVR 上用 **ONVIF / 自定义协议** 添加通道，地址填 `http://<本机IP>:8080/onvif/device_service`
-   - 用户名 `admin`，口令 `admin` —— 这是 **NVR 用的 ONVIF 凭据**，和控制台的
-     登录是**两套**（见下面「安全」那张表）。**装完请改掉。**
+   - 用户名/口令用 **`onvif.user` / `onvif.password`** —— 从安装包装出来的，
+     就是**安装向导里你填的那一对**；绿色版解压出来是 `admin` / `admin`。
+     这是 **NVR 用的 ONVIF 凭据**，和控制台的登录是**两套**（见下面「安全」那张表）。
 4. NVR 一般会自己搜到（WS-Discovery 组播），搜不到就手工填上面的地址
+5. **这台机器有几路，NVR 就会搜到几台设备**（每路一个 ONVIF 端口，见下面「端口」）。
+   有些 NVR 按 IP 归并、只显示一台，那就**手工添加**每一路。摄像头那一路要
+   先在控制台里「配置 → 通道 → 检测到的源 → 加为通道」加上去才有。
 
 > **NVR 搜不到或连不上时，先查防火墙。** 本机 ffplay 走的是回环接口、不受
 > 防火墙影响，所以「本机一切正常、别的机器连不上」正是它的典型症状。
@@ -119,14 +125,37 @@ Web 控制台上**改完就能存**。其中：
 
 | 端口 | 用途 |
 |---|---|
-| 554/tcp | RTSP（NVR 默认就用这个） |
-| 8080/tcp | Web 控制台 + ONVIF SOAP |
+| 554/tcp | RTSP（NVR 默认就用这个）。**所有通道共用这一个端口**，靠路径区分：通道 1 是 `/live`（子码流 `/live_sub`），通道 N 是 `/chN`（`/ch2`、`/ch3`…） |
+| 8080/tcp | Web 控制台 + 通道 1 的 ONVIF SOAP |
+| 8082/tcp、8083/tcp… | 通道 2、通道 3… 的 ONVIF SOAP（**`8080 + 通道号`**） |
 | 3702/udp | WS-Discovery，NVR 靠它自动搜到设备 |
 
 被占了就换：`start.bat -RtspPort 8554`。
 
+> 每路 ONVIF 一个端口，是因为 ONVIF 的设备服务**没有**"你说的是哪一路"这个信息
+> （`GetDeviceInformation` 就是个没有参数的 SOAP 请求），只能靠端口区分。代价是
+> 多几路就多占几个端口，而且 **8081 是空着的**（端口差是通道号，不是从 8081 顺排）。
+
 3702 还被 **Windows 自带的 WS-Discovery** 占着（`fdPHost` 服务）—— 这是正常的，
 两者能共存，程序已经处理了。
+
+---
+
+## 多通道：一块屏一路
+
+**这是默认行为。** 每块**能录**的屏自动成为一路，本机摄像头可以在网页上点一下
+加进来（摄像头**不会**自动加）。只有一块屏的机器上，行为和从前一模一样。
+
+- **关掉多出来的那几路**：控制台「配置 → 通道」，给那块屏写一条通道项、把开关
+  关掉即可 —— 自动发现会跳过"已经被显式项认领的屏"，不管那条是开还是关。
+- **最多 8 路。** 改通道配置**要重启**才生效（端口和 RTSP 路径在启动时定死）。
+- **每路各录一份**：`--record out\mc.mp4` 会变成 `mc.mp4`（通道 1）+ `mc-ch2.mp4`
+  + `mc-ch3.mp4`……。磁盘占用在**设备信息页**上摆着（文件名、当前大小、每小时约多少）。
+- **⚠️ 音频这一轮只跟通道 1。** 通道 2 起**没有**音频，界面上也不给那个开关 ——
+  这是结构性缺失，不是忘了接，补齐留下一轮。
+- 网页预览一次**只看一路**，顶上有个通道选择器。这不是省事：页面上的「真实延迟」
+  是拿编码时刻和浏览器解码时刻相减算的，两路混在一个页面上，这个数就不再回答
+  任何一个问题。
 
 ---
 
@@ -164,7 +193,7 @@ Web 控制台上**改完就能存**。其中：
 **用绿色版的话这一节整节跳过** —— 它没有安装程序。
 
 ```powershell
-Desk2ONVIF_Setup_0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
+Desk2ONVIF_Setup_<版本>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
     /DIR="D:\apps\Desk2ONVIF" /LOG="$env:TEMP\d2o-install.log" `
     /D2ORTSPORT=554 /D2OHTTPPORT=8080 /D2OSCOPE=all /MERGETASKS=!desktopicon
 ```
@@ -173,7 +202,7 @@ Desk2ONVIF_Setup_0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
 |---|---|
 | `/D2ORTSPORT` `/D2OHTTPPORT` | 端口，默认 `554` / `8080`。两个不能填成一样 |
 | `/D2OSCOPE=all`（或 `lan`）/ `local` | 监听所有网卡，还是只监听 `127.0.0.1` |
-| `/D2OUSER` `/D2OPASS` | ONVIF 凭据，默认 `admin` / `admin` |
+| `/D2OUSER` `/D2OPASS` | 账号口令，默认 `admin` / `admin`。**写进两个地方**：`web.user`/`web.password`（控制台登录）和 `onvif.user`/`onvif.password`（NVR 添加通道时填的） |
 | `/MERGETASKS=!desktopicon` | 不建桌面快捷方式（开始菜单项照建） |
 | `/LOG=<路径>` | 安装日志。**静默安装下这是唯一能看到警告的地方** |
 | `/DIR=<路径>` `/VERYSILENT` `/SUPPRESSMSGBOXES` `/NORESTART` | Inno 自己的开关 |
@@ -187,7 +216,7 @@ Desk2ONVIF_Setup_0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
 ```powershell
 $env:DESK2ONVIF_USER     = 'admin'
 $env:DESK2ONVIF_PASSWORD = 'A"b\c'     # 引号和反斜杠都能原样进去
-Desk2ONVIF_Setup_0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="$env:TEMP\d2o.log"
+Desk2ONVIF_Setup_<版本>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="$env:TEMP\d2o.log"
 ```
 
 优先级是 **命令行参数 > 环境变量 > 内置默认值**。口令**不写进日志**（日志经常被
@@ -208,6 +237,13 @@ Desk2ONVIF_Setup_0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="$env:T
 一行停在问句上、目标目录根本没建。这个症状和"安装程序坏了"长得一模一样。所以静默
 路径上凡是需要确认的地方，答案一律由参数预先决定，或者干脆不问。
 
+- **卸载会把操作日志一起删掉。** `{app}\logs\` 里的 `audit-*.log`（第四轮起的操作日志，
+  见 README 的「操作日志」一节）和 `config.json` 一样属于安装目录，卸载时清掉；
+  要留就先自己抄走。这一条是**修出来的**：在那之前卸载只删 `config.json`、
+  把 `logs\` 剩了下来，于是 `{app}` 不空、目录本身也不被移除 —— 症状是
+  "卸载完了还剩一个目录，里面一份配置加一份日志"。`logs\` 是**运行期**才出现的文件，
+  不在 Inno 的安装清单里，所以必须在 `[UninstallDelete]` 里显式声明。
+
 装和卸都不需要管理员权限，不弹 UAC。这是刻意的：程序要把 `config.json` 写在 exe
 旁边（删掉它就是恢复出厂设置），装到 `Program Files` 的话每次存配置都要提权，
 而失败的表现是"改了配置存不下来"，很难查。
@@ -216,19 +252,20 @@ Desk2ONVIF_Setup_0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="$env:T
 
 ## 安全
 
-**Web 控制台要登录，但出厂用户名/口令是 `admin`/`admin`，而 `start.bat` 默认
-监听 `0.0.0.0`** —— 在改掉口令之前，同一局域网内任何机器都能用这一对进来
-**看你的桌面画面、读配置、改配置**。这一对就印在 `--help` 里，等于没有。
+**Web 控制台要登录，而 `start.bat` 默认监听 `0.0.0.0`。** 从安装包装出来的，
+口令是你自己在向导里填的那个；**绿色版的出厂值是 `admin`/`admin`**，那一对就印在
+`--help` 里 —— 在没有改掉它之前，同一局域网内任何机器都能用它进来
+**看你的桌面画面、读配置、改配置**。
 
 装完请先改它（控制台 → 配置 → 登录用户名/登录口令，**存完当场生效、不用重启**），
 或者干脆用 `start-local.bat` 只监听 `127.0.0.1`。
 
 要留意的是这里**有两套凭据，互不相干**：
 
-| | 用在哪 | 配置项 | 出厂值 |
-|---|---|---|---|
-| Web 登录 | 浏览器打开控制台 | `web.user` / `web.password` | `admin` / `admin` |
-| ONVIF | NVR 添加通道时填的 | `onvif.user` / `onvif.password` | `admin` / `admin` |
+| | 用在哪 | 配置项 | 装出来的值 | 绿色版的出厂值 |
+|---|---|---|---|---|
+| Web 登录 | 浏览器打开控制台 | `web.user` / `web.password` | 安装向导里填的 | `admin` / `admin` |
+| ONVIF | NVR 添加通道时填的 | `onvif.user` / `onvif.password` | 安装向导里填的（**同一个值**） | `admin` / `admin` |
 
 **改一套不会影响另一套。** 把任一套的口令设成**空串**在这程序里都不是"关掉
 鉴权"，而是"口令就是空"：挑战/登录框照常出现、校验照走，任何人按一下回车就
@@ -242,5 +279,16 @@ Desk2ONVIF_Setup_0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="$env:T
 
 ## 许可证
 
-Desk2ONVIF 是 **GPL-3.0-or-later**。这个包里同时分发了若干第三方组件，
-各自的许可证与源码获取方式见 **`THIRD-PARTY.md`**。
+Desk2ONVIF 的**源码**是 **MIT**；而这个安装包/绿色版里的**可执行文件是
+GPL-3.0-or-later**。
+
+这不是写错了，也不是可以二选一的表述 —— 程序链接了带 x264 的 FFmpeg 构建，
+x264 是 GPL-2.0-or-later，链接进二进制即成为 GPL 下的组合作品。所以：
+
+- 你**读、改、复用**源码 → MIT，署名即可；
+- 你**分发**由它构建出的可执行文件 → 受 GPL-3.0 约束，需提供对应源码。
+
+想要纯 MIT 的二进制，得换成 LGPL 版 FFmpeg 并去掉 x264。
+
+这个包里同时分发了若干第三方组件，各自的许可证与源码获取方式见
+**`THIRD-PARTY.md`**。

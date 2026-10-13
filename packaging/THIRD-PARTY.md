@@ -1,8 +1,15 @@
 # 第三方组件与许可证
 
-Desk2ONVIF 本身是 **GPL-3.0-or-later**（全文见 `LICENSE`）。这个发行包里
-同时含有下列第三方组件。GPL 要求分发二进制时能让接收者拿到对应源码，
-所以每一项都给出上游地址 —— 全部是未经修改的官方版本（唯一的例外见文末）。
+Desk2ONVIF 的**源码**是 **MIT**（全文见 `LICENSE`）；而**这个发行包里的
+可执行文件是 GPL-3.0-or-later**（全文见 `LICENSE-GPL-3.0.txt`）。
+
+为什么二进制不能是 MIT：它链接了下面那份带 `--enable-libx264` 的 FFmpeg 构建，
+而 x264 是 GPL-2.0-or-later —— 链接进二进制即成为 GPL 下的组合作品。**这不是
+本项目的选择，是许可本身的约束。** 想要纯 MIT 的二进制，得换成 LGPL 版
+FFmpeg 并去掉 x264。
+
+GPL 要求分发二进制时能让接收者拿到对应源码，所以每一项都给出上游地址 ——
+全部是未经修改的官方版本（唯一的例外见文末）。
 
 ## 随包分发的 DLL
 
@@ -18,8 +25,8 @@ Desk2ONVIF 本身是 **GPL-3.0-or-later**（全文见 `LICENSE`）。这个发�
 
 > **FFmpeg 这个构建是 GPL 的**，不是 LGPL 的。它的 configure 串里有
 > `--enable-gpl --enable-version3 --enable-libx264`，所以整个 `avcodec-63.dll`
-> 受 GPL-3.0 约束。这与本项目的 GPL-3.0 一致，可以一起分发；但如果将来要
-> 换成宽松许可，得换成 LGPL 构建（并去掉 x264）。
+> 受 GPL-3.0 约束。与发行包的 GPL-3.0 一致，可以一起分发；但**正是它**让
+> 本发行包无法以 MIT 分发 —— 换成 LGPL 构建（并去掉 x264）才谈得上宽松许可。
 >
 > GCC 运行库那份的 **Runtime Library Exception** 明确允许把这三个 DLL 随
 > 非 GPL 程序一起分发，没有额外义务。
@@ -37,12 +44,13 @@ Desk2ONVIF 本身是 **GPL-3.0-or-later**（全文见 `LICENSE`）。这个发�
   静态链接了它**。LGPLv3 与 GPLv3 兼容，可以并入 GPLv3 作品；LGPL 的"允许用户
   替换库"这一条，本项目通过**完整发布源码 + 提供构建脚本**（`scripts/`）满足。
 - **x264** — https://code.videolan.org/videolan/x264 。GPL-2.0-or-later，是
-  本项目整体采用 GPL-3.0 的原因。
+  **本发行包整体按 GPL-3.0 分发**的原因（源码那侧仍是 MIT）。
 
 ## 前端
 
-`web/dist/` 是 Vue 3 + Vite 构建产物，许可证同本项目（GPL-3.0-or-later），
-源码在仓库的 `web/src/`。运行时不含任何第三方 JS 依赖 —— 打包时全部内联，
+`web/dist/` 是 Vue 3 + Vite 构建产物。它是源码的直接产物、不含任何链接进来的
+GPL 组件，所以许可证跟**源码**走：**MIT**，源码在仓库的 `web/src/`。
+运行时不含任何第三方 JS 依赖 —— 打包时全部内联，
 所以这个目录里没有 node_modules 之类的东西需要单独声明。
 
 ## 唯一一处对上游的修改

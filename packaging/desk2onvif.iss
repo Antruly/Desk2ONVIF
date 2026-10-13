@@ -82,7 +82,12 @@ Source: "..\build\bin\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; 只有网页界面打不开，而且一个字都不报（exe 的 --web-root 默认值是相对路径
 ; web/dist，"目录不存在"被刻意当成"没挂静态资源"而不是错误）。
 Source: "..\web\dist\*"; DestDir: "{app}\web\dist"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 两份许可证都要带。仓库的源码是 MIT（LICENSE），而这个包里装的是**链接了
+; x264 的可执行文件**，按 GPL-3.0 分发 —— 只装 MIT 那份会让用户以为二进制
+; 也是 MIT，只装 GPL 那份又抹掉了源码的许可。两份 + README.md 里的说明，
+; 才是完整的一句话。
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE-GPL-3.0.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\THIRD-PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
 ; 改名要用 DestName，不是 DestDir。写成 DestDir={app}\README.md 的后果是
 ; Inno 建了一个**叫 README.md 的目录**，把 README-release.md 塞进去 ——

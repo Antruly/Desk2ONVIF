@@ -125,7 +125,8 @@ Check ((Test-Path -LiteralPath $readme) -and -not (Get-Item -LiteralPath $readme
 foreach ($f in @('desk2onvif.exe', 'config.json', 'start.bat', 'start.ps1',
                  'start-local.bat', 'list-displays.bat', 'selfcheck.bat',
                  'firewall-allow.bat', 'firewall-print.bat',
-                 'LICENSE', 'THIRD-PARTY.md', 'desk2onvif.ico', 'unins000.exe')) {
+                 'LICENSE', 'LICENSE-GPL-3.0.txt', 'THIRD-PARTY.md',
+                 'desk2onvif.ico', 'unins000.exe')) {
     Check (Test-Path -LiteralPath (Join-Path $InstallDir $f)) "有 $f"
 }
 
