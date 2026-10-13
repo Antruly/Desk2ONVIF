@@ -115,9 +115,20 @@ jobs:
       # `make` 单独列：Live555 的 genMakefiles 产出的是 POSIX Makefile，
       # build_live555.sh 里调的是裸 `make`，它得从 /usr/bin 找得到。
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: MINGW64
           update: false
+          # **必须显式给 location，不能靠默认值。** 这个 action 的默认根是
+          # `$RUNNER_TEMP\msys64`（实测是 `D:\a\_temp\msys64`），不是 `C:\msys64`
+          # —— runner 的 `C:\msys64` 里只有一个光秃秃的 usr\bin\bash.exe，
+          # 没有 mingw64\ 工具链。而本项目的三个脚本认死了 `C:\msys64`：
+          # build.ps1 的 -MsysRoot 默认值、fetch_uvcpp.ps1 的 -GccBin 默认值，
+          # 以及 build_live555.ps1 里**写死**的 C:\msys64\usr\bin\bash.exe。
+          #
+          # `location` 是**父目录**：README 的例子 `location: D:\` 装出来是
+          # D:\msys64。所以这里给 `C:\`，产物即 C:\msys64。
+          location: C:\
           install: >-
             make
             mingw-w64-x86_64-gcc
@@ -138,17 +149,24 @@ jobs:
       # 让 runner 自己回答。跑完这一轮就可以删掉；在此之前，它比再赌一轮便宜。
       - name: 核对 MSYS2 装在哪
         run: |
+          Write-Host "action 报告的根 (msys2-location) = '${{ steps.msys2.outputs.msys2-location }}'"
           Write-Host "MSYS2_LOCATION = '$env:MSYS2_LOCATION'"
           Write-Host "MSYSTEM        = '$env:MSYSTEM'"
           Write-Host ''
           Write-Host '--- 期望路径是否存在 ---'
           foreach ($p in @('C:\msys64',
                            'C:\msys64\usr\bin\bash.exe',
+                           'C:\msys64\usr\bin\make.exe',
                            'C:\msys64\mingw64\bin\ninja.exe',
                            'C:\msys64\mingw64\bin\cmake.exe',
-                           'C:\msys64\mingw64\bin\g++.exe')) {
-            Write-Host ("{0,-42} {1}" -f $p, (Test-Path -LiteralPath $p))
+                           'C:\msys64\mingw64\bin\g++.exe',
+                           'C:\msys64\mingw64\include\openssl\ssl.h')) {
+            Write-Host ("{0,-48} {1}" -f $p, (Test-Path -LiteralPath $p))
           }
+          Write-Host ''
+          Write-Host '--- C:\msys64 顶层 ---'
+          Get-ChildItem 'C:\msys64' -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.Name)" }
           Write-Host ''
           Write-Host '--- 根目录附近找 msys64 ---'
           foreach ($d in @('C:\', 'D:\', 'D:\a', 'D:\a\_temp')) {
