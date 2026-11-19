@@ -44,7 +44,12 @@ class OsdOverlay {
   ///
   /// `device` 只是被借用（读取名称），必须活得比本对象久；可以为空 ——
   /// 那时 `name` 类型的项画不出东西，但不报错。
-  void configure(OsdConfig const& cfg, DeviceState const* device);
+  ///
+  /// `name_override` 非空时，`name` 类型的项用它当文字 —— 多通道下每一路
+  /// 要有自己的名字（`DeviceState` 只有一份，是通道 1 的）。空串 = 沿用
+  /// `DeviceState`（单通道/通道 1 的旧行为）。
+  void configure(OsdConfig const& cfg, DeviceState const* device,
+                 std::string name_override = std::string());
 
   bool enabled() const;
 
@@ -81,6 +86,8 @@ class OsdOverlay {
 
   OsdConfig cfg_;
   DeviceState const* device_ = nullptr;
+  /// 非空 = `name` 项用它（每通道自己的名字），见 `configure`。
+  std::string name_override_;
   std::vector<Item> items_;
 };
 

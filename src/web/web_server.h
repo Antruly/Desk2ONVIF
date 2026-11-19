@@ -212,6 +212,21 @@ struct WebOptions {
   /// 改了一边就会出现"NVR 拿到了 URL 却 404"，而两边看起来都没错。
   std::function<std::shared_ptr<BgraFrame const>()> snapshot_source;
 
+  /// **按通道**取一帧（`GET /api/channels/<n>/snapshot.jpg`）。
+  ///
+  /// 和 `snapshot_source`（"现在预览的那一路"）是两件事：通道列表的缩略图墙
+  /// 要同时拿好几路的图，而"现在看哪一路"只有一个值。没有这个回调时那条路由
+  /// 不注册 —— 前端会退回到只显示状态文字。
+  /// 参数是通道号；从请求路径里解析出来后由调用方校验（哪些号现在真的存在
+  /// 是运行期的事）。返回空 = 这一路还没有帧。
+  std::function<std::shared_ptr<BgraFrame const>(int)> channel_snapshot_of;
+
+  /// `GET /api/logs?lines=N` —— 调试日志的尾部（异常/告警那一页用）。
+  ///
+  /// 返回一份 JSON 文本：`{"path": "...", "lines": ["...", ...]}`。
+  /// 留空 = 不注册（单通道/测试构建）。
+  std::function<std::string(int lines)> log_tail;
+
   /// 开 ONVIF 的 SOAP 端点（`POST /onvif/device_service` 与 `/onvif/media_service`）。
   bool onvif_enabled = true;
   /// ONVIF 的身份、凭据与码流描述。**凭据也在这里**（`onvif.user/password/realm`）

@@ -8,8 +8,8 @@
 [![License](https://img.shields.io/badge/license-MIT%20(source)%20%2F%20GPL--3.0%20(binary)-blue)](#许可证)
 [![Built on libuvcpp](https://img.shields.io/badge/built%20on-libuvcpp-orange)](https://github.com/Antruly/libuvcpp)
 
-[**⬇ 下载最新安装包**](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.1.9.exe)
-· [绿色版](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.1.9-win64.zip)
+[**⬇ 下载最新安装包**](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.2.0.exe)
+· [绿色版](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.2.0-win64.zip)
 · [全部版本](https://github.com/Antruly/Desk2ONVIF/releases)
 
 Desk2ONVIF 把本机桌面模拟成一台标准 ONVIF 摄像机：海康、大华、Milestone
@@ -53,8 +53,9 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 
 **采集**
 
-- DXGI 桌面复制，**多显示器**支持，一块屏一路通道（自动发现、默认开）
-- USB / 内置**摄像头**（Media Foundation）也能加进来当一路，可与屏幕通道混用
+- DXGI 桌面复制。**默认只有通道 1（本机主屏）**；别的显示器与 USB / 内置
+  摄像头在网页「通道管理」里按 **NVR 方式显式添加**，每一路分配一个稳定通道号
+  （删掉别的通道不会让它换号）
 - **鼠标指针合成**（不依赖任何第三方库，见[工程实录](docs/ENGINEERING.md)）
 - 指定采集哪块屏、哪个摄像头、目标分辨率与帧率
 
@@ -72,11 +73,12 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 
 - **ONVIF Profile S**：SOAP + WS-Discovery（UDP 3702）+ Digest 鉴权，
   每个通道一个独立的 ONVIF 端口
-- **配置热生效**：改完当场生效的字段立刻生效，需要重启的**逐字段告诉你**
+- **配置热生效**：通道参数在网页上**改完即生效**（重开管线）；水印下一帧就变；
+  只有端口/口令这一类系统设置需要点保存，需要重启的**逐字段告诉你**
 - **设备身份**（厂商 / 型号 / 硬件码 / 序列号 / UUID）在界面上锁死，
   逃生门是手改 `config.json`
 - **设备时间**：支持 NTP 对时，也支持 NVR 反过来给它对时（SetSystemDateAndTime）
-- **OSD 水印**：时间戳与名称，网页和 NVR 两条路都能改，改完下一帧就变
+- **OSD 水印**：时间戳与名称，**每一路通道各自独立**，改完下一帧就变
 - **延时档位**：极致低延迟 / 均衡 / 优先画质，网页预览与 NVR 两侧分别可调
 - **DXGI 自恢复**：换分辨率、换刷新率、关显示器电源之后自动重建管线
   （三条触发路径都实机验证过）
@@ -86,8 +88,8 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 
 ### 方式一：安装包（推荐）
 
-当前版本 **v0.1.9**，直接下
-[`Desk2ONVIF_Setup_0.1.9.exe`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.1.9.exe)
+当前版本 **v0.2.0**，直接下
+[`Desk2ONVIF_Setup_0.2.0.exe`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.2.0.exe)
 （全部版本见 [Releases](https://github.com/Antruly/Desk2ONVIF/releases)）。
 Inno Setup 简体中文向导，装到
 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，**不弹 UAC**。
@@ -108,7 +110,7 @@ NVR 一份，互相独立），细节见[工程实录](docs/ENGINEERING.md#安�
 ### 方式二：绿色版
 
 下
-[`Desk2ONVIF-0.1.9-win64.zip`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.1.9-win64.zip)，
+[`Desk2ONVIF-0.2.0-win64.zip`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.2.0-win64.zip)，
 解压即用，整个目录拷走就能换机器。跑 `start.ps1`（或 `start-local.bat`）启动。
 
 ### 方式三：从源码
@@ -140,15 +142,20 @@ Profile S 摄像机。
 
 ## Web 控制台
 
-Vue 3 + Vite，六个页面：
+Vue 3 + Vite，按"读者要做的决定"分成独立页面（不再是一条长页面滚动）：
 
 | 页面 | 干什么 |
 |---|---|
-| 预览 | MSE 实时看画面，可切通道，可切延时档位 |
-| 状态 | 码率、帧率、队列、丢帧、连接数 |
-| 配置 | 分组改配置，按「能不能改」分组，改不了的标出来要重启 |
-| 信息 | 设备身份、版本、能力 |
-| 日志 | 审计日志 |
+| 实时预览 | 多画面缩略图墙 + 单路 MSE 实时画面，可切延时档位 |
+| 通道管理 | NVR 式：有哪几路、加一路（显示器 / USB 摄像头）、删停启 |
+| 通道详情 | 这一路的身份、图像、延时、子码流与 **独立的水印**；改完自动生效 |
+| 运行状态 | 码率、帧率、队列、丢帧、连接数、ONVIF 计数 |
+| 系统设置 | 端口、登录、自适应、审计留存、重启 / 恢复出厂（需要保存） |
+| ONVIF 设置 | 设备名、NVR 凭据、重新广播 |
+| 音频设置 | 系统声音 / 麦克风、增益 |
+| 时间设置 | 设备时间、NTP、手动校准 |
+| 日志与告警 | 操作审计 + 调试日志尾部 |
+| 设备信息 | 设备身份、版本、能力 |
 | 登录 | 会话鉴权 + 路由守卫 |
 
 前端构建产物**全部内联**，运行时不含任何第三方 JS 依赖 —— 所以
@@ -171,7 +178,7 @@ Vue 3 + Vite，六个页面：
 # 有哪些音频设备
 .\desk2onvif.exe --list-audio
 
-# 摄像头当通道 1（那块屏就自动成为通道 2）
+# 摄像头当通道 1（桌面那块屏不再自动变成通道 2；要加就在网页「通道管理」里加）
 .\desk2onvif.exe --camera "FHD Camera" --rtsp --http
 
 # 录 10 秒

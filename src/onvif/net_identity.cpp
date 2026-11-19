@@ -228,4 +228,71 @@ std::string make_serial(std::string const& seed, std::size_t hex_chars) {
   return out;
 }
 
+namespace {
+
+/// 读一个 REG_SZ。取不到（键不存在 / 值缺失 / 类型不对）返回空串。
+///
+/// 和前面 `read_machine_guid()` 是同一个写法，只是那一个写死了键名；这里要
+/// 试好几个序列号位置，所以抽成一个按名字取的小函数。
+std::string read_reg_sz(char const* subkey, char const* value) {
+  HKEY key = nullptr;
+  if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkey, 0, KEY_READ | KEY_WOW64_64KEY,
+                      &key) != ERROR_SUCCESS) {
+    return {};
+  }
+  char buf[256] = {};
+  DWORD size = sizeof(buf) - 1;
+  DWORD type = 0;
+  LONG const rc = ::RegQueryValueExA(key, value, nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(buf), &size);
+  ::RegCloseKey(key);
+  if (rc != ERROR_SUCCESS || type != REG_SZ) return {};
+  // `buf` 是零初始化的，而 REG_SZ 的值本身带结尾的 NUL —— 用 `std::string(buf)`
+  // 就够，不必依赖 `strnlen`（它不是标准 C++，MSVC 的 C++ 头里不保证有
+  // `std::strnlen`）。
+  std::string s(buf);
+  // 去掉首尾空白。
+  auto const not_space = [](unsigned char c) { return c != ' ' && c != '\t'; };
+  while (!s.empty() && !not_space(static_cast<unsigned char>(s.front()))) s.erase(0, 1);
+  while (!s.empty() && !not_space(static_cast<unsigned char>(s.back()))) s.pop_back();
+  return s;
+}
+
+/// OEM 占位串。它们**不是**序列号，但比空串更危险：直接显示出来，用户会以为
+/// 这台机器的序列号真的叫 "To be filled by O.E.M."。
+bool is_oem_placeholder(std::string const& s) {
+  static char const* const kBad[] = {
+      "to be filled by o.e.m.", "default string", "n/a", "none", "0",
+      "system serial number", "chassis serial number", "base board serial number",
+  };
+  std::string low;
+  low.reserve(s.size());
+  for (char c : s) {
+    low.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+  }
+  for (char const* b : kBad) {
+    if (low == b) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+std::string machine_hardware_serial() {
+  char const* const kKey = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+  static char const* const kValues[] = {
+      "SystemSerialNumber",
+      "BaseBoardSerialNumber",
+      "ChassisSerialNumber",
+  };
+  for (char const* v : kValues) {
+    std::string s = read_reg_sz(kKey, v);
+    if (s.empty() || is_oem_placeholder(s)) continue;
+    return s;
+  }
+  // 读不到就退回到稳定派生值。**不返回空串** —— 通道 1 的 ID 和序列号都要有
+  // 一个确定的值，而空串会让两路本机通道在界面上看起来像同一个"未绑定"。
+  return make_serial(machine_seed());
+}
+
 }  // namespace d2o

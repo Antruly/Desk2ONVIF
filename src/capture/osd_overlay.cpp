@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <utility>
 
 namespace d2o {
 
@@ -170,8 +171,11 @@ std::string format_time(std::string const& pattern, std::tm const& tmv) {
 
 /// 解析一项此刻该显示的文字。
 std::string item_text(OsdItemConfig const& it, DeviceState const* dev,
+                      std::string const& name_override,
                       std::chrono::system_clock::time_point wall) {
   if (it.type == "name") {
+    // 每通道先看自己的名字；空串才回落到全局 `DeviceState`（通道 1/单通道）。
+    if (!name_override.empty()) return name_override;
     return dev == nullptr ? std::string() : dev->channel_name();
   }
   if (it.type == "text") return it.text;
@@ -254,9 +258,11 @@ struct OsdOverlay::Item {
 OsdOverlay::OsdOverlay() = default;
 OsdOverlay::~OsdOverlay() = default;
 
-void OsdOverlay::configure(OsdConfig const& cfg, DeviceState const* device) {
+void OsdOverlay::configure(OsdConfig const& cfg, DeviceState const* device,
+                           std::string name_override) {
   cfg_ = cfg;
   device_ = device;
+  name_override_ = std::move(name_override);
   items_.clear();
   items_.reserve(cfg_.items.size());
   for (auto const& it : cfg_.items) {
@@ -279,7 +285,7 @@ std::string OsdOverlay::key(std::chrono::system_clock::time_point wall) const {
   std::string k;
   for (auto const& it : items_) {
     if (!it.cfg.enabled) continue;
-    std::string const t = item_text(it.cfg, device_, wall);
+    std::string const t = item_text(it.cfg, device_, name_override_, wall);
     // **解析不出文字的项不进指纹**，否则它们会贡献一个恒定的分隔符，于是
     // "什么都没画"的 key 变成一个非空串，而调用方要判的正是"有没有东西可画"。
     // 触发它的现实情形是 `name` 项而 `DeviceState` 还没接上（或者名字是空的）
@@ -301,7 +307,7 @@ int OsdOverlay::compose(std::uint8_t* dst, int dst_w, int dst_h, std::size_t str
     if (!item.cfg.enabled) continue;
 
     int const px = font_px(item.cfg, dst_h);
-    item.ensure(item_text(item.cfg, device_, wall), px);
+    item.ensure(item_text(item.cfg, device_, name_override_, wall), px);
     if (item.mask.empty()) continue;
 
     Mask const& m = item.mask;

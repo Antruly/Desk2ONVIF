@@ -74,6 +74,20 @@ struct CameraInfo {
   std::string name;           ///< MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME
   std::string symbolic_link;  ///< MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK
   bool is_default = false;    ///< 枚举里的第一台
+
+  /// 稳定的硬件标识 = 完整符号链接。添加通道时写进配置，运行期用它判断
+  /// "绑定的那台设备还在不在"。
+  ///
+  /// **不用友好名**：两台同型号摄像头的友好名可能一模一样，而符号链接里带着
+  /// VID/PID 和实例路径，至少能把它们分开。
+  std::string hardware_id;
+
+  /// 符号链接里的实例段（`usb#vid_xxxx&pid_xxxx#<这一段>#...`）。
+  ///
+  /// 有真实 USB 序列号的摄像头，这一段就是序列号；没有的话它是
+  /// `7&1a2b3c4d&0&0000` 这种"跟着端口走"的实例路径 —— 那种情况下这里
+  /// **留空**（界面上显示「未提供」），而不是把一个端口号当成序列号展示。
+  std::string serial;
 };
 
 /// 枚举本机摄像头。进程内第一次调用会做 MFStartup。

@@ -8,6 +8,8 @@ import type {
   ReloadResult,
   SaveConfigResult,
   SessionInfo,
+  ChannelStat,
+  LogTail,
   Sources,
   Stats,
   TimeActionResult,
@@ -167,6 +169,31 @@ export function fetchStatus(): Promise<ApiResult<Stats>> {
 
 export function fetchConfig(): Promise<ApiResult<AppConfig>> {
   return getJson<AppConfig>('/api/config')
+}
+
+/**
+ * 全部通道的**统一视图**（配置 + 运行状态）。
+ *
+ * 和 `/ws/stats` 里那个 `channels` 数组是同一份数据，区别只在于"推"和"拉"。
+ * 首屏还没连上 WS 时用这条，避免先渲染一个空列表再跳一下。
+ */
+export function fetchChannels(): Promise<ApiResult<{ channels: ChannelStat[] }>> {
+  return getJson<{ channels: ChannelStat[] }>('/api/channels')
+}
+
+/**
+ * 按通道取缩略图的 URL（直接塞给 `<img>`）。
+ *
+ * `t=` 是**必须的**：URL 不变时浏览器会一直用缓存里那张，界面上就永远定格
+ * 在第一张，而 HTTP 200 + 一张合理的图看起来完全正常。
+ */
+export function channelSnapshotUrl(channel: number): string {
+  return `/api/channels/${channel}/snapshot.jpg?t=${Date.now()}`
+}
+
+/** 调试日志尾部（异常/告警页）。行数由后端夹到 [1, 2000]。 */
+export function fetchLogTail(lines = 300): Promise<ApiResult<LogTail>> {
+  return getJson<LogTail>(`/api/logs?lines=${lines}`)
 }
 
 /**

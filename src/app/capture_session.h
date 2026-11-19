@@ -89,6 +89,11 @@ struct SessionOptions {
   /// 这是明说的取舍（README「已知取舍」）。
   LiveOsd const* live_osd = nullptr;
 
+  /// 水印里 `name` 那一项显示的文字。**空 = 用 `device->channel_name()`**
+  /// （通道 1 / 单通道）。多通道下每一路有自己的名字，而 `DeviceState` 只有
+  /// 一份 —— 不填的话通道 2 的「名称」水印会写着通道 1 的设备名。
+  std::string osd_name;
+
   /// 水印里 `name` 那一项读的是它。**借用**，必须活得比这一趟 run() 久；
   /// 可以为空 —— 那时名称项画不出东西，但不报错。
   DeviceState const* device = nullptr;
@@ -219,6 +224,12 @@ struct SessionStats {
   std::uint64_t content_frames = 0;   ///< 其中画面真的变了的
   std::uint64_t queue_dropped = 0;    ///< 编码跟不上而丢掉的
   std::uint64_t pool_exhausted = 0;   ///< 池子空而跳过采集的次数
+  /// **画面来源此刻掉线了**（摄像头拔了 / 显示器电源断了），这一路正在
+  /// 每秒重试重建，期间推的是最后一帧。通道列表据此显示「无信号」。
+  ///
+  /// 它和 `access_lost` 是两件事：那个是**累计重建次数**（只增不减），
+  /// 这个是**当前状态**（会回到 false）。
+  bool source_offline = false;
   /// 自适应降载主动丢掉的拍数。**和 queue_dropped 分开计**：一个是"我们
   /// 故意降了帧率"，另一个是"编码器出问题了"，混成一个数字就没法归因。
   std::uint64_t adaptive_dropped = 0;

@@ -61,4 +61,14 @@ std::string make_uuid_urn(std::string const& seed);
 /// 由种子派生的稳定序列号，纯大写十六进制。
 std::string make_serial(std::string const& seed, std::size_t hex_chars = 16);
 
+/// 本机的**硬件序列号**：优先读 SMBIOS 落进注册表的值
+/// （`HKLM\HARDWARE\DESCRIPTION\System\BIOS` 里的主板/整机序列号），
+/// 读不到或者读到 OEM 占位串（`To be filled by O.E.M.` 那一类）时，
+/// 退回到 `make_serial(machine_seed())`。
+///
+/// 它给**通道 1**（本机桌面）当硬件序列号显示，也是那个通道 ID 的种子。
+/// 返回值永远非空 —— 界面上"未提供"只该出现在 USB 摄像头没暴露序列号的时候，
+/// 不该出现在本机上。
+std::string machine_hardware_serial();
+
 }  // namespace d2o

@@ -7,6 +7,8 @@
 
 #include "common/log.h"
 
+#include <algorithm>
+
 namespace d2o {
 
 namespace {
@@ -18,6 +20,9 @@ namespace {
 /// 而症状是"自动建出来的那个通道这一项永远是默认值" —— 看起来像那个显示器
 /// 有什么特殊之处，看不出是漏抄了一个赋值。
 void copy_tunables(ChannelConfig const& c, ChannelPlan& p) {
+  p.id = c.id;
+  p.hardware_id = c.hardware_id;
+  p.hardware_serial = c.hardware_serial;
   p.name = c.name;
   p.source = c.source;
   p.display_index = c.display_index;
@@ -27,9 +32,13 @@ void copy_tunables(ChannelConfig const& c, ChannelPlan& p) {
   p.fps = c.fps;
   p.bitrate_kbps = c.bitrate_kbps;
   p.max_height = c.max_height;
+  p.latency = c.latency;
+  p.gop_seconds = c.gop_seconds;
+  p.threads = c.threads;
   p.sub_enabled = c.sub_enabled;
   p.sub_height = c.sub_height;
   p.sub_bitrate_kbps = c.sub_bitrate_kbps;
+  p.osd = c.osd;
   p.rtsp_path = c.rtsp_path;
   p.rtsp_sub_path = c.rtsp_sub_path;
 }
@@ -49,98 +58,104 @@ void expand_quality(ChannelPlan& p) {
   p.sub_enabled = t->sub_enabled;
 }
 
+/// 延时档位展开。与 `expand_quality` 同一条纪律：只有这一处，别处不许手抄。
+/// `validate_config` 对配置里的项已经展开过（幂等），这里兜的是手搓的计划。
+void expand_latency(ChannelPlan& p) {
+  LatencyTier const* t = find_latency_tier(p.latency);
+  if (t == nullptr) return;
+  p.threads = t->threads;
+  p.gop_seconds = t->gop_seconds;
+}
+
 }  // namespace
 
 std::vector<ChannelPlan> plan_channels(
     std::vector<ChannelDisplayInfo> const& displays, ChannelsConfig const& cfg,
     unsigned channel1_display_index, bool channel1_is_display) {
   std::vector<ChannelPlan> out;
-  out.reserve(cfg.items.size() + displays.size());
+  out.reserve(cfg.items.size());
 
-  // --- 1. 显式项 ----------------------------------------------------------
+  // **同一块屏只给一路。** 判据是"这块屏已经被谁占了"，而通道 1 排在最前面
+  // —— 它是不是在抓屏、抓的是哪一块，由调用方传进来。
   //
-  // 这一趟同时做规则 2：**同一块屏只给一路**。判据是"这块屏已经被谁占了"，
-  // 而通道 1 排在最前面 —— 它是不是在抓屏、抓的是哪一块，由调用方传进来。
-  std::vector<unsigned> taken;   // 已经被占掉的显示器序号
+  // **不再自动发现显示器。** 默认安装只有通道 1；别的屏由用户在「通道管理」里
+  // 显式添加。自动建通道会让"有几块屏就有几个通道"变成一件用户看不见的事，
+  // 而它恰好与"NVR 式的显式通道管理"相反。
+  std::vector<unsigned> taken;
   if (channel1_is_display) taken.push_back(channel1_display_index);
+  /// 已经被占用的**摄像头**（同一个 reader 只能开一次）。
+  std::vector<std::string> taken_cameras;
+
   for (std::size_t i = 0; i < cfg.items.size(); ++i) {
     ChannelPlan p;
-    // **通道号 = 下标 + 2。** `validate_config` 就是按这一条补的名字和默认
-    // 路径（`channels.cpp` 里那句 `int const no = static_cast<int>(i) + 2`），
-    // 这里再按同一把尺子算一遍 —— 两边算得不一样的话，配置里写的
-    // `/ch3` 会接到一个叫「通道 4」的通道上。
-    p.index = static_cast<unsigned>(i) + 2;
+    // **通道号取配置里的稳定编号。** `validate_config` 已经把 0 / 重复 /
+    // 越界的号分配好了；这里保留 `i+2` 只是给没走过校验的手搓配置兜底。
+    p.index = cfg.items[i].number >= 2
+                  ? static_cast<unsigned>(cfg.items[i].number)
+                  : static_cast<unsigned>(i) + 2;
     p.item_index = i;
     copy_tunables(cfg.items[i], p);
     expand_quality(p);
+    expand_latency(p);
 
-    // 规则 2：这块屏是不是已经被别人占了？
     if (p.source == "display") {
-      for (unsigned const d : taken) {
-        if (d != p.display_index) continue;
+      // 这块屏在本机存在吗？抓不抓得到？
+      ChannelDisplayInfo const* found = nullptr;
+      for (ChannelDisplayInfo const& d : displays) {
+        if (d.index == p.display_index) {
+          found = &d;
+          break;
+        }
+      }
+      if (found == nullptr) {
         p.enabled = false;
-        if (channel1_is_display && d == channel1_display_index) {
-          // 通道 1 是"先来"的：它由顶层 `capture.*` 描述，用户没别的办法
-          // 让它换一块屏（只能 `--display` / `--camera`）。
+        p.blocked_reason = fmt(
+            "显示器 #%u 不在本机当前的显示输出里 —— 可能被拔掉了，"
+            "或者显示器序号变了。重新扫描并选一块能抓的屏。",
+            p.display_index);
+      } else if (!found->capturable) {
+        p.enabled = false;
+        p.blocked_reason = fmt(
+            "显示器 #%u 抓不到（%s）—— 向日葵一类的间接显示驱动常常这样。"
+            "这一路建不了，换一块屏。",
+            p.display_index, found->description.c_str());
+      } else if (std::find(taken.begin(), taken.end(), p.display_index) !=
+                 taken.end()) {
+        p.enabled = false;
+        if (channel1_is_display && p.display_index == channel1_display_index) {
           p.blocked_reason = fmt(
               "显示器 #%u 正被通道 1 使用 —— 一块屏同时只能抓一路"
               "（DXGI 的限制），这一路建不了。给它换一块屏，"
               "或者把通道 1 换到摄像头/别的屏上。",
-              d);
+              p.display_index);
         } else {
           p.blocked_reason = fmt(
               "显示器 #%u 已经被前面某一项占用了 —— 一块屏同时只能抓一路"
               "（DXGI 的限制）。删掉重复的那一项。",
-              d);
+              p.display_index);
         }
-        break;
       }
       if (p.enabled) taken.push_back(p.display_index);
-    }
-    out.push_back(std::move(p));
-  }
-
-  // --- 2. 自动发现的显示器 ------------------------------------------------
-  //
-  // 号从**全部显式项之后**接着排（含被关掉的项）。于是"关掉通道 3"不会让
-  // 通道 4 变成通道 3 —— 序号可能出现空档，而空档不伤人；反过来把后面每一路
-  // 的端口和 RTSP 路径整体挪一格，会伤到 NVR 上那些按路径存的书签。
-  unsigned next = static_cast<unsigned>(cfg.items.size()) + 2;
-  for (ChannelDisplayInfo const& d : displays) {
-    if (!d.capturable) continue;   // 见头文件规则 3
-    if (channel1_is_display && d.index == channel1_display_index) continue;
-    bool covered = false;
-    for (ChannelConfig const& it : cfg.items) {
-      // **只按 display_index 认领，不看 `enabled`。** `enabled:false` 的项
-      // 正是用户"关掉这块屏"的写法 —— 把它当成"没覆盖"就会把用户刚关掉的
-      // 通道原样又建回来，而界面上那条项明明白白写着已关闭。
-      //
-      // `source == "webcam"` 的项不参与：那个字段对摄像头项没有意义（默认
-      // 全是 0），拿它认领会让"配了一路摄像头"顺手把显示器 #0 也吞掉。
-      if (it.source == "display" && it.display_index == d.index) {
-        covered = true;
-        break;
+    } else if (p.source == "webcam" && p.enabled) {
+      // **同一台摄像头只给一路。** Media Foundation 的 SourceReader 在释放时会
+      // 把它拿到的 source `Shutdown()`，所以第二路根本开不起来（E_ACCESSDENIED
+      // 或者 MF_E_SHUTDOWN）—— 而那看起来像"摄像头坏了"。判据优先用绑定的
+      // `hardware_id`；老配置没有它时退回选择器（空 = 第一台）。
+      std::string const key =
+          !p.hardware_id.empty()
+              ? p.hardware_id
+              : (p.camera.empty() ? std::string("@first") : p.camera);
+      if (std::find(taken_cameras.begin(), taken_cameras.end(), key) !=
+          taken_cameras.end()) {
+        p.enabled = false;
+        p.blocked_reason = fmt(
+            "摄像头「%s」已经被前面某一项占用 —— 一个摄像头同时只能被一路"
+            "打开。删掉重复的那一项，或者给这一路换一台设备。",
+            p.camera.empty() ? "第一台（默认）" : p.camera.c_str());
+      } else {
+        taken_cameras.push_back(key);
       }
     }
-    if (covered) continue;
-
-    ChannelPlan p;
-    p.index = next++;
-    // 名字里的序号用**显示器的**，不是通道号：`--list-displays` 报的是 `#N`，
-    // 界面上写的也是同一个数。写成通道号的话，用户按界面上那句去
-    // `--display N` 会指到一块别的屏上。
-    p.name = fmt("显示器 #%u", d.index);
-    p.source = "display";
-    p.display_index = d.index;
-    p.auto_created = true;
-    // 默认档位「流畅」——`ChannelConfig::quality` 的默认值就是它。走
-    // `expand_quality` 而不是在这里手抄 20/1024/1080：档位表改了而这里没改，
-    // 症状是"自动建的那一路画质和界面上选的对不上"。
-    expand_quality(p);
-    // 路径的默认值在配置层是 `validate_config` 补的，自动项没经过它，所以
-    // 在这里按同一条规则补（`/ch<N>` / `/ch<N>_sub`）。
-    p.rtsp_path = fmt("/ch%u", p.index);
-    p.rtsp_sub_path = fmt("/ch%u_sub", p.index);
     out.push_back(std::move(p));
   }
 

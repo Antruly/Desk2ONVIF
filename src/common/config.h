@@ -302,8 +302,36 @@ struct LogConfig {
 struct ChannelConfig {
   bool enabled = true;
 
-  /// 空 → 按序号取「通道 N」。**不在这里填默认值** —— 序号要由它在数组里的
-  /// 位置决定，而结构体不知道自己的位置（填在 `validate_config` 里）。
+  /// **稳定的通道号**（2 起；通道 1 是顶层的本机桌面通道，永远不在这里）。
+  ///
+  /// `0` = 还没分配，由 `validate_config` 取当前**最小的空号**写回来。
+  /// 分配之后它就不随数组顺序变了：删掉通道 3 不会让通道 4 变成通道 3 ——
+  /// 端口（`web.port + number`）、默认 RTSP 路径、ONVIF 设备 UUID 全都挂在
+  /// 这个数上，整体前移会让 NVR 上按地址保存的通道全部错位。
+  ///
+  /// 空号会被新加的通道复用（NVR 的行为），所以号可能出现空档，这是正常的。
+  int number = 0;
+
+  /// 通道的**稳定 ID**。由创建时的来源硬件标识派生，形如
+  /// `webcam:1bcf2c99:7&1a2b3c4d&0&0000` / `display:DESKTOP-ABC:DISPLAY1`。
+  ///
+  /// 它和通道号是两件事：号是"在 NVR 里的第几路"，ID 是"这一路绑的是哪块
+  /// 硬件"。界面上两样都要显示 —— 后者在换机、换线、重排通道之后仍然指着
+  /// 同一台设备。`validate_config` 会在为空时从 `hardware_id` 派生一次。
+  std::string id;
+
+  /// 绑定的**来源硬件标识**（添加通道时写入）。运行期用它判断"设备还在不在"：
+  /// 枚举结果里找不到这一项 → 这一路进入「等待设备接入」而不是报一个笼统的失败。
+  ///
+  /// 空 = 未绑定，按 `source` + `camera` / `display_index` 的旧规则工作。
+  std::string hardware_id;
+
+  /// 给人看的硬件序列号（USB 摄像头的序列号 / 主机的 BIOS 序列号）。
+  /// 设备没有暴露序列号时为空 —— **不编一个**，界面上显示「未提供」。
+  std::string hardware_serial;
+
+  /// 空 → 按**通道号**取「通道 N」。`number` 分配之后这里才有默认值
+  /// （填在 `validate_config` 里，结构体不知道自己的位置）。
   std::string name;
 
   /// `display` = 抓一块屏幕；`webcam` = 抓本机摄像头。
@@ -332,17 +360,35 @@ struct ChannelConfig {
   /// 0 = 源的原生尺寸（不缩放）。档位展开会把「流畅」写成 1080。
   int max_height = 1080;
 
+  /// 延时档位，语义与 `CaptureConfig::latency` **完全一样**（预设展开器，
+  /// 展开 `threads` / `gop_seconds` 两项）。每个通道各管各的：通道 1 要
+  /// 「极致低延迟」不代表 NVR 网格用的通道 2 也要。
+  std::string latency = "balanced";
+  /// 关键帧间隔（秒）。`latency != "custom"` 时由档位覆盖。
+  ///
+  /// 默认值**与「均衡」档一致**（2 秒 / 3 线程）：出厂的通道不该在第一次
+  /// 校验时就冒出一条"档位把 threads 从 0 改成 3"的 note —— 那是默认值，
+  /// 不是修正。
+  int gop_seconds = 2;
+  /// 编码线程数。`latency != "custom"` 时由档位覆盖；0 = 自动（封顶 6）。
+  int threads = 3;
+
   bool sub_enabled = true;
   int sub_height = 360;
   int sub_bitrate_kbps = 512;
 
-  /// RTSP 路径。**空 → 按序号取 `/chN` / `/chN_sub`**，同 `name`。
+  /// 这一路自己的水印。**与顶层 `osd` 相互独立** —— 顶层那份是通道 1
+  /// （本机桌面）的，这里这份是通道 2 起的。默认值与 `OsdConfig` 的默认
+  /// 构造相同（时间左上、名称右下），所以"新加一路"不需要用户先配水印。
+  OsdConfig osd;
+
+  /// RTSP 路径。**空 → 按通道号取 `/chN` / `/chN_sub`**，同 `name`。
   /// 非空时 `validate_config` 会补上前导 `/`、并保证与别的路由不撞。
   std::string rtsp_path;
   std::string rtsp_sub_path;
 };
 
-/// 多通道配置。**`items` 为空 = 只有通道 1**，也就是今天的行为。
+/// 多通道配置。**`items` 为空 = 只有通道 1**，也就是默认安装的样子。
 struct ChannelsConfig {
   /// **上限 8**。定这个数不是因为算不过来，而是因为每个通道站一路独立编码器
   /// 加一个 ONVIF 端口：8 路 1080p 已经能把这台机器按住，再多给只是让人
@@ -351,6 +397,19 @@ struct ChannelsConfig {
 
   std::vector<ChannelConfig> items;
 };
+
+/// 由来源种类 + 硬件标识派生一个**稳定**的通道 ID。
+///
+/// `hardware_id` 为空时返回空串（= 还没绑定，由调用方决定怎么显示）。
+/// 结果只取可打印 ASCII，可以直接进 JSON / URL。
+std::string make_channel_id(std::string const& source,
+                            std::string const& hardware_id);
+
+/// 在 `1..N` 之外取最小的空闲通道号（从 2 起）。给"新增一路"用。
+///
+/// **空号会被复用**，这是 NVR 的行为：删掉通道 3 之后再加一路，新通道仍然
+/// 叫 3，而不是永远往后长。已经在用的号不会被动。
+int next_free_channel_number(std::vector<int> const& used);
 
 struct AppConfig {
   CaptureConfig capture;

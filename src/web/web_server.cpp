@@ -1352,6 +1352,94 @@ void WebServer::Impl::register_routes() {
           });
   }
 
+  // GET /api/channels —— 全部通道的**统一视图**（配置 + 运行状态），一次拉取。
+  //
+  // `/ws/stats` 每秒推的是同一份数据，这条是"没有 WS 时也能看"的一次性快照，
+  // 也是"刚打开通道管理页、还没连上 WS"时首屏用的那份。两份来自同一个回调，
+  // 字段集不可能漂移。
+  a.get("/api/channels", [this](uvcpp_web_request&, uvcpp_web_response& resp,
+                                uvcpp_web_next) {
+    uvcpp_json j;
+    if (opt.channels_json) {
+      uvcpp_json arr = uvcpp_json::parse(opt.channels_json(), nullptr, false);
+      j["channels"] = arr.is_discarded() ? uvcpp_json::array() : std::move(arr);
+    } else {
+      j["channels"] = uvcpp_json::array();
+    }
+    send_json(resp, j);
+  });
+
+  // GET /api/channels/:n/snapshot.jpg —— 按通道取一张缩略图。
+  //
+  // 通道列表的"多画面墙"靠它：一次要拿好几路的图，而 `/api/snapshot.jpg`
+  // 只跟"当前预览的那一路"走。鉴权由上面那个中间件统一负责（`/api/` 前缀）。
+  if (opt.channel_snapshot_of) {
+    a.get("/api/channels/:n/snapshot.jpg",
+          [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                 uvcpp_web_next) {
+            std::string const* ns = req.param("n");
+            int n = 0;
+            if (ns != nullptr) {
+              try {
+                n = std::stoi(*ns);
+              } catch (...) {
+                n = 0;
+              }
+            }
+            if (n < 1) {
+              resp.status(400).text("通道号必须是一个正整数。").end();
+              return;
+            }
+            auto frame = opt.channel_snapshot_of(n);
+            if (!frame || frame->width <= 0 || frame->height <= 0) {
+              // **404 是准确的**：这一路现在没有帧（关着 / 还没起来）。
+              // 前端据此显示"无信号"，而不是一张破图。
+              resp.status(404).text("这一路现在没有画面。").end();
+              return;
+            }
+            // 复用同一个 `MjpegEncoder`：它在一条循环线程上被串行调用，
+            // 不需要为缩略图再造一个编码器。分辨率变了就重建（同快照那条路）。
+            if (!mjpeg.ready() || mjpeg.width() != frame->width ||
+                mjpeg.height() != frame->height) {
+              if (!mjpeg.init(frame->width, frame->height)) {
+                resp.status(500).text("缩略图编码器初始化失败。").end();
+                return;
+              }
+            }
+            std::string const jpg = mjpeg.encode(frame->pixels.data(), frame->stride);
+            if (jpg.empty()) {
+              resp.status(500).text("缩略图编码失败。").end();
+              return;
+            }
+            resp.status(200);
+            resp.set_content_type("image/jpeg");
+            resp.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+            resp.body(jpg);
+            resp.end();
+          });
+  }
+
+  // GET /api/logs?lines=N —— 调试日志尾部（异常/告警页）。
+  if (opt.log_tail) {
+    a.get("/api/logs", [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                              uvcpp_web_next) {
+      int lines = 300;
+      if (std::string const* q = req.query("lines")) {
+        try {
+          lines = std::stoi(*q);
+        } catch (...) {
+          lines = 300;
+        }
+      }
+      if (lines < 1) lines = 1;
+      if (lines > 2000) lines = 2000;
+      uvcpp_json j = uvcpp_json::parse(opt.log_tail(lines), nullptr, false);
+      if (j.is_discarded() || !j.is_object()) j = uvcpp_json::object();
+      if (!j.contains("lines")) j["lines"] = uvcpp_json::array();
+      send_json(resp, j);
+    });
+  }
+
   // WS /ws/preview —— fMP4 分片，给浏览器的 MSE 播。
   //
   // **无条件注册**，不像快照那样看回调在不在：这条通道的数据来源是采集会话，
