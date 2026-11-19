@@ -220,8 +220,21 @@ export interface Stats {
 
 /** `Stats.channels` 里的一行 = 一路通道此刻的样子。 */
 export interface ChannelStat {
-  /** 从 1 起。**1 = 主屏那一路**，它由顶层 `capture.*` 描述 */
+  /** 从 1 起。**1 = 本机桌面那一路**，它由顶层 `capture.*` 描述 */
   index: number
+  /**
+   * 稳定通道号（与 `index` 相同）。**删除别的通道不会改变它** —— 端口
+   * `web.port + number`、RTSP 路径、NVR 书签都挂在这个数上。
+   */
+  number?: number
+  /** 稳定通道 ID（由来源硬件派生）。界面上「通道详情」第一行显示它 */
+  id?: string
+  /** 绑定的来源硬件标识（USB 符号链接 / 显示器设备名） */
+  hardware_id?: string
+  /** 硬件序列号。空串 = 设备没提供（显示「未提供」，不要编） */
+  hardware_serial?: string
+  /** 这一路是否启用（关掉的也占号） */
+  enabled?: boolean
   /** 显示名，如「通道 1」「显示器 #2」。后端已经拼好，前端直接显示 */
   name: string
   /** `display` / `webcam` */
@@ -253,6 +266,27 @@ export interface ChannelStat {
   web_port: number
   /** 主码流的 RTSP 路径，**带前导斜杠**（`/live`、`/ch2`）。空串 = 没开 RTSP */
   rtsp_path: string
+  /** 子码流的 RTSP 路径，带前导斜杠 */
+  rtsp_sub_path?: string
+  /** 目标参数（不是实测值）。实测 fps 在上面的 `fps` 字段里 */
+  target_fps?: number
+  target_bitrate_kbps?: number
+  max_height?: number
+  quality?: string
+  latency?: string
+  gop_seconds?: number
+  threads?: number
+  sub_enabled?: boolean
+  sub_height?: number
+  sub_bitrate_kbps?: number
+}
+
+/** `GET /api/logs` 的响应：调试日志尾部。 */
+export interface LogTail {
+  /** 日志文件路径。空串 = 这个跑法没有落盘日志（裸形态） */
+  path: string
+  /** 最后 N 行，按时间顺序（最老的在前） */
+  lines: string[]
 }
 
 /**
@@ -530,7 +564,23 @@ export interface OsdConfig {
 export interface ChannelConfig {
   /** 关掉的项留在列表里，但这一路不建。**与"删掉这一项"是两回事** */
   enabled: boolean
-  /** 显示名。空 → 后端按序号补「通道 N」 */
+  /**
+   * 稳定通道号（2 起）。**0 = 让后端分配**（新加一路时用这个）。
+   *
+   * 分配之后它不随数组顺序变：删掉通道 3 不会让通道 4 变成 3 —— 端口、默认
+   * RTSP 路径、NVR 书签都挂在这个数上。
+   */
+  number?: number
+  /** 稳定通道 ID，由来源硬件派生。只读（新增时后端生成） */
+  id?: string
+  /**
+   * 绑定的来源硬件标识。添加通道时从 `/api/sources` 里取，运行期用它判断
+   * "绑定的那台设备还在不在"；掉线时这一路显示「无信号」并等待重连。
+   */
+  hardware_id?: string
+  /** 给人看的硬件序列号（USB 摄像头序列号 / 本机 BIOS 序列号）。空 = 未提供 */
+  hardware_serial?: string
+  /** 显示名。空 → 后端按通道号补「通道 N」 */
   name: string
   /** `display` = 抓一块屏；`webcam` = 抓本机摄像头。决定另外两个字段哪个有用 */
   source: string
@@ -549,9 +599,17 @@ export interface ChannelConfig {
   bitrate_kbps: number
   /** 0 = 源的原生尺寸（不缩放） */
   max_height: number
+  /** 延时档位标签（`latency_tiers` 里的 key，或 `custom`）。每通道独立 */
+  latency?: string
+  /** 关键帧间隔（秒）。档位不是 custom 时由档位覆盖 */
+  gop_seconds?: number
+  /** 编码线程数。档位不是 custom 时由档位覆盖；0 = 自动 */
+  threads?: number
   sub_enabled: boolean
   sub_height: number
   sub_bitrate_kbps: number
+  /** 这一路自己的水印（通道 1 用顶层 `osd`，这里只对通道 2 起有意义） */
+  osd?: OsdConfig
   /** 空 → 后端补 `/chN` */
   rtsp_path: string
   /** 空 → 后端补 `/chN_sub` */
@@ -608,6 +666,14 @@ export interface TimeConfig {
   offset_s: number
 }
 
+/** 审计/调试日志的留存策略。后端 `LogConfig`。 */
+export interface LogConfig {
+  /** 关掉之后一行审计都不写（`--no-audit`）。 */
+  audit: boolean
+  /** 审计留存天数。**0 = 永不剪枝**（不是"不记"）。 */
+  audit_keep_days: number
+}
+
 export interface AppConfig {
   capture: CaptureConfig
   rtsp: RtspConfig
@@ -617,6 +683,7 @@ export interface AppConfig {
   osd: OsdConfig
   adaptive: AdaptiveConfig
   time: TimeConfig
+  log: LogConfig
   /**
    * 通道 2 起。**`items` 为空时这个键整个不存在**（见 `ChannelsConfig`）。
    *
@@ -919,6 +986,10 @@ export interface SourceDisplay {
    * 把这一项标出来并挡住 —— 否则用户加了一路，得到的是黑屏。
    */
   capturable: boolean
+  /** 稳定的来源硬件标识（添加通道时写进 `hardware_id`） */
+  hardware_id?: string
+  /** 显示器序列号（通常为空 —— 不读 EDID，界面上显示「未提供」） */
+  hardware_serial?: string
 }
 
 /** 一台摄像头。后端 `CameraInfo`。 */
@@ -929,6 +1000,10 @@ export interface SourceCamera {
   name: string
   /** 第一台。`--camera` 不带值时开的就是它，`ChannelConfig.camera` 留空也选它 */
   is_default: boolean
+  /** 稳定的来源硬件标识（完整符号链接）。添加通道时写进 `hardware_id` */
+  hardware_id?: string
+  /** USB 序列号。空 = 摄像头没暴露序列号（显示「未提供」，不要编） */
+  hardware_serial?: string
 }
 
 /** `GET /api/sources` 的响应。 */

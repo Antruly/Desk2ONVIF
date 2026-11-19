@@ -1,11 +1,16 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Icon from '../components/Icon.vue'
-import { fetchConfig, fetchPreviewChannel, setPreviewChannel } from '../api'
+import {
+  channelSnapshotUrl,
+  fetchConfig,
+  fetchPreviewChannel,
+  setPreviewChannel,
+} from '../api'
 import { useAuth } from '../composables/useAuth'
 import { useStats } from '../composables/useStats'
-import { formatBytes, formatInt } from '../format'
+import { formatInt } from '../format'
 
 /**
  * 浏览器预览：fMP4 over WebSocket → MediaSource。
@@ -1050,7 +1055,39 @@ let switching = false
  * 数据源是 `/ws/stats` 的 `channels`（后端每秒重拼一次），不是新开一个接口：
  * 那份数组本来就带着 `index` 和 `name`，而它的刷新节奏正好是"通道增删之后一秒内"。
  */
-const channelChoices = computed(() => stats.value.channels ?? [])
+// 关掉的通道不进预览墙：`preview_hub.has()` 对它返回 false，点过去只会得到
+// 一条"切不到通道 N"的报错。它们仍然在「通道管理」里显示成"已关闭"。
+const channelChoices = computed(() =>
+  (stats.value.channels ?? [])
+    .filter((c) => c.enabled !== false)
+    // 按通道号排：后端数组是配置顺序，新加的一路可能拿到更小的空号。
+    .sort((a, b) => (a.number ?? a.index) - (b.number ?? b.index)),
+)
+
+/** 当前这一路自己的统计。`stats.value.effective_fps` 是**通道 1** 的。 */
+const activeRow = computed(() =>
+  channelChoices.value.find((c) => (c.number ?? c.index) === activeChannel.value),
+)
+
+/**
+ * 缩略图墙：NVR 式的"这几路现在都长什么样"。
+ *
+ * 每 4 秒换一次 URL 里的时间戳（浏览器会缓存 URL 不变的图片）。取不到帧的
+ * 通道用 `@error` 标出来，画成「无画面」—— 那比一张全黑的图准确。
+ */
+const snapTick = ref(0)
+const snapBroken = ref<Record<number, boolean>>({})
+let snapTimer = 0
+
+function snapUrl(n: number): string {
+  return `${channelSnapshotUrl(n)}&v=${snapTick.value}`
+}
+function onSnapLoad(n: number) {
+  if (snapBroken.value[n]) snapBroken.value = { ...snapBroken.value, [n]: false }
+}
+function onSnapError(n: number) {
+  snapBroken.value = { ...snapBroken.value, [n]: true }
+}
 
 async function switchChannel(n: number) {
   if (n === activeChannel.value || switching) return
@@ -1089,6 +1126,17 @@ async function switchChannel(n: number) {
   if (wasPlaying) start()
 }
 
+// 正在看的那一路被删掉/停用了：自动切到还活着的第一路。不切的话画面会安静
+// 地停住，而界面没有任何一处说"你看的这一路没了"。
+watch(channelChoices, (list) => {
+  if (list.length === 0) return
+  const alive = list.some((c) => (c.number ?? c.index) === activeChannel.value)
+  if (!alive) {
+    const first = list[0].number ?? list[0].index
+    if (first > 0) void switchChannel(first)
+  }
+})
+
 /* --------------------------------------------------------------- 生命周期 */
 
 onMounted(() => {
@@ -1096,6 +1144,12 @@ onMounted(() => {
   // 进页面就开始播：这一页存在的唯一理由就是看画面，让用户先点一下
   // 「开始预览」是纯多余的一步。
   start()
+  snapTimer = window.setInterval(() => {
+    snapTick.value = Date.now()
+    // 同 ChannelsView：被 `v-if` 摘掉的 `<img>` 不会自己重试，所以每拍清一次
+    // 失败标记，让离线的通道在恢复后能重新请求。
+    snapBroken.value = {}
+  }, 4000)
   // 档位那几个数是"这一页怎么播"的参数，不是画面本身，所以**不进 start() 的
   // 关键路径** —— 读不到就按默认档播（旧版本的行为），不能让一次配置请求的
   // 失败把画面挡在门外。
@@ -1111,6 +1165,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stop()
+  if (snapTimer) window.clearInterval(snapTimer)
   document.removeEventListener('fullscreenchange', onFullscreenChange)
 })
 
@@ -1188,10 +1243,10 @@ const firstFrameNote = computed(() => {
 
 <template>
   <div class="page-head">
-    <h1>预览</h1>
+    <h1>实时预览</h1>
     <span class="hint">
-      画面走 WebSocket 上的 fMP4，和 NVR 拉的 RTSP 是两条独立的链路。画面上的
-      「真实延迟」是按墙钟量的端到端值，等于「分片滞后」+「缓冲」两项之和。
+      上排是多画面墙（取缩略图），点一路看这一路的实时画面。预览走 WebSocket 上的
+      fMP4，和 NVR 拉的 RTSP 是两条独立链路；「真实延迟」= 分片滞后 + 缓冲。
     </span>
   </div>
 
@@ -1218,18 +1273,41 @@ const firstFrameNote = computed(() => {
       今天**同口径**。并排会同时跑 N 路解码 + N 条 WS，而那个延迟数字就没法
       归因了 —— 它答的必须是"这一路怎么样"。
     -->
-    <div v-if="channelChoices.length > 1" class="channel-pick">
-      <span class="hint">通道</span>
+    <!--
+      NVR 式的多画面墙：每一路一张缩略图 + 状态。点一张就切到那一路的实时流
+      （同时只看一路，理由见下面 `stage` 的说明：CPU 和「真实延迟」要能归因）。
+    -->
+    <div v-if="channelChoices.length > 0" class="preview-wall">
       <button
         v-for="c in channelChoices"
-        :key="c.index"
-        :class="{ primary: c.index === activeChannel }"
+        :key="c.number ?? c.index"
+        type="button"
+        class="preview-thumb"
+        :class="{ 'is-active': (c.number ?? c.index) === activeChannel }"
         :title="`${c.name}（${c.source === 'webcam' ? '摄像头' : '显示器'}）`"
-        @click="switchChannel(c.index)"
+        @click="switchChannel(c.number ?? c.index)"
       >
-        {{ c.name }}
+        <span class="thumb-media">
+          <img
+            v-if="!snapBroken[c.number ?? c.index] && !c.state.startsWith('无信号')"
+            :src="snapUrl(c.number ?? c.index)"
+            :alt="c.name"
+            loading="lazy"
+            @load="onSnapLoad(c.number ?? c.index)"
+            @error="onSnapError(c.number ?? c.index)"
+          />
+          <span v-else class="no-signal">
+            <Icon name="eye-off" :size="20" />
+            <span>无画面</span>
+          </span>
+          <span class="thumb-no">CH {{ c.number ?? c.index }}</span>
+        </span>
+        <span class="thumb-meta">
+          <strong>{{ c.name }}</strong>
+          <span :class="c.state.startsWith('无信号') ? 'tone-warn' : 'muted'">{{ c.state }}</span>
+        </span>
       </button>
-      <span class="hint">切换会重连一次预览流，黑一下是正常的。</span>
+      <span class="hint wall-hint">点任意一路切过去；切换会重连一次预览流，黑一下是正常的。</span>
     </div>
 
     <div ref="stageRef" class="stage">
@@ -1243,13 +1321,21 @@ const firstFrameNote = computed(() => {
         @loadedmetadata="syncVideoAspect"
       ></video>
 
+      <!-- 来源掉线：采集会话会继续推最后一帧，所以不做这一层的话，
+           画面会停在某个瞬间而播放器一切正常 —— 看起来像"画面卡了"。 -->
+      <div v-if="activeRow?.state.startsWith('无信号')" class="stage-offline">
+        <Icon name="eye-off" :size="28" />
+        <strong>无信号</strong>
+        <span>{{ activeRow?.state }}</span>
+      </div>
+
       <!-- 画面上的实时读数。`pointer-events: none`，不挡点击。 -->
       <div v-if="playerState === 'playing'" class="stage-overlay">
         <span class="chip">
-          <Icon name="activity" :size="12" />{{ stats.effective_fps.toFixed(0) }} fps
+          <Icon name="activity" :size="12" />{{ (activeRow?.fps ?? stats.effective_fps).toFixed(0) }} fps
         </span>
         <span class="chip">
-          <Icon name="zap" :size="12" />{{ formatBytes(stats.bytes) }}
+          <Icon name="zap" :size="12" />{{ formatInt(activeRow?.bitrate_kbps ?? 0) }} kbps
         </span>
         <span class="chip" title="画面落后现实多少秒（按墙钟算，端到端）">
           <Icon name="clock" :size="12" />真实延迟 {{ trueLatencyText }}

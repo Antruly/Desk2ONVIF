@@ -99,6 +99,8 @@ extern "C" {
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <system_error>
@@ -1635,6 +1637,11 @@ struct ExtraChannel {
   /// 这一路录到哪个文件（基准名，分段是它加序号）。空 = 只推流不录。
   std::string record_path;
 
+  /// "这一路该停了"。**只给重试循环看** —— `session->request_stop()` 会被下一趟
+  /// `run()` 的第一句清掉，所以"摄像头没插、正在等"的那段时间里它不是一个
+  /// 可靠的停止信号。`teardown_channels` 先置这一位再 request_stop。
+  std::atomic<bool> stop{false};
+
   // --- 采集线程写、状态那一份读 -----------------------------------------
   //
   // 逐项原子而不是整份加锁：状态是每秒刷新的近似值，拼出"fps 是这一拍、
@@ -1642,6 +1649,9 @@ struct ExtraChannel {
   // 线程持有的锁 —— 那是拿采集的准时性去换一个没人看得出来的精度。
   std::atomic<double> fps{0.0};
   std::atomic<double> bitrate_kbps{0.0};
+  /// 画面来源此刻掉线了没有（见 `SessionStats::source_offline`）。采集线程写、
+  /// 通道 JSON 那一拍读；`build_channels_json` 据此把状态改写成「无信号」。
+  std::atomic<bool> offline{false};
 
   /// 这一路此刻的状态，一句人话（"显示器 #2 抓不到"比"失败"有用得多）。
   ///
@@ -1676,9 +1686,28 @@ struct ChannelBoard {
     std::string record_file;
     /// 通道 1 主码流的 RTSP 路径，**带前导斜杠**（`/live`）。空 = 没开 RTSP。
     ///
-    /// 带斜杠是刻意的：通道 2 起那些自动合成的路径（`/ch2`）都带，两处在界面上
-    /// 拼出来的是同一句话。一边带一边不带的话，`/ws/stats` 里就会有两种写法。
+    /// 带斜杠是刻意的：通道 2 起那些按通道号合成的路径（`/ch2`）都带，
+    /// 两处在界面上拼出来的是同一句话。
     std::string rtsp_path;
+    std::string rtsp_sub_path;
+    /// 稳定 ID 与硬件序列号（本机硬件）。界面上「通道详情」第一行要用。
+    std::string id;
+    std::string hardware_id;
+    std::string hardware_serial;
+    /// 当前**目标**参数（不是实测值；实测 fps 在 `SessionStats` 里）。
+    /// 前端拿它渲染"这一路配的是什么"，与 `/api/status` 里每秒刷新的实测
+    /// 数字分开显示 —— 混在一起会让"配了 30 但只跑 12"看起来像配置没生效。
+    std::string quality = "balanced";
+    std::string latency = "balanced";
+    int fps = 25;
+    int bitrate_kbps = 2048;
+    int max_height = 0;
+    int gop_seconds = 2;
+    int threads = 0;
+    bool sub_enabled = false;
+    int sub_height = 360;
+    int sub_bitrate_kbps = 512;
+    bool enabled = true;
   };
 
   mutable std::mutex mu;
@@ -1825,9 +1854,19 @@ std::string build_channels_json(
   {
     nlohmann::json o;
     o["index"] = 1;
+    o["number"] = 1;
+    o["id"] = info.id;
+    o["hardware_id"] = info.hardware_id;
+    o["hardware_serial"] = info.hardware_serial;
     o["name"] = info.name;
     o["source"] = info.source;
-    o["state"] = info.state;
+    o["enabled"] = info.enabled;
+    // 采集会话自己会重试重建来源（摄像头拔了 / 显示器断电），期间推最后一帧。
+    // 状态不能还写「采集中」—— 用户看到的是一张冻住的图，而界面说一切正常。
+    o["state"] = ch1_stats.source_offline
+                     ? std::string("无信号（等待设备接入）")
+                     : info.state;
+    // **实测值**，每秒刷新；下面那组 `target_*` 才是配置。
     o["fps"] = ch1_stats.effective_fps;
     o["bitrate_kbps"] = bitrate_kbps_of(ch1_stats.bytes, ch1_stats.elapsed_s);
     o["record_file"] = info.record_file;
@@ -1836,15 +1875,37 @@ std::string build_channels_json(
     // 时成立。写成 `base_port + 1` 是个很容易犯、而且看起来很像对的错。
     o["web_port"] = base_port;
     o["rtsp_path"] = info.rtsp_path;
+    o["rtsp_sub_path"] = info.rtsp_sub_path;
+    o["target_fps"] = info.fps;
+    o["target_bitrate_kbps"] = info.bitrate_kbps;
+    o["max_height"] = info.max_height;
+    o["quality"] = info.quality;
+    o["latency"] = info.latency;
+    o["gop_seconds"] = info.gop_seconds;
+    o["threads"] = info.threads;
+    o["sub_enabled"] = info.sub_enabled;
+    o["sub_height"] = info.sub_height;
+    o["sub_bitrate_kbps"] = info.sub_bitrate_kbps;
     arr.push_back(std::move(o));
   }
 
   for (auto const& ch : extras) {
     nlohmann::json o;
     o["index"] = ch->plan.index;
+    o["number"] = ch->plan.index;
+    o["id"] = ch->plan.id;
+    o["hardware_id"] = ch->plan.hardware_id;
+    o["hardware_serial"] = ch->plan.hardware_serial;
     o["name"] = ch->plan.name;
     o["source"] = ch->plan.source;
-    o["state"] = ch->get_state();
+    o["enabled"] = ch->plan.enabled;
+    // 来源掉线时**覆盖**状态文案：采集会话会一直推最后一帧（不是断流），
+    // 而界面上那张冻住的图如果配着「运行中」，用户会以为摄像头是好的。
+    o["state"] = (!ch->plan.enabled)
+                     ? ch->get_state()
+                     : (ch->offline.load(std::memory_order_relaxed)
+                            ? std::string("无信号（等待设备接入）")
+                            : ch->get_state());
     o["fps"] = ch->fps.load(std::memory_order_relaxed);
     o["bitrate_kbps"] = ch->bitrate_kbps.load(std::memory_order_relaxed);
     o["record_file"] = ch->record_path;
@@ -1854,10 +1915,53 @@ std::string build_channels_json(
     // 线程就地补写 `url` 这些字段，而这里跑在通道 1 的采集线程上 —— 跨线程读
     // 另一个会话那个 `std::string` 是真会读到半个字符串的。计划是只读的。
     o["rtsp_path"] = ch->plan.rtsp_path;
+    o["rtsp_sub_path"] = ch->plan.rtsp_sub_path;
+    o["target_fps"] = ch->plan.fps;
+    o["target_bitrate_kbps"] = ch->plan.bitrate_kbps;
+    o["max_height"] = ch->plan.max_height;
+    o["quality"] = ch->plan.quality;
+    o["latency"] = ch->plan.latency;
+    o["gop_seconds"] = ch->plan.gop_seconds;
+    o["threads"] = ch->plan.threads;
+    o["sub_enabled"] = ch->plan.sub_enabled;
+    o["sub_height"] = ch->plan.sub_height;
+    o["sub_bitrate_kbps"] = ch->plan.sub_bitrate_kbps;
     arr.push_back(std::move(o));
   }
 
   return arr.dump();
+}
+
+/// 两份通道配置在**除水印之外**的字段上是否相等。
+///
+/// 用途只有一个：`apply_config` 要判断"这次保存能不能只靠热生效的水印路径
+/// 收尾"。若只有 `osd` 变了，运行侧可以立刻跟上、不必进 pending；若动了编码、
+/// 路径、来源、名字里任何一项，就必须重开管线（那时留给 `POST /api/reload`）。
+///
+/// **字段表必须和 `channels_json_node` 对齐**（加字段时两边一起加）：这里漏一项
+/// 的症状是"改了那一项、界面说已生效、实际没变"。
+bool channel_media_equal(d2o::ChannelConfig const& a,
+                         d2o::ChannelConfig const& b) {
+  return a.enabled == b.enabled && a.number == b.number && a.name == b.name &&
+         a.source == b.source && a.display_index == b.display_index &&
+         a.camera == b.camera && a.quality == b.quality && a.fps == b.fps &&
+         a.bitrate_kbps == b.bitrate_kbps && a.max_height == b.max_height &&
+         a.latency == b.latency && a.gop_seconds == b.gop_seconds &&
+         a.threads == b.threads && a.sub_enabled == b.sub_enabled &&
+         a.sub_height == b.sub_height &&
+         a.sub_bitrate_kbps == b.sub_bitrate_kbps &&
+         a.rtsp_path == b.rtsp_path && a.rtsp_sub_path == b.rtsp_sub_path &&
+         a.hardware_id == b.hardware_id &&
+         a.hardware_serial == b.hardware_serial && a.id == b.id;
+}
+
+bool channels_media_equal(d2o::ChannelsConfig const& a,
+                          d2o::ChannelsConfig const& b) {
+  if (a.items.size() != b.items.size()) return false;
+  for (std::size_t i = 0; i < a.items.size(); ++i) {
+    if (!channel_media_equal(a.items[i], b.items[i])) return false;
+  }
+  return true;
 }
 
 /// 拼出 `/api/sources` 的正文：本机**能当通道来源的东西**。
@@ -1865,9 +1969,10 @@ std::string build_channels_json(
 /// 配置页的「通道」那一段靠它把"还能加什么"摆出来 —— 用户看不到 `--list-displays`
 /// 和 `--list-cameras` 的输出，而那两个命令是**命令行**上的东西，网页上够不着。
 ///
-/// 内容是**启动时算好的快照**（调用方那份 `displays` 就是规划时用的同一份），
-/// 理由写在 `cmd_run` 里那个注释和 `WebOptions::sources_json` 上：探"能不能抓"
-/// 会真的建一个 `IDXGIOutputDuplication`，而一块屏同时只允许一个。
+/// 显示器那份是**启动时算好的快照**（调用方那份 `displays` 就是规划时用的同
+/// 一份），理由写在 `cmd_run` 里那个注释和 `WebOptions::sources_json` 上：探
+/// "能不能抓"会真的建一个 `IDXGIOutputDuplication`，而一块屏同时只允许一个。
+/// 摄像头那份由调用方**每次请求现枚举**（枚举没有副作用，插上就能看到）。
 ///
 /// `cameras` 单独传而不是在这里现枚举，是为了让"枚举失败"这件事**就在调用方
 /// 一眼可见**（它得处理那个 err），而不是藏在一个拼 JSON 的函数里。
@@ -1890,8 +1995,12 @@ std::string build_sources_json(
     // **`capturable:false` 的也要发出去**，不能在这里筛掉：用户在这台机器上
     // 看不到那块屏（向日葵那类间接显示驱动），而 `--list-displays` 里列着它
     // —— 清单里凭空少一项，他只会以为网页坏了。前端拿到 `false` 就把那一项
-    // 显示成"抓不了"并且加不上（自动发现也不会建它，见 channel_plan.h 规则 3）。
+    // 显示成"抓不了"并且加不上（规划层也不会建它，见 channel_plan.h 规则 3）。
     o["capturable"] = d.capturable;
+    // 添加通道时要把这两个写进配置：`hardware_id` 是绑定（设备掉线/重插后
+    // 靠它认回来），`hardware_serial` 只给人看。
+    o["hardware_id"] = d.hardware_id;
+    o["hardware_serial"] = d.hardware_serial;
     out["displays"].push_back(std::move(o));
   }
 
@@ -1903,11 +2012,55 @@ std::string build_sources_json(
     // 第一台是默认的那一台（`--camera` 不带值时用的就是它）。前端据此把它
     // 排在前面并标一下，用户才知道"我不选的话会开哪个"。
     o["is_default"] = cameras[i].is_default;
+    // 硬件绑定：添加通道时写进 `hardware_id` / `hardware_serial`。
+    // `serial` 可能为空（摄像头没暴露序列号）—— 前端显示「未提供」，不要编。
+    o["hardware_id"] = cameras[i].hardware_id;
+    o["hardware_serial"] = cameras[i].serial;
     out["cameras"].push_back(std::move(o));
   }
   // 枚举失败时才带上这句话。**空串不发**：前端判 `sources.camera_error` 非空
   // 就显示一句提示，多一个恒为空的字段只是让前端多一个要判断的东西。
   if (!camera_err.empty()) out["camera_error"] = camera_err;
+  return out.dump();
+}
+
+/// 调试日志尾部，给「异常与告警」页用。
+///
+/// 只返回最后 `lines` 行、且**只读我们自己的那个文件**（`Log::file_path()`）。
+/// 日志文件上限 4 MB（`Log::set_file` 会轮转一份 `.old`），一次读进内存不会
+/// 撑爆 —— 但仍然设了 2000 行的上限，页面上不可能需要更多。
+///
+/// 返回 JSON 文本：`{"path": "...", "lines": [...]}`。日志文件没开/读不到时
+/// `lines` 是空数组、`path` 照发 —— 前端据此说"这台机器没有落盘日志"，
+/// 而不是显示一个空白页。
+std::string build_log_tail(int lines) {
+  if (lines < 1) lines = 1;
+  nlohmann::json out;
+  std::string const path = d2o::Log::file_path();
+  out["path"] = path;
+  out["lines"] = nlohmann::json::array();
+  if (path.empty()) return out.dump();
+
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return out.dump();
+  // 从头读到尾，用一个环形缓冲只留最后 N 行。日志文件的规模由轮转封顶，
+  // 所以这不会成为内存问题。
+  std::vector<std::string> ring;
+  ring.reserve(static_cast<std::size_t>(lines) + 1);
+  std::string line;
+  std::size_t next = 0;
+  while (std::getline(in, line)) {
+    if (ring.size() < static_cast<std::size_t>(lines)) {
+      ring.push_back(line);
+    } else {
+      ring[next] = line;
+      next = (next + 1) % static_cast<std::size_t>(lines);
+    }
+  }
+  // 按时间顺序展开环形缓冲（从最老的那一行开始）。
+  for (std::size_t i = 0; i < ring.size(); ++i) {
+    out["lines"].push_back(ring[(next + i) % ring.size()]);
+  }
   return out.dump();
 }
 
@@ -1968,7 +2121,15 @@ void run_channel_segments(ExtraChannel& ch, int total_seconds,
                           std::chrono::steady_clock::time_point const started) {
   std::string err;
   d2o::SessionOptions seg = ch.opt;
-  for (int round = 0;; ++round) {
+  // `round` 只在**成功重开**（换分辨率）时 +1。摄像头没插导致的"等待设备接入"
+  // 不算一轮 —— 否则拔着摄像头过二十秒就会撞上 `kMaxSegments` 而彻底放弃，
+  /// 而用户要的恰恰是"插回来就自动接上"。
+  int round = 0;
+  for (;;) {
+    if (ch.stop.load(std::memory_order_relaxed)) {
+      ch.set_state("已停止");
+      return;
+    }
     if (round > kMaxSegments) {
       ch.set_state(d2o::fmt("反复重开超过 %d 次，停下", kMaxSegments));
       D2O_ERROR("通道 %u 反复重开超过 %d 次，停下 —— 再开下去就成了反复重建而"
@@ -1997,14 +2158,38 @@ void run_channel_segments(ExtraChannel& ch, int total_seconds,
 
     ch.set_state("运行中");
     d2o::CaptureSession::RunResult const r = ch.session->run(seg, err);
-    if (r == d2o::CaptureSession::RunResult::Restart) continue;
-    if (r == d2o::CaptureSession::RunResult::Failed) {
+    if (r == d2o::CaptureSession::RunResult::Restart) {
+      ++round;
+      continue;
+    }
+    if (r != d2o::CaptureSession::RunResult::Failed) {
+      ch.set_state("已停止");
+      return;
+    }
+
+    // --- 失败：摄像头类来源进入"等待设备接入"，其余照旧停住 ---
+    //
+    // 用户明确要的行为：USB 摄像头拔掉之后**这一路显示无画面、等它插回来**，
+    // 而不是整路失败退出。显示器那条路不在这里无限重试：DXGI 的换分辨率/
+    // 断电恢复是会话内部的 `Restart`，走不到这儿；真走到这儿多半是编码器或
+    // 权限问题，无限重试只会把日志刷满。
+    if (ch.plan.source != "webcam") {
       ch.set_state("失败：" + err);
       D2O_ERROR("通道 %u 停了：%s", ch.plan.index, err.c_str());
-    } else {
-      ch.set_state("已停止");
+      return;
     }
-    return;
+    ch.set_state("无信号（等待摄像头接入）：" + err);
+    D2O_WARN("通道 %u 暂时没有画面：%s —— 每 3 秒重试一次，插回来就自动接上。",
+             ch.plan.index, err.c_str());
+    // 可中断的等待：100 ms 一份，`teardown_channels` 置位之后最多 100 ms 退出。
+    for (int i = 0; i < 30; ++i) {
+      if (ch.stop.load(std::memory_order_relaxed)) {
+        ch.set_state("已停止");
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    // 不 ++round：循环顶部直接再跑一次。
   }
 }
 
@@ -2362,6 +2547,9 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
   // 机器标识在这里取一次、整趟共用：通道 2 起的 UUID 和序列号都由它派生，
   // 而每调一次 `machine_seed()` 就要读一次注册表。
   std::string const machine_seed_value = d2o::machine_seed();
+  // 通道 1（本机桌面）绑定的硬件序列号。取 BIOS 里的那一份；读不到时退回
+  // 由 `machine_seed()` 派生的稳定值 —— 界面上永远不会显示一个空的"本机序列号"。
+  std::string const machine_serial_value = d2o::machine_hardware_serial();
 
   // 本机的显示输出（含"这块屏能不能抓"）。**留在函数级**，因为配置页要它：
   // `/api/sources` 把这份清单发给前端，用户才能看到"能加哪几路"。
@@ -2371,7 +2559,7 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
   // `channel_plan.h` 规则 2）—— 现枚举的话，用户一打开配置页就会让**正在采集
   // 的那一路**失败。所以这里算一次、之后只读。
   std::vector<d2o::ChannelDisplayInfo> displays;
-  std::vector<d2o::ChannelPlan> const channel_plans = [&] {
+  {
     // 探测要真的建一次 D3D 设备 + 一次 DuplicateOutput，所以整个进程只做一次。
     std::vector<d2o::OutputInfo> const outputs = d2o::enumerate_outputs();
     displays.reserve(outputs.size());
@@ -2386,34 +2574,47 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       // 抓不了的屏**一条都不建**（见 channel_plan.h 规则 3）：向日葵那类间接
       // 显示驱动建出来就是一路永远黑屏的通道，而用户会去查摄像头或网络。
       d.capturable = d2o::probe_capturable(outputs[i]).ok;
+      // 绑定用的稳定标识。`device_name` 是 `\\.\DISPLAYn`，同一台机器上跨
+      // 重启通常不变；加上适配器名可以把多显卡上同名的输出分开。
+      d.hardware_id = d2o::fmt("display:%s:%s", outputs[i].device_name.c_str(),
+                               outputs[i].adapter_name.c_str());
+      // 显示器序列号（EDID）**不读**：那条路要 SetupAPI/DDC，而用户能看到的
+      // "这是哪块屏"由描述已经回答得很清楚。留空 → 界面显示「未提供」。
       displays.push_back(std::move(d));
     }
-    return d2o::plan_channels(displays, cfg.channels, opt.source.display_index,
-                              opt.source.kind == "display");
-  }();
+  }
 
-  // 规划结果要**说出来**。哪几路被自动建了出来、名字/端口/路径各是什么，是
-  // "NVR 里怎么加这几路"唯一能当场回答的东西 —— 而"自动发现"这件事在只有
-  // 一块屏的机器上（比如这台）完全不发生，用户无从知道它在别的机器上会做什么。
+  // **每次重开管线都重算**（不再只在启动时算一次）。`POST /api/reload` 之后
+  // 通道的增删和参数改动要真的落到新的一趟里 —— 而端口、UUID、RTSP 路径全都
+  // 从这份计划来。`displays` 仍然是启动时那一次的快照（探测有副作用，见上）。
+  auto compute_channel_plans = [&displays, &opt](d2o::ChannelsConfig const& chans) {
+    return d2o::plan_channels(displays, chans, opt.source.display_index,
+                              opt.source.kind == "display");
+  };
+  std::vector<d2o::ChannelPlan> channel_plans = compute_channel_plans(cfg.channels);
+
+  // 规划结果要**说出来**。哪几路显式配了、名字/端口/路径各是什么，是
+  // "NVR 里怎么加这几路"唯一能当场回答的东西。通道 2 起现在**只来自配置**
+  // （不再自动发现显示器），所以这份清单和界面上「通道管理」是同一份。
   {
     unsigned enabled = 0;
     for (d2o::ChannelPlan const& p : channel_plans) {
       if (p.enabled) ++enabled;
-      // `rtsp_path` **自带前导斜杠**（`validate_config` 补的、自动项合成时
-      // 也是这么写的），所以这里不再加一个 —— 加了会印出 `RTSP //ch2`。
+      // `rtsp_path` **自带前导斜杠**（`validate_config` 补的），所以这里不再
+      // 加一个 —— 加了会印出 `RTSP //ch2`。
       //
-      // "不建"有三种说法，这里分得开：**用户关的**（配置里那个开关）和
+      // "不建"有两种说法，这里分得开：**用户关的**（配置里那个开关）和
       // **建不了的**（同一块屏被占，`blocked_reason` 里写着为什么）。
       // 只印一句"不建"的话，第二种的用户会去配置里找一个明明是开着的开关。
-      std::printf("通道 %u：%s%s%s，ONVIF 端口 %d，RTSP %s\n", p.index,
-                  p.name.c_str(), p.auto_created ? "（自动发现）" : "",
+      std::printf("通道 %u：%s%s，ONVIF 端口 %d，RTSP %s\n", p.index,
+                  p.name.c_str(),
                   p.enabled ? ""
                             : (p.blocked_reason.empty() ? "（配置里关着，不建）"
                                                         : "（建不了，见下）"),
                   cfg.web.port + static_cast<int>(p.index), p.rtsp_path.c_str());
     }
     if (channel_plans.empty()) {
-      std::printf("通道 2 起：没有（只有一块可捕获的屏，配置里也没有 channels.items）。\n");
+      std::printf("通道 2 起：没有（默认只有通道 1；在网页「通道管理」里添加来源）。\n");
     } else {
       std::printf("通道 2 起：共 %zu 路，其中 %u 路启用。\n", channel_plans.size(),
                   enabled);
@@ -2491,6 +2692,9 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
   // 再调就是空转。
   auto const teardown_channels = [&]() {
     for (auto& ch : extra_channels) {
+      // 先置"该停了"，再 request_stop：前者是给"摄像头没插、正在等"的重试
+      // 循环看的（那个循环里 `run()` 没有在跑，request_stop 会被下一趟清掉）。
+      ch->stop.store(true, std::memory_order_relaxed);
       if (ch->session) ch->session->request_stop();
     }
     for (auto& ch : extra_channels) {
@@ -2763,6 +2967,28 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
   d2o::LiveOsd live_osd(opt.osd);
   opt.live_osd = &live_osd;
 
+  /// 通道 2 起**每一路自己的**水印快照。键是**稳定的通道号**（不是数组下标）
+  /// —— 通道号一变，这一路的 `LiveOsd` 就换了对象，而换对象意味着指针悬垂。
+  ///
+  /// 用 `shared_ptr` 而不是 `map<unsigned, LiveOsd>`：`LiveOsd` 不可拷贝，
+  /// 而 `std::map::operator[]` 要求可默认构造 + 可移动；`shared_ptr` 让"取一份
+  /// 指针交给采集线程"和"配置线程原地 `set()`"能同时成立（`set()` 是线程安全的，
+  /// 换对象不是）。
+  ///
+  /// 删除一个通道时**不擦除**这里的条目：这一路可能还有一条正在收尾的采集
+  /// 线程握着它的指针。条目最多 64 个，留着不伤人。
+  std::mutex channel_osd_mu;
+  std::map<unsigned, std::shared_ptr<d2o::LiveOsd>> channel_osd;
+  auto channel_osd_for = [&channel_osd_mu, &channel_osd](
+                             unsigned number,
+                             d2o::OsdConfig const& osd) {
+    std::lock_guard<std::mutex> lk(channel_osd_mu);
+    std::shared_ptr<d2o::LiveOsd>& slot = channel_osd[number];
+    if (!slot) slot = std::make_shared<d2o::LiveOsd>();
+    slot->set(osd);
+    return slot;
+  };
+
   // --- 下面这两个闭包也必须在 `cmd_run` 这一层，和上面那段同一个理由 --------
   //
   // 上面那条规矩（见 1041 行附近）说的是"**变量**"，而这里翻车的是"**闭包对象
@@ -2814,9 +3040,9 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
                        &config_path, &web, &derived_serial, &suggest_mu,
                        &suggest_quality, &cfg_mu,
                        &reload_cfg, &live_osd, &device_state,
-                       &ntp_syncer](d2o::AppConfig next,
-                                    d2o::ConfigApplyResult& out,
-                                    std::string& cerr) {
+                       &channel_osd_for, &ntp_syncer](d2o::AppConfig next,
+                                                      d2o::ConfigApplyResult& out,
+                                                      std::string& cerr) {
     std::vector<std::string> notes;
     d2o::validate_config(next, notes);
 
@@ -2920,6 +3146,23 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     {
       std::lock_guard<std::mutex> lk(run_mu);
       running_cfg.osd = next.osd;
+    }
+
+    // 通道 2 起：每一路自己的水印同样是**热生效**的（和上面通道 1 那三件事
+    // 同构）。采集线程每拍从自己那个 `LiveOsd` 取快照，所以这里 `set()` 之后
+    // 画面下一帧就变，不需要重开管线。
+    //
+    // **不进 pending 的条件**：一次保存里只动了水印，没动编码/路径/来源。
+    // 那种情况下运行侧可以直接跟上（`running_cfg.channels = next.channels`），
+    // 否则 `channels.items` 会一直挂在"需要重启"里，而用户只是拖了一下水印。
+    bool const channels_media_changed =
+        !channels_media_equal(cfg.channels, next.channels);
+    for (auto const& ch : next.channels.items) {
+      channel_osd_for(static_cast<unsigned>(ch.number), ch.osd);
+    }
+    if (!channels_media_changed) {
+      std::lock_guard<std::mutex> lk(run_mu);
+      running_cfg.channels = next.channels;
     }
 
     // 时间设置：**当场生效**（Phase U）。理由与水印那一段**逐条同构**，
@@ -3879,27 +4122,40 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       return session.snapshot();
     };
 
-    // 本机有什么可以当通道 —— 配置页的「通道」那一段要。
+    // **按通道**取帧：通道列表的多画面墙一次要好几路的图。
     //
-    // **显示输出那份是启动时算好的**（`displays` 就在上面），这里只补摄像头：
-    // 枚举摄像头走 Media Foundation，要 `MFStartup`，几十毫秒起步，而
-    // `--no-http` 的那些跑法（录制、只推流）根本没人问这件事 —— 所以它放在
-    // `if (http)` 里面。
+    // 和上面那个的区别只在参数来源：这里不读"现在看哪一路"，而是请求路径
+    // 里点的那个号。号不存在/关着时 `session_of` 返回空 → 404 → 前端显示
+    // "无信号"，这是准确的。
+    wo.channel_snapshot_of = [&session, &preview_hub](int n) {
+      if (n == 1) return session.snapshot();
+      if (auto s = preview_hub.session_of(n)) return s->snapshot();
+      return std::shared_ptr<d2o::BgraFrame const>();
+    };
+
+    // 调试日志尾部（异常/告警页）。
+    wo.log_tail = [](int lines) { return build_log_tail(lines); };
+
+    // 本机有什么可以当通道 —— 「通道管理」的添加对话框要。
+    //
+    // **显示输出那份是启动时算好的**（`displays` 就在上面）：探"这块屏能不能
+    // 抓"要真的建一个 `IDXGIOutputDuplication`，现枚举会让正在采集的那一路
+    // 失败。**摄像头每次请求现枚举**：枚举只是列出设备，不开设备、没有副作用，
+    // 而"刚插上的 USB 摄像头在添加列表里看不到、要重启服务"是用户明确不接受
+    // 的行为。代价是几十毫秒的 MF 初始化，一次设置页请求完全付得起。
     //
     // 枚举失败**不拦启动**：`/api/sources` 回一份带 `camera_error` 的空表，
-    // 配置页显示"这台机器上枚举不出摄像头"并能照常加显示器通道。让整个进程
-    // 因为"网页上看不到摄像头清单"而起不来是荒谬的。
-    {
+    // 页面显示"这台机器上枚举不出摄像头"并能照常加显示器通道。
+    wo.sources_json = [&displays] {
       std::string cam_err;
       std::vector<d2o::CameraInfo> const cams = d2o::enumerate_cameras(&cam_err);
       if (!cam_err.empty()) {
-        D2O_WARN("枚举摄像头失败（%s）—— 配置页的通道那一段列不出摄像头，"
+        D2O_WARN("枚举摄像头失败（%s）—— 添加通道时列不出摄像头，"
                  "显示器通道不受影响。",
                  cam_err.c_str());
       }
-      std::string const sources = build_sources_json(displays, cams, cam_err);
-      wo.sources_json = [sources] { return sources; };
-    }
+      return build_sources_json(displays, cams, cam_err);
+    };
 
     // 预览切到哪一路。**校验在这里**（哪几路真的存在是运行期的事，
     // Web 层手里只有一份字符串），成功之后**重放**那一路的初始化分段和 0 点。
@@ -4160,6 +4416,24 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     }
     d2o::apply_config_to_options(snap, seg);
 
+    // **通道计划每一趟重算。** 这是"改通道参数点击即生效"的关键一半：
+    // `POST /api/config` 只改文件，`POST /api/reload` 让本循环再跑一圈；
+    // 而端口、UUID、RTSP 路径、每路的水印/延时全都从这一份计划来。
+    //
+    // 通道 1 不在计划里（它由 `capture.*` / `rtsp.*` 描述），所以 `seg` 那条
+    // 路照旧。`displays` 仍是启动时的快照 —— 探测会真的建 `IDXGIOutputDuplication`，
+    // 不能在每次重载时重来一遍。
+    std::vector<d2o::ChannelPlan> const channel_plans_now =
+        compute_channel_plans(snap.channels);
+    // 预览切换的可用集合跟着这一趟走：删掉的通道不能还留在下拉里。
+    {
+      std::vector<int> avail{1};
+      for (d2o::ChannelPlan const& p : channel_plans_now) {
+        if (p.enabled) avail.push_back(static_cast<int>(p.index));
+      }
+      preview_hub.set_available(std::move(avail));
+    }
+
     // 运行侧基线**就在这里跟上**：从这一句起，"接下来这一趟要跑的"就是 `seg`。
     //
     // **不能放在 `run()` 返回之后**（最初就是那么写的，实测当场撒了谎）：
@@ -4195,6 +4469,10 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       // 少了这一行，用户点完降档会看到"画质档位：需要重启" —— 而那个档位刚刚
       // 才被完整地应用在这一段上。
       running_cfg.capture.quality = snap.capture.quality;
+      // 通道 2 起的配置也跟上：这一趟的 `channel_plans_now` 就是从 `snap.channels`
+      // 算出来的，管线马上会按它重建。不写这一句的话，`channels.items` 会永远
+      // 挂在 pending 里 —— 用户点了"应用"、流真的重开过，界面却还说"要重启"。
+      running_cfg.channels = snap.channels;
     }
 
     // --- 通道 2 起：这一趟的对象、共享服务器与线程 ------------------------
@@ -4203,7 +4481,7 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     // 时的尺寸上，而通道 1 那条路已经是"换分辨率就整条重建"，通道 2 起没有理由
     // 不一样。代价是这几路的 ONVIF 端点会在重开的那一两秒里断一下（通道 1 的
     // 不会）—— 而那一刻本机所有通道的推流本来就在断，不差这一个。
-    for (d2o::ChannelPlan const& p : channel_plans) {
+    for (d2o::ChannelPlan const& p : channel_plans_now) {
       auto ch = std::make_unique<ExtraChannel>();
       ch->plan = p;
       // 名字的兜底：`validate_config` 会给显式项补上名字，但计划是纯函数，
@@ -4214,6 +4492,9 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       // 这一路就只推流（见 `channel_record_filename`）。
       ch->record_path = channel_record_filename(opt.output_path, p.index);
       ch->opt = d2o::options_for_channel(p, seg, ch->record_path);
+      // 这一路自己的水印快照。`channel_osd_for` 的返回值由 `channel_osd`
+      // 这张表持有（活到进程结束），所以取裸指针交给会话是安全的。
+      ch->opt.live_osd = channel_osd_for(p.index, p.osd).get();
       ch->session = std::make_shared<d2o::CaptureSession>();
       // 登记给 `preview_hub`：`/api/snapshot.jpg` 要按"现在看哪一路"取帧，而
       // 通道 1 的 WebServer 够不着这一路的会话。**无条件登记**（连关着的那几路
@@ -4237,6 +4518,7 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         // 里那条守卫），而"只录不推流"是合法配置。
         ExtraChannel* const c = ch.get();
         ch->session->set_stats_hook([c](d2o::SessionStats const& s) {
+          c->offline.store(s.source_offline, std::memory_order_relaxed);
           c->fps.store(s.effective_fps, std::memory_order_relaxed);
           c->bitrate_kbps.store(
               static_cast<double>(bitrate_kbps_of(s.bytes, s.elapsed_s)),
@@ -4465,7 +4747,9 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         // GetStreamUri 的地址存下来，报 0 毫无意义。
         wo2.onvif.rtsp_port = seg.rtsp.enabled ? seg.rtsp.port : 554;
         wo2.onvif.http_port = wo2.port;   // 真实值由 start() 覆盖
-        wo2.onvif.osd = cfg.osd;
+        // **这一路自己的水印**（不是通道 1 那份）。以前这里是 `cfg.osd`，
+        // 于是 NVR 在通道 2 的 OSD 页面看到并改的是通道 1 的水印。
+        wo2.onvif.osd = ch->plan.osd;
         // 身份：主身份那份原样拿过来，换掉能区分通道的那几样（见
         // `channel_identity`）。NVR 的设备列表里那两台长得一模一样的时候，
         // 用户就是靠型号和序列号把条目和屏幕上的画面对上号的。
@@ -4540,11 +4824,30 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       info.source = opt.source.kind.empty() ? "display" : opt.source.kind;
       info.state = "未启动";
       info.record_file = opt.output_path;
+      // 通道 1 的身份：**本机硬件序列号**。它不随配置变，界面上显示成
+      // 「本机」而通道 2 起显示各自的 USB 序列号。
+      info.hardware_serial = machine_serial_value;
+      info.hardware_id = "machine:" + machine_serial_value;
+      info.id = d2o::make_channel_id("machine", machine_serial_value);
+      // 目标参数取自这一趟的配置快照（`snap`），不是启动时的 `cfg` ——
+      // 用户在网页上点了新的帧率、管线重开之后，这里要跟着变。
+      info.quality = snap.capture.quality;
+      info.latency = snap.capture.latency;
+      info.fps = snap.capture.fps;
+      info.bitrate_kbps = snap.capture.bitrate_kbps;
+      info.max_height = snap.capture.max_height;
+      info.gop_seconds = snap.capture.gop_seconds;
+      info.threads = snap.capture.threads;
+      info.sub_enabled = snap.rtsp.sub_enabled;
+      info.sub_height = snap.rtsp.sub_height;
+      info.sub_bitrate_kbps = snap.rtsp.sub_bitrate_kbps;
+      info.enabled = true;
       // 主码流的路径。取 `opt`（主线程独有、`run()` 改的是它的副本 `seg`），
       // 不取 `seg.rtsp.streams[0]` —— 那个的 `url` 会被采集线程就地补写。
       if (!opt.rtsp.streams.empty()) {
         info.rtsp_path = "/" + opt.rtsp.streams[0].path;
       }
+      info.rtsp_sub_path = snap.rtsp.sub_path;
       ch_board.set_ch1(std::move(info));
     }
 
@@ -4586,6 +4889,26 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     // 因为上面那句 `request_stop()`，这条路上 `res` 通常是 `Finished` —— 也就是
     // 一份完整、带 trailer 的录像，这正是要的效果。理由见循环顶部那一段。
     if (restart_requested.load(std::memory_order_relaxed)) break;
+
+    // 通道 1 用摄像头当来源、而摄像头掉了：**等它插回来**，不要退出进程。
+    // 和通道 2 起那条路同一个行为（见 `run_channel_segments`），区别只是通道 1
+    // 的退出会带走整个进程 —— 那正是最不该发生在"拔了一下 USB 摄像头"时的事。
+    if (res == d2o::CaptureSession::RunResult::Failed &&
+        opt.source.kind == "webcam") {
+      ch_board.set_state("无信号（等待摄像头接入）：" + err);
+      // **顺手把缓存的那一份重拼一次**：接下来这 3 秒里没有统计钩子在跑，
+      // 不重拼的话页面会一直显示上一次的「失败」—— 而它其实正在等设备。
+      ch_board.set_json(build_channels_json(ch_board, extra_channels,
+                                            d2o::SessionStats{}, cfg.web.port));
+      D2O_WARN("通道 1 暂时没有画面：%s —— 每 3 秒重试一次，插回来就自动接上。",
+               err.c_str());
+      for (int i = 0; i < 30; ++i) {
+        if (restart_requested.load(std::memory_order_relaxed)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      if (!restart_requested.load(std::memory_order_relaxed)) continue;
+    }
+
     if (res != d2o::CaptureSession::RunResult::Restart) break;
 
     ++segment;

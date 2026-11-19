@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import Icon from '../components/Icon.vue'
-import { fetchAudit } from '../api'
-import type { AuditEntry, AuditPage } from '../types'
+import { fetchAudit, fetchLogTail } from '../api'
+import type { AuditEntry, AuditPage, LogTail } from '../types'
 import { copyText, formatBytes } from '../format'
 
 /**
@@ -95,7 +95,61 @@ function onQuery(): void {
 
 onMounted(() => {
   void load()
+  void loadLogs()
+  logTimer = window.setInterval(() => {
+    if (tab.value === 'errors' && !logLoading.value) void loadLogs()
+  }, 5000)
 })
+
+onBeforeUnmount(() => {
+  if (logTimer) window.clearInterval(logTimer)
+})
+
+// ---------------------------------------------------------------------------
+// 异常与告警（调试日志尾部）
+// ---------------------------------------------------------------------------
+/**
+ * 第二块：**调试日志**，不是审计。
+ *
+ * 审计回答"谁改了什么"；这一块回答"机器自己出了什么事" —— 打不开摄像头、
+ * DXGI 会话失效、编码器初始化失败，那些不会写进审计，但正是要查的东西。
+ *
+ * 日志文件在 `--console` / `--worker` 才落盘（裸形态只有 stderr），所以这里
+ * 必须能显示"没有落盘日志"，而不是一张空表。
+ */
+const tab = ref<'audit' | 'errors'>('audit')
+const logTail = ref<LogTail | null>(null)
+const logLoading = ref(false)
+const logError = ref('')
+const onlyProblems = ref(true)
+let logTimer = 0
+
+async function loadLogs() {
+  logLoading.value = true
+  logError.value = ''
+  const res = await fetchLogTail(500)
+  logLoading.value = false
+  if (!res.ok) {
+    logError.value = res.error
+    return
+  }
+  logTail.value = res.data
+}
+
+const problemLines = computed(() => {
+  const lines = logTail.value?.lines ?? []
+  if (!onlyProblems.value) return lines
+  // 后端 `level_tag` 给的是定宽的五字符：`WARN `（带一个尾随空格）、`ERROR`。
+  // 所以前缀匹配到 `[WARN` 就够了 —— 写成 `[WARN]` 会一条都匹配不上，而
+  // 表现是"日志页永远说没有告警"，看起来像机器一切正常。
+  return lines.filter((l) => l.includes('[WARN') || l.includes('[ERROR'))
+})
+
+function lineTone(l: string): string {
+  if (l.includes('[ERROR')) return 'tone-bad'
+  if (l.includes('[WARN')) return 'tone-warn'
+  return ''
+}
 
 // ---- 顶部那句留存策略 -------------------------------------------------------
 
@@ -242,16 +296,58 @@ async function onCopy(text: string, key: string): Promise<void> {
 
 <template>
   <div class="page-head">
-    <h1>操作日志</h1>
+    <h1>日志与告警</h1>
     <span class="hint">
-      只读。这里记的是「谁、从哪、改了什么」，以及登录 —— 看页面、看快照这类
-      <strong>查看</strong>操作不记。
+      审计回答「谁改了什么」；异常日志回答「机器自己出了什么事」。
     </span>
-    <button :disabled="loading" @click="load()">
+    <button v-if="tab === 'audit'" :disabled="loading" @click="load()">
       <Icon name="refresh" :size="14" />{{ loading ? '读取中…' : '刷新' }}
+    </button>
+    <button v-else :disabled="logLoading" @click="loadLogs()">
+      <Icon name="refresh" :size="14" />{{ logLoading ? '读取中…' : '刷新' }}
     </button>
   </div>
 
+  <div class="seg-tabs wide">
+    <button type="button" :class="{ 'is-on': tab === 'audit' }" @click="tab = 'audit'">
+      <Icon name="list" :size="15" />操作审计
+    </button>
+    <button type="button" :class="{ 'is-on': tab === 'errors' }" @click="tab = 'errors'">
+      <Icon name="alert" :size="15" />异常与告警
+    </button>
+  </div>
+
+  <div v-if="tab === 'errors'">
+    <div v-if="logError" class="banner is-err">
+      <strong>读不到调试日志。</strong>{{ logError }}
+    </div>
+    <div v-else-if="logTail && !logTail.path" class="banner is-warn">
+      这个跑法不落盘调试日志（裸形态只往 stderr 写）。用控制台/服务形态启动，
+      或者从启动它的终端里看输出。
+    </div>
+
+    <div class="card">
+      <div class="row wrap">
+        <label class="toggle">
+          <input v-model="onlyProblems" type="checkbox" />
+          <span>只看告警与错误</span>
+        </label>
+        <span class="hint">
+          文件：<code>{{ logTail?.path || '（无）' }}</code> · 每 5 秒自动刷新
+        </span>
+      </div>
+
+      <p v-if="logLoading && !logTail" class="hint">正在读取…</p>
+      <p v-else-if="problemLines.length === 0" class="hint">
+        {{ onlyProblems ? '最近 500 行里没有告警或错误。' : '日志是空的。' }}
+      </p>
+      <div v-else class="log-lines">
+        <code v-for="(l, i) in problemLines" :key="i" :class="lineTone(l)">{{ l }}</code>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="tab === 'audit'">
   <!-- 连不上后端 / 500：与「日志里没有记录」是两回事，所以单独一块。 -->
   <div v-if="loadError" class="banner is-err">
     读不到操作日志（{{ loadError }}）。
@@ -413,5 +509,6 @@ async function onCopy(text: string, key: string): Promise<void> {
         </p>
       </template>
     </template>
+  </div>
   </div>
 </template>

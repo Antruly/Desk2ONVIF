@@ -5,7 +5,6 @@ import Icon from './components/Icon.vue'
 import TechBackground from './components/TechBackground.vue'
 import { useAuth } from './composables/useAuth'
 import { useStats } from './composables/useStats'
-import { scrollToHash } from './scroll'
 import type { IconName } from './icons'
 
 const route = useRoute()
@@ -16,7 +15,7 @@ const { stats, state, startStats, stopStats } = useStats()
 interface MenuItem {
   /** 菜单上显示的字 */
   label: string
-  /** 目标路由。带 `#` 的是**同一个页面**的段落（配置页那几个子项） */
+  /** 目标路由。每一项都是**独立的页面**（旧版那套 `#` 锚点已经拆掉了） */
   to: string
   icon: IconName
 }
@@ -56,72 +55,46 @@ const MENU_GROUPS: MenuGroup[] = [
   {
     title: '监控',
     items: [
-      { label: '预览', to: '/', icon: 'eye' },
-      { label: '实时状态', to: '/status', icon: 'activity' },
+      { label: '实时预览', to: '/', icon: 'eye' },
+      // 「通道管理」是新的主入口：有哪几路、加一路、删一路、点进某一路。
+      { label: '通道管理', to: '/channels', icon: 'camera' },
+      { label: '运行状态', to: '/status', icon: 'activity' },
     ],
   },
   {
-    title: '配置',
+    title: '设置',
     items: [
-      { label: '图像设置', to: '/config#video', icon: 'monitor' },
-      // 「通道」紧挨着「图像设置」：它管的正是"图像设置那一路之外还有几路"，
-      // 两者分开放在菜单两头时，用户会以为多通道是另一个功能而不是同一条管线的复制。
-      // 图标用 `camera`（和「检测到的源」里摄像头那一行同一个），不复用 `monitor`
-      // —— 收起侧栏之后两个 `monitor` 就完全分不出谁是谁了。
-      { label: '通道', to: '/config#channels', icon: 'camera' },
-      { label: '水印 OSD', to: '/config#osd', icon: 'image' },
-      // 「音视频」这一行和 `ConfigView.vue` 里 `id="audio"` 那个段落是**同一次
-      // 改动里一起进来的**：菜单行指向一个不存在的锚点，点下去就是"什么都没发生"
-      // —— 而它和"这一段没做"在界面上长得一模一样。
-      { label: '音视频', to: '/config#audio', icon: 'volume' },
-      // 「时间设置」单独一项、不并进「系统设置」：它管的不是一个开关，而是
-      // **画面上的时间**（水印和 ONVIF 报出去的那个），与 NVR 对时、取证对账
-      // 直接相关 —— 这跟端口、口令那一类"系统设置"不是同一件事。
-      { label: '时间设置', to: '/config#time', icon: 'clock' },
-      { label: 'ONVIF 设置', to: '/config#onvif', icon: 'shield' },
-      { label: '系统设置', to: '/config#system', icon: 'sliders' },
+      // 这四项各自是**独立页面**，不再挤在一条长页面里滚动。
+      { label: '系统设置', to: '/settings/system', icon: 'sliders' },
+      { label: 'ONVIF 设置', to: '/settings/onvif', icon: 'shield' },
+      { label: '音频设置', to: '/settings/audio', icon: 'volume' },
+      { label: '时间设置', to: '/settings/time', icon: 'clock' },
     ],
   },
   {
-    // 「设备」和「配置」分开，是用户点名要的三分法（系统设置 / ONVIF 设置 /
-    // 设备信息）里最后那一项：**这一组只有只读的东西**，所以它不属于"配置"。
-    title: '设备',
+    // 只读的两项。放进「设置」组会让人以为点进去能改什么。
+    title: '运维',
     items: [
+      { label: '日志与告警', to: '/logs', icon: 'list' },
       { label: '设备信息', to: '/info', icon: 'info' },
-      // 操作日志也归「设备」：它和设备信息一样是**只读**的，而且问的是
-      // 同一类问题（"这台设备身上发生过什么"）。放进「配置」组会让人以为
-      // 点进去能改什么。
-      { label: '操作日志', to: '/logs', icon: 'list' },
     ],
   },
 ]
 
-/** 当前地址的"路径 + 锚点"。锚点为空时就是路径本身。 */
-const here = computed(() => route.path + route.hash)
-
 /**
- * 高亮哪一项 —— **自己算，不用 RouterLink 的 `router-link-active`**。
+ * 高亮哪一项。**前缀匹配而不是全等**：`/channels/2`（某一路的详情）应当让
+ * 「通道管理」保持高亮 —— 全等匹配的话，点进详情之后整个侧栏一个亮的都没有，
+ * 看起来像"当前页不属于任何一块"。
  *
- * 原因是配置页那三个子项指向同一个 path：`router-link-active`（以及不少版本的
- * `router-link-exact-active`）只比到 path 这一层，于是在 `/config#system` 上
- * 「图像设置」「ONVIF 设置」「系统设置」会**同时**高亮 —— 三个都亮等于一个都没指。
- * 这里的判据是路径**加锚点**完全相同。
- *
- * 不带锚点的项按 path 比，且**不比查询串**：登录回跳会带一个 `?next=`，
- * 它不该影响哪一项高亮。
+ * 不比查询串：登录回跳会带一个 `?next=`，它不该影响高亮。
  */
 function isActive(item: MenuItem): boolean {
-  return item.to.includes('#') ? here.value === item.to : route.path === item.to
+  if (item.to === '/') return route.path === '/'
+  return route.path === item.to || route.path.startsWith(item.to + '/')
 }
 
-/**
- * 点的是当前这一项时，vue-router 判为重复导航、什么都不做 —— 而用户那时多半
- * 是把页面滚上去了、想再回到那一段。所以这里自己补一次滚动。
- *
- * 顺带收抽屉：`watch(route.fullPath)` 只对"真的换了地址"生效，重复点击不换地址。
- */
-function onMenuClick(item: MenuItem) {
-  if (item.to.includes('#') && here.value === item.to) scrollToHash(route.hash)
+/** 收抽屉。重复点击当前项不需要任何额外动作（没有锚点要滚了）。 */
+function onMenuClick(_item: MenuItem) {
   drawerOpen.value = false
 }
 

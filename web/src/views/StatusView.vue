@@ -421,7 +421,7 @@ function streamLabel(i: number): string {
       （最近一次 NTP 对时：{{ timeLastSyncText }}）
     </span>
     <div class="actions" style="margin-top: 10px">
-      <RouterLink class="btn" to="/config#time">
+      <RouterLink class="btn" to="/settings/time">
         <Icon name="clock" :size="15" />去「时间设置」校准
       </RouterLink>
     </div>

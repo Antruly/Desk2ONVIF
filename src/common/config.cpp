@@ -201,6 +201,57 @@ bool save_config(AppConfig const& c, std::string const& path, std::string& err) 
   }
 }
 
+namespace {
+
+/// 校验一棵 OSD 配置。**顶层与每通道共用**，理由同 `parse_osd_node`：
+/// 两份各写一遍，新字段只会被其中一处校验，而"打错字了却安静地按默认画"
+/// 正是这一整套校验要防的那一类。
+///
+/// `prefix` 进每条 note，用来点名是哪一路的水印。
+void validate_osd(OsdConfig& o, std::string const& prefix,
+                  std::vector<std::string>& notes, bool& changed) {
+  if (o.items.size() > OsdConfig::kMaxItems) {
+    notes.push_back(fmt("%s.items 有 %zu 项，超过上限 %zu 项，多出来的已丢弃",
+                        prefix.c_str(), o.items.size(), OsdConfig::kMaxItems));
+    o.items.resize(OsdConfig::kMaxItems);
+    changed = true;
+  }
+  auto clamp = [&](std::string const& name, int& v, int lo, int hi) {
+    if (v < lo || v > hi) {
+      int const c2 = std::clamp(v, lo, hi);
+      notes.push_back(
+          fmt("%s = %d 超出 [%d, %d]，已夹到 %d", name.c_str(), v, lo, hi, c2));
+      v = c2;
+      changed = true;
+    }
+  };
+  clamp(prefix + ".plate_alpha", o.plate_alpha, 0, 255);
+  for (std::size_t i = 0; i < o.items.size(); ++i) {
+    OsdItemConfig& it = o.items[i];
+    std::string const pre = prefix + ".items[" + std::to_string(i) + "]";
+    clamp(pre + ".x_pct", it.x_pct, 0, 100);
+    clamp(pre + ".y_pct", it.y_pct, 0, 100);
+    clamp(pre + ".font_size", it.font_size, 0, 512);
+    if (it.type != "time" && it.type != "name" && it.type != "text") {
+      notes.push_back(pre + ".type 不认识「" + it.type +
+                      "」，已改成 text（可选：time / name / text）");
+      it.type = "text";
+      changed = true;
+    }
+    if (it.position != "upper_left" && it.position != "upper_right" &&
+        it.position != "lower_left" && it.position != "lower_right" &&
+        it.position != "custom") {
+      notes.push_back(pre + ".position 不认识「" + it.position +
+                      "」，已改成 upper_left（可选：upper_left / upper_right / "
+                      "lower_left / lower_right / custom）");
+      it.position = "upper_left";
+      changed = true;
+    }
+  }
+}
+
+}  // namespace
+
 bool validate_config(AppConfig& c, std::vector<std::string>& notes) {
   bool changed = false;
   auto clamp = [&](char const* name, int& v, int lo, int hi) {
@@ -335,34 +386,7 @@ bool validate_config(AppConfig& c, std::vector<std::string>& notes) {
 
   // OSD 的各项。字符串枚举也要**校验**，理由和 quality 一样：写错了要当场
   // 说，否则水印会安静地按默认位置/默认类型画出来，而配置里写的是别的。
-  if (c.osd.items.size() > OsdConfig::kMaxItems) {
-    notes.push_back(fmt("osd.items 有 %zu 项，超过上限 %zu 项，多出来的已丢弃",
-                        c.osd.items.size(), OsdConfig::kMaxItems));
-    c.osd.items.resize(OsdConfig::kMaxItems);
-    changed = true;
-  }
-  for (std::size_t i = 0; i < c.osd.items.size(); ++i) {
-    OsdItemConfig& it = c.osd.items[i];
-    std::string const pre = fmt("osd.items[%zu]", i);
-    clamp((pre + ".x_pct").c_str(), it.x_pct, 0, 100);
-    clamp((pre + ".y_pct").c_str(), it.y_pct, 0, 100);
-    clamp((pre + ".font_size").c_str(), it.font_size, 0, 512);
-    if (it.type != "time" && it.type != "name" && it.type != "text") {
-      notes.push_back(pre + ".type 不认识「" + it.type +
-                      "」，已改成 text（可选：time / name / text）");
-      it.type = "text";
-      changed = true;
-    }
-    if (it.position != "upper_left" && it.position != "upper_right" &&
-        it.position != "lower_left" && it.position != "lower_right" &&
-        it.position != "custom") {
-      notes.push_back(pre + ".position 不认识「" + it.position +
-                      "」，已改成 upper_left（可选：upper_left / upper_right / "
-                      "lower_left / lower_right / custom）");
-      it.position = "upper_left";
-      changed = true;
-    }
-  }
+  validate_osd(c.osd, "osd", notes, changed);
 
   if (c.rtsp.path.empty() || c.rtsp.path[0] != '/') {
     notes.push_back("rtsp.path 必须以 / 开头，已改成 /" + c.rtsp.path);
@@ -413,6 +437,39 @@ bool validate_config(AppConfig& c, std::vector<std::string>& notes) {
     c.channels.items.resize(ChannelsConfig::kMaxChannels);
     changed = true;
   }
+  // 通道号分配。**必须在补名字/路径之前**：那两个默认值就是按号拼出来的。
+  //
+  // 规则：显式写了且不重复的号原样保留；`0`、越界、重复的都重新分配成
+  // **当前最小的空号**。空号会被复用（删掉 3 再加一路还是 3），这是 NVR 的
+  // 行为 —— 而"永远往后长"会让端口和 `/chN` 一路漂到没人认识的地方。
+  {
+    constexpr int kMaxNumber = 64;   // 端口 = web.port + number，留足余量
+    std::vector<int> used_numbers;
+    for (std::size_t i = 0; i < c.channels.items.size(); ++i) {
+      ChannelConfig& ch = c.channels.items[i];
+      bool const bad =
+          ch.number < 2 || ch.number > kMaxNumber ||
+          std::find(used_numbers.begin(), used_numbers.end(), ch.number) !=
+              used_numbers.end();
+      if (bad) {
+        if (ch.number != 0) {
+          notes.push_back(fmt(
+              "channels.items[%zu].number = %d 无效或与前面重复，已重新分配",
+              i, ch.number));
+          changed = true;
+        }
+        ch.number = 0;
+      } else {
+        used_numbers.push_back(ch.number);
+      }
+    }
+    for (ChannelConfig& ch : c.channels.items) {
+      if (ch.number != 0) continue;
+      ch.number = next_free_channel_number(used_numbers);
+      used_numbers.push_back(ch.number);
+      changed = true;
+    }
+  }
   {
     // 通道 1 的两条路由先占位 —— 撞上它们和撞上别的通道是同一件事：一个路径
     // 只能挂一条流，否则 NVR 拉到的是"碰巧先注册的那一条"，而它看起来完全正常。
@@ -425,14 +482,10 @@ bool validate_config(AppConfig& c, std::vector<std::string>& notes) {
     for (std::size_t i = 0; i < c.channels.items.size(); ++i) {
       ChannelConfig ch = c.channels.items[i];
       std::string const pre = fmt("channels.items[%zu]", i);
-      // 序号 = 在数组里的位置 + 2（通道 1 不是 items 的一项）。
-      //
-      // **去重丢项时不重编号。** 重编号会悄悄改掉后面每一项的默认路径和名字：
-      // 丢掉第 3 项，第 4 项就从 `/ch4` 变成 `/ch3`，而 NVR 上那个书签是按
-      // `/ch4` 存的。保住"通道 N ↔ items[N-2]"这条恒等式，每一条 note 才是
-      // 可执行的（"通道 5 的 rtsp_path 撞了" ⇒ 去看 items[3]）；代价只是
-      // 序号可能出现空档，而空档不伤人。
-      int const no = static_cast<int>(i) + 2;
+      // **序号取 `ch.number`，不再取数组下标 + 2。** 号在上一段已经分配好了，
+      // 删一项不会让后面的通道整体前移 —— 端口、默认路径和 NVR 里存的书签
+      // 全都挂在这个数上。
+      int const no = ch.number;
       if (ch.name.empty()) ch.name = fmt("通道 %d", no);
       if (ch.source != "display" && ch.source != "webcam") {
         notes.push_back(pre + ".source 不认识「" + ch.source +
@@ -512,12 +565,50 @@ bool validate_config(AppConfig& c, std::vector<std::string>& notes) {
         ch.quality = "custom";
         changed = true;
       }
+      // 延时档位。与顶层 `capture.latency` 同构，展开的是另一组字段
+      // （threads / gop_seconds），与画质档位展开的四项没有交集。
+      if (LatencyTier const* t = find_latency_tier(ch.latency)) {
+        auto const snap = [&](char const* fname, int& v, int want) {
+          if (v == want) return;
+          notes.push_back(fmt("%s 的延时档位「%s」把 %s 从 %d 改成 %d",
+                              pre.c_str(), t->label, fname, v, want));
+          v = want;
+          changed = true;
+        };
+        snap("threads", ch.threads, t->threads);
+        snap("gop_seconds", ch.gop_seconds, t->gop_seconds);
+      } else if (ch.latency != "custom") {
+        notes.push_back(pre + ".latency 不认识「" + ch.latency +
+                        "」，已改成 custom（可选：realtime / balanced / quality / "
+                        "custom）");
+        ch.latency = "custom";
+        changed = true;
+      }
       clamp((pre + ".fps").c_str(), ch.fps, 1, 120);
       clamp((pre + ".bitrate_kbps").c_str(), ch.bitrate_kbps, 100, 100000);
       // 0 = 不缩放，同 capture.max_height，所以下界是 0。
       clamp((pre + ".max_height").c_str(), ch.max_height, 0, 4320);
+      clamp((pre + ".gop_seconds").c_str(), ch.gop_seconds, 1, 60);
+      clamp((pre + ".threads").c_str(), ch.threads, 0, 128);
       clamp((pre + ".sub_height").c_str(), ch.sub_height, 120, 2160);
       clamp((pre + ".sub_bitrate_kbps").c_str(), ch.sub_bitrate_kbps, 32, 100000);
+
+      // 这一路自己的水印。校验规则与顶层那份**是同一个函数**，
+      // 所以通道 1 能设的东西、通道 N 也能设，且错法的说法一致。
+      validate_osd(ch.osd, pre + ".osd", notes, changed);
+
+      // 稳定 ID。给老配置（没有 `id`）补一个：优先用绑定的硬件标识，
+      // 没有绑定时退到"来源 + 选择器"。这个值只用于显示与对账，不参与运行。
+      if (ch.id.empty()) {
+        std::string const key =
+            !ch.hardware_id.empty()
+                ? ch.hardware_id
+                : (ch.source == "webcam"
+                       ? (ch.camera.empty() ? std::string("@first") : ch.camera)
+                       : fmt("#%u", ch.display_index));
+        ch.id = make_channel_id(ch.source, key);
+        changed = true;
+      }
       kept.push_back(std::move(ch));
     }
     // 无条件赋值：上面每一项都是在**副本**上改的（名字、路径、展开后的档位、
@@ -570,6 +661,50 @@ json osd_json_node(OsdConfig const& o) {
   };
 }
 
+/// 从一棵 JSON 对象里读 OSD 配置。**顶层 `osd` 和每通道 `osd` 共用这一份**
+/// —— 两份各写一遍的话，加一个水印字段（比如以后的字号单位）只会加到其中一处，
+/// 而症状是"通道 1 的水印能设、通道 2 的这一项永远不生效"。
+///
+/// `prefix` 只进错误消息，用来点名是哪一棵子树（`osd` / `channels.items[3].osd`）。
+bool parse_osd_node(json const& s, OsdConfig& out, std::string const& prefix,
+                    std::string& err) {
+  take(s, "enabled", out.enabled);
+  take(s, "adaptive_color", out.adaptive_color);
+  take(s, "outline", out.outline);
+  take(s, "plate_alpha", out.plate_alpha);
+
+  // `items` 是**整体替换**，不是逐项合并：数组就是列表本身，把新的一项
+  // 并进旧列表会让"删掉了一项"这个操作在 POST 回来之后又冒出来。
+  // 缺这个键时保留原来的列表 —— 老配置文件里没有它。
+  if (auto const ai = s.find("items"); ai != s.end() && !ai->is_null()) {
+    if (!ai->is_array()) {
+      err = prefix + ".items 必须是一个数组。";
+      return false;
+    }
+    std::vector<OsdItemConfig> parsed;
+    for (auto const& e : *ai) {
+      if (!e.is_object()) {
+        err = prefix + ".items 的每一项都必须是一个对象。";
+        return false;
+      }
+      // 每一项**从默认值起**，只覆盖写了的键 —— 和顶层同一套容忍规则。
+      OsdItemConfig one;
+      take(e, "enabled", one.enabled);
+      take(e, "type", one.type);
+      take(e, "text", one.text);
+      take(e, "position", one.position);
+      take(e, "x_pct", one.x_pct);
+      take(e, "y_pct", one.y_pct);
+      take(e, "font_size", one.font_size);
+      take(e, "date_format", one.date_format);
+      take(e, "time_format", one.time_format);
+      parsed.push_back(std::move(one));
+    }
+    out.items = std::move(parsed);
+  }
+  return true;
+}
+
 /// `channels` 那棵子树。**只有这一处构造它**，纪律同 `osd_json_node`：
 /// `config_to_json` 从这里取，而 `diff_config` 又只比 `config_to_json` 的输出，
 /// 于是"落盘的字段清单"和"用来判变没变的字段清单"不可能漂成两份。
@@ -581,6 +716,10 @@ json channels_json_node(ChannelsConfig const& c) {
   for (auto const& ch : c.items) {
     items.push_back(json{
         {"enabled", ch.enabled},
+        {"number", ch.number},
+        {"id", ch.id},
+        {"hardware_id", ch.hardware_id},
+        {"hardware_serial", ch.hardware_serial},
         {"name", ch.name},
         {"source", ch.source},
         {"display_index", ch.display_index},
@@ -589,11 +728,18 @@ json channels_json_node(ChannelsConfig const& c) {
         {"fps", ch.fps},
         {"bitrate_kbps", ch.bitrate_kbps},
         {"max_height", ch.max_height},
+        {"latency", ch.latency},
+        {"gop_seconds", ch.gop_seconds},
+        {"threads", ch.threads},
         {"sub_enabled", ch.sub_enabled},
         {"sub_height", ch.sub_height},
         {"sub_bitrate_kbps", ch.sub_bitrate_kbps},
         {"rtsp_path", ch.rtsp_path},
         {"rtsp_sub_path", ch.rtsp_sub_path},
+        // 每一路自己的水印。放在 items 里面之后，`diff_config` 对整数组
+        // 一次比较，改任何一路的水印都会报一条 `channels.items` —— 和别的
+        // 通道字段同一种粒度，前端不需要为它单开一条路径。
+        {"osd", osd_json_node(ch.osd)},
     });
   }
   return json{{"items", std::move(items)}};
@@ -802,41 +948,7 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
       if (pw != kSecretSentinel) out.onvif.password = pw;
     }
     if (auto const it = j.find("osd"); it != j.end() && it->is_object()) {
-      auto const& s = *it;
-      take(s, "enabled", out.osd.enabled);
-      take(s, "adaptive_color", out.osd.adaptive_color);
-      take(s, "outline", out.osd.outline);
-      take(s, "plate_alpha", out.osd.plate_alpha);
-
-      // `items` 是**整体替换**，不是逐项合并：数组就是列表本身，把新的一项
-      // 并进旧列表会让"删掉了一项"这个操作在 POST 回来之后又冒出来。
-      // 缺这个键时保留默认的两项（时间 + 名称）—— 老配置文件里没有它。
-      if (auto const ai = s.find("items"); ai != s.end() && !ai->is_null()) {
-        if (!ai->is_array()) {
-          err = "osd.items 必须是一个数组。";
-          return false;
-        }
-        std::vector<OsdItemConfig> parsed;
-        for (auto const& e : *ai) {
-          if (!e.is_object()) {
-            err = "osd.items 的每一项都必须是一个对象。";
-            return false;
-          }
-          // 每一项**从默认值起**，只覆盖写了的键 —— 和顶层同一套容忍规则。
-          OsdItemConfig one;
-          take(e, "enabled", one.enabled);
-          take(e, "type", one.type);
-          take(e, "text", one.text);
-          take(e, "position", one.position);
-          take(e, "x_pct", one.x_pct);
-          take(e, "y_pct", one.y_pct);
-          take(e, "font_size", one.font_size);
-          take(e, "date_format", one.date_format);
-          take(e, "time_format", one.time_format);
-          parsed.push_back(std::move(one));
-        }
-        out.osd.items = std::move(parsed);
-      }
+      if (!parse_osd_node(*it, out.osd, "osd", err)) return false;
     }
     if (auto const it = j.find("channels"); it != j.end() && it->is_object()) {
       auto const& s = *it;
@@ -861,6 +973,10 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
           // 全部走默认，并由 validate_config 按序号补出名字和路径。
           ChannelConfig one;
           take(e, "enabled", one.enabled);
+          take(e, "number", one.number);
+          take(e, "id", one.id);
+          take(e, "hardware_id", one.hardware_id);
+          take(e, "hardware_serial", one.hardware_serial);
           take(e, "name", one.name);
           take(e, "source", one.source);
           take(e, "display_index", one.display_index);
@@ -869,11 +985,19 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
           take(e, "fps", one.fps);
           take(e, "bitrate_kbps", one.bitrate_kbps);
           take(e, "max_height", one.max_height);
+          take(e, "latency", one.latency);
+          take(e, "gop_seconds", one.gop_seconds);
+          take(e, "threads", one.threads);
           take(e, "sub_enabled", one.sub_enabled);
           take(e, "sub_height", one.sub_height);
           take(e, "sub_bitrate_kbps", one.sub_bitrate_kbps);
           take(e, "rtsp_path", one.rtsp_path);
           take(e, "rtsp_sub_path", one.rtsp_sub_path);
+          if (auto const oi = e.find("osd"); oi != e.end() && oi->is_object()) {
+            std::string const pre =
+                "channels.items[" + std::to_string(parsed.size()) + "].osd";
+            if (!parse_osd_node(*oi, one.osd, pre, err)) return false;
+          }
           parsed.push_back(std::move(one));
         }
         out.channels.items = std::move(parsed);
@@ -901,6 +1025,43 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
     return false;
   }
   return true;
+}
+
+std::string make_channel_id(std::string const& source,
+                            std::string const& hardware_id) {
+  if (hardware_id.empty()) return {};
+  std::string out = source.empty() ? std::string("src") : source;
+  out += ':';
+  auto const append = [&out](char c) {
+    if (out.size() >= 160) return;
+    out.push_back(c);
+  };
+  bool last_dash = false;
+  for (unsigned char const c : hardware_id) {
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_';
+    if (ok) {
+      append(static_cast<char>(c));
+      last_dash = false;
+      continue;
+    }
+    // 其余可打印字符折成 `-`；连续几个只留一个，免得 ID 里出现 `----`。
+    if (c >= 0x20 && c < 0x7f) {
+      if (!last_dash && !out.empty() && out.back() != ':') {
+        append('-');
+        last_dash = true;
+      }
+    }
+  }
+  while (!out.empty() && out.back() == '-') out.pop_back();
+  return out;
+}
+
+int next_free_channel_number(std::vector<int> const& used) {
+  for (int n = 2; n < 100000; ++n) {
+    if (std::find(used.begin(), used.end(), n) == used.end()) return n;
+  }
+  return 2;
 }
 
 }  // namespace d2o

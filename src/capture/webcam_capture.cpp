@@ -392,6 +392,42 @@ std::string fps_text(unsigned num, unsigned den) {
 // 6. 公开接口
 // ---------------------------------------------------------------------------
 
+/// 符号链接里的**实例段**。
+///
+/// 形如 `\\?\usb#vid_1bcf&pid_2c99&mi_00#<实例>#{guid}\global`：按 `#` 切开，
+/// 第 3 段就是它。`<实例>` 有两种形态：
+///   * 摄像头真带序列号 → 一串厂商序列号；
+///   * 不带（UVC 常见）→ `7&1a2b3c4d&0&0000`，跟着 USB 端口走。
+///
+/// 拿不到（链接形状不认识）时返回空串 —— 调用方据此把 serial 留空。
+std::string link_instance(std::string const& link) {
+  std::string s = link;
+  if (s.rfind("\\\\?\\", 0) == 0) s.erase(0, 4);
+  std::vector<std::string> parts;
+  std::string cur;
+  for (char c : s) {
+    if (c == '#') {
+      parts.push_back(cur);
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  parts.push_back(cur);
+  if (parts.size() < 3) return {};
+  return parts[2];
+}
+
+/// 有真实序列号才返回它。实例段里带 `&` 的是"端口路径"，不是序列号。
+std::string serial_of_link(std::string const& link) {
+  std::string const inst = link_instance(link);
+  if (inst.empty()) return {};
+  if (inst.find('&') != std::string::npos) return {};
+  // 太短的值（`0` / `1`）更像占位，不像序列号。
+  if (inst.size() < 4) return {};
+  return inst;
+}
+
 std::vector<CameraInfo> enumerate_cameras(std::string* err) {
   std::string e;
   std::vector<DeviceEntry> devs = collect_devices(e);
@@ -402,6 +438,8 @@ std::vector<CameraInfo> enumerate_cameras(std::string* err) {
     c.name = devs[i].name;
     c.symbolic_link = devs[i].link;
     c.is_default = (i == 0);
+    c.hardware_id = devs[i].link;
+    c.serial = serial_of_link(devs[i].link);
     out.push_back(std::move(c));
   }
   // 无条件写：成功时 `e` 是空的，这一句就等于**把 err 清掉** —— 调用方复用同一个

@@ -705,6 +705,150 @@ void test_diff() {
             num(static_cast<long long>(d6.size())) + " 条）");
 }
 
+// ---------------------------------------------------------------------------
+// [9] 稳定通道号、通道 ID、每通道水印
+// ---------------------------------------------------------------------------
+void test_stable_numbering_and_identity() {
+  std::printf("\n[9] 稳定编号 / 通道 ID / 每通道水印\n");
+
+  // 9a：老配置（没写 number）按数组顺序补 2、3、4；路径跟着号走。
+  {
+    AppConfig c;
+    c.channels.items.push_back(disp(1));
+    c.channels.items.push_back(disp(2));
+    c.channels.items.push_back(disp(3));
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    check(c.channels.items[0].number == 2 && c.channels.items[1].number == 3 &&
+              c.channels.items[2].number == 4,
+          "没写 number → 补成 2/3/4（实际 " +
+              num(c.channels.items[0].number) + "/" +
+              num(c.channels.items[1].number) + "/" +
+              num(c.channels.items[2].number) + "）");
+    check(c.channels.items[1].rtsp_path == "/ch3",
+          "默认路径按**通道号**补，不是按下标（实际 " +
+              c.channels.items[1].rtsp_path + "）");
+  }
+
+  // 9b：写了的号原样保留，不按数组顺序重排。
+  {
+    AppConfig c;
+    ChannelConfig a = disp(1);
+    a.number = 5;
+    ChannelConfig b = disp(2);
+    b.number = 2;
+    c.channels.items.push_back(a);
+    c.channels.items.push_back(b);
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    check(c.channels.items[0].number == 5 && c.channels.items[1].number == 2,
+          "显式号 5/2 原样保留（实际 " + num(c.channels.items[0].number) +
+              "/" + num(c.channels.items[1].number) + "）");
+    check(c.channels.items[0].rtsp_path == "/ch5" &&
+              c.channels.items[1].rtsp_path == "/ch2",
+          "默认路径按各自的号（实际 " + c.channels.items[0].rtsp_path + " / " +
+              c.channels.items[1].rtsp_path + "）");
+  }
+
+  // 9c：重复号：后一条被重新分配成最小空号（2）。
+  {
+    AppConfig c;
+    ChannelConfig a = disp(1);
+    a.number = 3;
+    ChannelConfig b = disp(2);
+    b.number = 3;
+    c.channels.items.push_back(a);
+    c.channels.items.push_back(b);
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    check(c.channels.items[0].number == 3 && c.channels.items[1].number == 2,
+          "重复的 3 被改成最小空号 2（实际 " + num(c.channels.items[0].number) +
+              "/" + num(c.channels.items[1].number) + "）");
+    check(says(notes, "重复"),
+          "而且有一条 note 说了为什么改号（实际：" + join(notes) + "）");
+  }
+
+  // 9d：删掉中间一项之后，后面的号**不变**（稳定编号的全部意义）。
+  {
+    AppConfig c;
+    ChannelConfig a = disp(1);
+    a.number = 2;
+    ChannelConfig b = disp(2);
+    b.number = 4;
+    c.channels.items.push_back(a);
+    c.channels.items.push_back(b);
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    check(c.channels.items[0].number == 2 && c.channels.items[1].number == 4,
+          "空号 3 不会被后面的通道补上（实际 " +
+              num(c.channels.items[0].number) + "/" +
+              num(c.channels.items[1].number) + "）");
+  }
+
+  // 9e：通道 ID 由绑定硬件派生；往返之后不变。
+  {
+    AppConfig c;
+    ChannelConfig a = disp(1);
+    a.hardware_id = "usb:vid_1bcf&pid_2c99";
+    a.hardware_serial = "SN12345";
+    c.channels.items.push_back(a);
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    check(!c.channels.items[0].id.empty(),
+          "有 hardware_id 时补出稳定 ID（实际 \"" + c.channels.items[0].id + "\"）");
+    check(c.channels.items[0].id.find("display:") == 0,
+          "ID 带来源前缀（实际 \"" + c.channels.items[0].id + "\"）");
+
+    std::string const text = config_to_json(c, /*redact_secrets=*/false);
+    check(text.find("\"number\"") != std::string::npos &&
+              text.find("\"id\"") != std::string::npos &&
+              text.find("\"hardware_serial\"") != std::string::npos,
+          "落盘 JSON 带 number / id / hardware_serial");
+    AppConfig back;
+    std::string err;
+    check(config_from_json(text, back, err), "读回来成功：" + err);
+    check(back.channels.items.size() == 1 &&
+              back.channels.items[0].number == c.channels.items[0].number &&
+              back.channels.items[0].id == c.channels.items[0].id &&
+              back.channels.items[0].hardware_id == "usb:vid_1bcf&pid_2c99" &&
+              back.channels.items[0].hardware_serial == "SN12345",
+          "number / id / hardware_* 往返一致");
+  }
+
+  // 9f：每通道水印是**独立的一份**，往返之后仍是。
+  {
+    AppConfig c;
+    ChannelConfig a = disp(1);
+    a.osd.enabled = false;
+    a.osd.items[0].position = "lower_left";
+    a.osd.items[0].text = "门口";
+    a.osd.items[0].type = "text";
+    c.channels.items.push_back(a);
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    std::string const text = config_to_json(c, false);
+    AppConfig back;
+    std::string err;
+    check(config_from_json(text, back, err), "带水印的通道读回来成功：" + err);
+    check(!back.channels.items[0].osd.enabled &&
+              back.channels.items[0].osd.items[0].position == "lower_left" &&
+              back.channels.items[0].osd.items[0].text == "门口",
+          "通道自己的水印字段往返一致（不是被顶层 osd 覆盖）");
+    check(back.osd.items[0].position != "lower_left" ||
+              back.osd.items[0].text != "门口",
+          "顶层 osd 没有被通道那份改写（两者独立）");
+  }
+
+  // 9g：ID 只留可打印安全字符。
+  {
+    std::string const id = make_channel_id("webcam", "\\\\?\\usb#vid_1&pid_2#SN 3");
+    check(id.find(' ') == std::string::npos && id.find('#') == std::string::npos &&
+              id.find('\\') == std::string::npos,
+          "make_channel_id 把空格 / # / \\ 折成 -（实际 \"" + id + "\"）");
+    check(id.rfind("webcam:", 0) == 0, "带来源前缀（实际 \"" + id + "\"）");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -718,6 +862,7 @@ int main() {
   test_truncate();
   test_bad_shape();
   test_diff();
+  test_stable_numbering_and_identity();
   std::printf("----\n通过 %d 项，失败 %d 项。\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

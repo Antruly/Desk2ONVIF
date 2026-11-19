@@ -709,6 +709,18 @@ SessionOptions options_for_channel(ChannelPlan const& plan,
   o.sub_height = plan.sub_height;
   o.sub_bitrate_kbps = plan.sub_bitrate_kbps;
 
+  // 延时档位：**每通道各管各的**。以前这两个字段从 `base`（通道 1）继承，
+  // 于是"通道 2 选极致低延迟"改的是标签、值还是通道 1 的 —— 和陷阱 27 是
+  // 同一个形状（选项被无声忽略）。
+  o.gop_seconds = plan.gop_seconds;
+  o.threads = plan.threads;
+
+  // 水印：**这一路自己的那一份**。`live_osd` 由调用方在计划建好之后换上
+  // 本通道的 `LiveOsd`（通道 1 用全局那个），这里先给静态兜底值。
+  o.osd = plan.osd;
+  // 水印里的「名称」项用**这一路的名字**，不是通道 1 的设备名。
+  o.osd_name = plan.name;
+
   // **只走通道 1**（见头文件那段）。这是这一份里唯一一个故意不继承的字段。
   o.audio.enabled = false;
 
@@ -1339,7 +1351,9 @@ CaptureSession::RunResult CaptureSession::run(SessionOptions& opt,
         }
       }
     }
-    osd.configure(scaled, opt.device);
+    // 第三项是**这一路自己的名字**：多通道下 `DeviceState` 只有一份（通道 1
+    // 的），不传的话通道 2 的「名称」水印会显示通道 1 的设备名。
+    osd.configure(scaled, opt.device, opt.osd_name);
     cur_osd = src;
   };
   /// 已经装进去的那一份（**只是 live 那条路的记账**）。指针换了就把新的比一次
@@ -1745,6 +1759,9 @@ CaptureSession::RunResult CaptureSession::run(SessionOptions& opt,
       // 填在**这里**而不是等收尾：不填的话，运行期间 `stats()` 里的
       // packets/bytes 一直是 0，Web 上就是"帧率 0、码率 0"而画面明明是通的。
       stats_.elapsed_s = elapsed;
+      // **每一拍都写**：掉线时置 true，重建成功时置回 false。它回答的是
+      // "现在有没有画面来源"，不是"总共掉过几次"（那个是 access_lost）。
+      stats_.source_offline = session_down;
       stats_.packets = pk;
       stats_.keyframes = pipeline.keyframes.load(std::memory_order_relaxed);
       stats_.bytes = by;

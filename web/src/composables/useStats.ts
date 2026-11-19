@@ -132,6 +132,13 @@ function channels(v: unknown): ChannelStat[] {
     const o = (e ?? {}) as Record<string, unknown>
     return {
       index: num(o.index),
+      number: num(o.number) || num(o.index),
+      id: str(o.id),
+      hardware_id: str(o.hardware_id),
+      hardware_serial: str(o.hardware_serial),
+      // **默认 true**：老后端不发这个字段，而"没写"在这里的意思是"能用的
+      // 那几路"，不是"全关着"。
+      enabled: o.enabled !== false,
       name: str(o.name),
       source: str(o.source),
       // **空串兜底成一句人话**，不是什么都不填：状态那一栏是整张表的主干，
@@ -143,6 +150,17 @@ function channels(v: unknown): ChannelStat[] {
       record_bytes: num(o.record_bytes),
       web_port: num(o.web_port),
       rtsp_path: str(o.rtsp_path),
+      rtsp_sub_path: str(o.rtsp_sub_path),
+      target_fps: num(o.target_fps),
+      target_bitrate_kbps: num(o.target_bitrate_kbps),
+      max_height: num(o.max_height),
+      quality: str(o.quality),
+      latency: str(o.latency),
+      gop_seconds: num(o.gop_seconds),
+      threads: num(o.threads),
+      sub_enabled: o.sub_enabled === true,
+      sub_height: num(o.sub_height),
+      sub_bitrate_kbps: num(o.sub_bitrate_kbps),
     }
   })
 }

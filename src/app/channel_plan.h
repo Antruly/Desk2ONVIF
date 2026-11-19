@@ -47,13 +47,26 @@ struct ChannelDisplayInfo {
   /// 探过可捕获性没有。**false 的屏不建通道** —— 向日葵的虚拟屏就是这一类，
   /// 给它建一路的结果是"这个通道永远黑屏"，而用户会去查摄像头或网络。
   bool capturable = false;
+
+  /// 稳定的来源硬件标识（`display:<device_name>` 之类）。添加通道时写进配置。
+  std::string hardware_id;
+  /// 显示器能报出来的序列号（EDID）。**通常为空** —— 不读写屏器 EDID 是有意
+  /// 的取舍，拿 `\\.\DISPLAYn` 当"设备名"已经足够把两块屏分开，而 EDID 那条
+  /// 路要 SetupAPI / DDC，代价与收益不成比例。空的界面上显示「未提供」。
+  std::string hardware_serial;
 };
 
 /// 一个通道的**静态计划**。通道 1 **不在这里** —— 它由顶层 `capture.*` /
 /// `rtsp.*` 描述，代码也在 `cmd_run` 里那条既有路径上（见 main.cpp 的说明）。
 struct ChannelPlan {
   /// 通道号，**2 起**。端口是 `web.port + index`，默认路径是 `/ch<index>`。
+  ///
+  /// 现在它取自 `ChannelConfig::number`（稳定编号），不再是数组下标 + 2。
   unsigned index = 0;
+  /// 稳定通道 ID 与来源硬件标识（见 `ChannelConfig`）。
+  std::string id;
+  std::string hardware_id;
+  std::string hardware_serial;
   std::string name;
   /// `display` | `webcam`。未知取值在配置层已被挡掉（`validate_config`）。
   std::string source = "display";
@@ -65,9 +78,14 @@ struct ChannelPlan {
   int fps = 20;
   int bitrate_kbps = 1024;
   int max_height = 1080;
+  std::string latency = "balanced";
+  int gop_seconds = 2;
+  int threads = 3;
   bool sub_enabled = true;
   int sub_height = 360;
   int sub_bitrate_kbps = 512;
+  /// 这一路自己的水印（通道 1 用顶层 `osd`，不在这里）。
+  OsdConfig osd;
   /// 不含前导斜杠，和 `RtspStreamOptions::path` 一致。
   std::string rtsp_path;
   std::string rtsp_sub_path;
@@ -88,29 +106,28 @@ struct ChannelPlan {
   std::string blocked_reason;
 };
 
-/// 规划出**通道 2 起的全部通道**，顺序即通道号。
+/// 规划出**通道 2 起的全部通道**，顺序即配置里的顺序（不是通道号）。
 ///
-/// @param displays 运行期枚举出来的显示输出（含抓不了的）。
+/// @param displays 运行期枚举出来的显示输出（含抓不了的）。**只用来校验**
+///                 "这一项指向的屏是否存在/可捕获"，不再自动建通道。
 /// @param cfg      配置里的 `channels` 那一棵。
 /// @param channel1_display_index 通道 1 抓的是哪一块屏。
 /// @param channel1_is_display   通道 1 是不是在抓屏（`--camera` 之后它不是）。
 ///
-/// 规则（四条，顺序即优先级）：
-///   1. `items[]` 里每一项都成为一个计划，**通道号 = 下标 + 2**（与
-///      `validate_config` 的 `no = i + 2` 是同一条规则）。**`enabled:false`
-///      的项也占号** —— 否则"勾掉再勾回来"会让后面每一路的端口和路径整体
-///      挪一格，而 NVR 上那个书签是按路径存的。
-///   2. **同一块屏只给一路**：显式项里 `source == "display"` 且那块屏已经被
-///      通道 1（它也在抓屏时）或者**前面某一项**占了的，标记
-///      `blocked_reason` + `enabled = false`，仍然占号。
-///      DXGI 一块输出同时只允许一个 `IDXGIOutputDuplication`，第二个
-///      `DuplicateOutput` 必失败；而**谁先谁后是线程赛跑**（通道 2 的线程先
-///      起、通道 1 的会话后跑），所以不拦的话结果有两种：要么这一路红、要么
-///      **通道 1 红**并带着整个进程退出（`run()` 失败 = 没有通道 1 = 没事可做）。
-///      一个配错的屏号因此有了 50% 的概率把服务弄没，而两种结果都不说原因。
-///   3. 每一块**可捕获**且没被上面任何一项覆盖、也不是通道 1 那块的显示器，
-///      合成一条 `enabled` + 默认档位的计划，号从上面最后一项之后接着排。
-///   4. 抓不了的屏**一条都不建** —— 建了就是一路永远黑屏的通道。
+/// 规则（三条，顺序即优先级）：
+///   1. `items[]` 里每一项都成为一个计划，**通道号取 `ChannelConfig::number`**
+///      （`validate_config` 已分配成稳定编号）。**`enabled:false` 的项也占号**
+///      —— 否则"勾掉再勾回来"会让端口和路径整体挪一格。
+///   2. **同一块屏只给一路**：`source == "display"` 且那块屏已经被通道 1
+///      （它也在抓屏时）或者**前面某一项**占了的，标记 `blocked_reason` +
+///      `enabled = false`，仍然占号。DXGI 一块输出同时只允许一个
+///      `IDXGIOutputDuplication`，第二个必失败，而且谁先谁后是线程赛跑 ——
+///      不拦的话结果要么这一路红、要么通道 1 红并带着整个进程退出。
+///   3. **不再自动发现显示器。** 一台机器默认只有通道 1；别的屏要用户在
+///      「通道管理」里显式添加。自动建通道会让"默认安装只有一个通道"变成
+///      "有几块屏就有几个通道"，而用户从界面上看不出后者是自动发生的。
+///      抓不了的屏在添加那一刻就会被挡住（`blocked_reason`），而不是建出来
+///      一路永远黑屏的通道。
 std::vector<ChannelPlan> plan_channels(
     std::vector<ChannelDisplayInfo> const& displays, ChannelsConfig const& cfg,
     unsigned channel1_display_index, bool channel1_is_display);
