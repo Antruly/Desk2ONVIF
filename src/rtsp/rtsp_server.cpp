@@ -16,10 +16,29 @@
 #include "RTSPServer.hh"
 #include "ServerMediaSession.hh"
 
+#include "liveMedia_version.hh"
+
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <type_traits>
+
+// Live555 在 2026.11.08 改了 `OnDemandServerMediaSubsession` 的两个虚函数：
+//
+//   * `startStream()` 的第 3 个参数多了 `int tcpSocketNum`（RTP-over-TCP 用），
+//     8 个参数变成 9 个；
+//   * `deleteStream()` 的返回类型从 `void` 变成 `Boolean`。
+//
+// 我们覆写这两个函数只为了记"现在有几个观众"以及给队列 arm/disarm，所以两种
+// 签名转发一下就行。**不跟上游版本硬绑**：本机 third_party 里是 2026.09.23
+// （旧签名），CI 每次下载 latest（新签名）——两头都得能编。
+//
+// 阈值取 2026.11.01（1794000000，刚好在 1794096000 = 2026.11.08 之前）：
+// 这一组签名是那一次改的；更早的版本仍是旧签名。
+#if defined(LIVEMEDIA_LIBRARY_VERSION_INT) && \
+    LIVEMEDIA_LIBRARY_VERSION_INT >= 1794000000
+#  define D2O_LIVE555_TCP_SOCKET_STREAM_API 1
+#endif
 
 namespace d2o {
 
@@ -193,6 +212,28 @@ class LiveSubsession : public OnDemandServerMediaSubsession {
         static_cast<unsigned>(pps.size()));
   }
 
+#ifdef D2O_LIVE555_TCP_SOCKET_STREAM_API
+  virtual void startStream(
+      unsigned clientSessionId, void* streamToken, int tcpSocketNum,
+      TaskFunc* rtcpRRHandler, void* rtcpRRHandlerClientData,
+      unsigned short& rtpSeqNum, unsigned& rtpTimestamp,
+      ServerRequestAlternativeByteHandler* serverRequestAlternativeByteHandler,
+      void* serverRequestAlternativeByteHandlerClientData) {
+    OnDemandServerMediaSubsession::startStream(
+        clientSessionId, streamToken, tcpSocketNum, rtcpRRHandler,
+        rtcpRRHandlerClientData, rtpSeqNum, rtpTimestamp,
+        serverRequestAlternativeByteHandler,
+        serverRequestAlternativeByteHandlerClientData);
+    note_client_started();
+  }
+
+  virtual Boolean deleteStream(unsigned clientSessionId, void*& streamToken) {
+    Boolean const ok =
+        OnDemandServerMediaSubsession::deleteStream(clientSessionId, streamToken);
+    note_client_stopped();
+    return ok;
+  }
+#else
   virtual void startStream(
       unsigned clientSessionId, void* streamToken, TaskFunc* rtcpRRHandler,
       void* rtcpRRHandlerClientData, unsigned short& rtpSeqNum,
@@ -203,13 +244,24 @@ class LiveSubsession : public OnDemandServerMediaSubsession {
         clientSessionId, streamToken, rtcpRRHandler, rtcpRRHandlerClientData,
         rtpSeqNum, rtpTimestamp, serverRequestAlternativeByteHandler,
         serverRequestAlternativeByteHandlerClientData);
-    if (clients_) clients_->fetch_add(1, std::memory_order_relaxed);
-    // 有人开始看了：队列开始收数据，并进入"等下一个关键帧"状态。
-    if (queue_) queue_->set_armed(true);
+    note_client_started();
   }
 
   virtual void deleteStream(unsigned clientSessionId, void*& streamToken) {
     OnDemandServerMediaSubsession::deleteStream(clientSessionId, streamToken);
+    note_client_stopped();
+  }
+#endif
+
+ private:
+  /// 一个观众开始/停止看。两种 Live555 签名下面共用这两段逻辑，免得
+  /// 将来只改了一边 —— 那会让"观众数"在新旧版本上表现不一致。
+  void note_client_started() {
+    if (clients_) clients_->fetch_add(1, std::memory_order_relaxed);
+    // 有人开始看了：队列开始收数据，并进入"等下一个关键帧"状态。
+    if (queue_) queue_->set_armed(true);
+  }
+  void note_client_stopped() {
     if (clients_ && clients_->load(std::memory_order_relaxed) > 0) {
       clients_->fetch_sub(1, std::memory_order_relaxed);
     }
@@ -219,7 +271,6 @@ class LiveSubsession : public OnDemandServerMediaSubsession {
     }
   }
 
- private:
   std::shared_ptr<NaluQueue> queue_;
   RtspStreamOptions opt_;
   /// 参数集槽位。**共享**（不是拷贝）：`createNewRTPSink` 每次都要读当期值 ——
@@ -297,6 +348,28 @@ class AudioSubsession : public OnDemandServerMediaSubsession {
         "audio", "AAC-hbr", opt_.config_hex.c_str(), opt_.channels);
   }
 
+#ifdef D2O_LIVE555_TCP_SOCKET_STREAM_API
+  virtual void startStream(
+      unsigned clientSessionId, void* streamToken, int tcpSocketNum,
+      TaskFunc* rtcpRRHandler, void* rtcpRRHandlerClientData,
+      unsigned short& rtpSeqNum, unsigned& rtpTimestamp,
+      ServerRequestAlternativeByteHandler* serverRequestAlternativeByteHandler,
+      void* serverRequestAlternativeByteHandlerClientData) {
+    OnDemandServerMediaSubsession::startStream(
+        clientSessionId, streamToken, tcpSocketNum, rtcpRRHandler,
+        rtcpRRHandlerClientData, rtpSeqNum, rtpTimestamp,
+        serverRequestAlternativeByteHandler,
+        serverRequestAlternativeByteHandlerClientData);
+    note_client_started();
+  }
+
+  virtual Boolean deleteStream(unsigned clientSessionId, void*& streamToken) {
+    Boolean const ok =
+        OnDemandServerMediaSubsession::deleteStream(clientSessionId, streamToken);
+    note_client_stopped();
+    return ok;
+  }
+#else
   virtual void startStream(
       unsigned clientSessionId, void* streamToken, TaskFunc* rtcpRRHandler,
       void* rtcpRRHandlerClientData, unsigned short& rtpSeqNum,
@@ -307,13 +380,22 @@ class AudioSubsession : public OnDemandServerMediaSubsession {
         clientSessionId, streamToken, rtcpRRHandler, rtcpRRHandlerClientData,
         rtpSeqNum, rtpTimestamp, serverRequestAlternativeByteHandler,
         serverRequestAlternativeByteHandlerClientData);
-    if (clients_) clients_->fetch_add(1, std::memory_order_relaxed);
-    // 有人开始看了。音频**没有**"等关键帧"那一步 —— 每个 AU 独立可解。
-    if (queue_) queue_->set_armed(true);
+    note_client_started();
   }
 
   virtual void deleteStream(unsigned clientSessionId, void*& streamToken) {
     OnDemandServerMediaSubsession::deleteStream(clientSessionId, streamToken);
+    note_client_stopped();
+  }
+#endif
+
+ private:
+  void note_client_started() {
+    if (clients_) clients_->fetch_add(1, std::memory_order_relaxed);
+    // 有人开始看了。音频**没有**"等关键帧"那一步 —— 每个 AU 独立可解。
+    if (queue_) queue_->set_armed(true);
+  }
+  void note_client_stopped() {
     if (clients_ && clients_->load(std::memory_order_relaxed) > 0) {
       clients_->fetch_sub(1, std::memory_order_relaxed);
     }
@@ -323,7 +405,6 @@ class AudioSubsession : public OnDemandServerMediaSubsession {
     }
   }
 
- private:
   std::shared_ptr<AuQueue> queue_;
   RtspAudioOptions opt_;
   std::atomic<unsigned>* clients_ = nullptr;
