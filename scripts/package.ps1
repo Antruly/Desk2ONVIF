@@ -149,16 +149,37 @@ if ($NoBuild) {
     Write-Host '  [1/4] 构建后端…'
     $buildArgs = @('-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'build.ps1'))
     if ($Jobs -gt 0) { $buildArgs += @('-Jobs', "$Jobs") }
-    & powershell @buildArgs | Select-Object -Last 3 | ForEach-Object { Write-Host "        $_" }
-    if ($LASTEXITCODE -ne 0 -and $Jobs -le 0) {
+
+    # **构建输出必须留得住。** 以前这里是 `| Select-Object -Last 3`，只把最后
+    # 三行打出来 —— 而 ninja 最后三行恰好是"两条别的文件编完了 + build stopped"，
+    # 真正的 `FAILED: ... error: ...` 在更上面。CI 上因此只能看到"编译失败，
+    # 退出码 1"，没有一行能指向是哪个文件、哪一行。留在变量里，失败时把尾部
+    # 一大截打出来。
+    $buildOut = @()
+    & powershell @buildArgs 2>&1 | Tee-Object -Variable buildOut |
+        Select-Object -Last 3 | ForEach-Object { Write-Host "        $_" }
+    $buildCode = $LASTEXITCODE
+    if ($buildCode -ne 0) {
+        Write-Host '        —— 构建输出（最后 120 行）——' -ForegroundColor Yellow
+        $buildOut | Select-Object -Last 120 | ForEach-Object { Write-Host "        $_" }
+    }
+    if ($buildCode -ne 0 -and $Jobs -le 0) {
         # 见 param 里 -Jobs 那段：全核编译撞提交上限时 cc1plus 会 OOM。那种失败
         # 全核重跑一次大概率还是同样的结果，而错误文本长得像代码有问题 —— 直接
         # 降级到 2 路重建一次，比自己重跑一遍赌内存划算。真·编译错误会原样复现，
         # 所以这个重试不会把真失败盖掉。
         Write-Host '        ↑ 构建失败，按内存不足降级到 -Jobs 2 重试…' -ForegroundColor Yellow
-        & powershell @($buildArgs + @('-Jobs', '2')) | Select-Object -Last 3 | ForEach-Object { Write-Host "        $_" }
+        $retryOut = @()
+        & powershell @($buildArgs + @('-Jobs', '2')) 2>&1 |
+            Tee-Object -Variable retryOut |
+            Select-Object -Last 3 | ForEach-Object { Write-Host "        $_" }
+        $buildCode = $LASTEXITCODE
+        if ($buildCode -ne 0) {
+            Write-Host '        —— 重试输出（最后 120 行）——' -ForegroundColor Yellow
+            $retryOut | Select-Object -Last 120 | ForEach-Object { Write-Host "        $_" }
+        }
     }
-    if ($LASTEXITCODE -ne 0) { throw "后端构建失败（build.ps1 退出码 $LASTEXITCODE）" }
+    if ($buildCode -ne 0) { throw "后端构建失败（build.ps1 退出码 $buildCode）" }
 }
 
 $exePath = Join-Path $bin 'desk2onvif.exe'
