@@ -25,8 +25,8 @@ const form = reactive({
   auth_enabled: true,
   user: 'admin',
   password: '',
-  adaptive_mode: 'throttle',
-  adaptive_min_fps: 5,
+  adaptiveMode: 'throttle',
+  adaptiveMinFps: 5,
   audit: true,
   audit_keep_days: 180,
 })
@@ -44,8 +44,8 @@ function sync() {
   form.auth_enabled = c.web.auth_enabled
   form.user = c.web.user
   form.password = ''
-  form.adaptive_mode = c.adaptive.mode
-  form.adaptive_min_fps = c.adaptive.min_fps
+  form.adaptiveMode = c.adaptive.mode
+  form.adaptiveMinFps = c.adaptive.min_fps
   form.audit = c.log.audit
   form.audit_keep_days = c.log.audit_keep_days
   pending.value = Array.isArray(c.pending) ? c.pending : []
@@ -65,8 +65,8 @@ const dirty = computed(() => {
     form.auth_enabled !== c.web.auth_enabled ||
     form.user !== c.web.user ||
     form.password !== '' ||
-    form.adaptive_mode !== c.adaptive.mode ||
-    form.adaptive_min_fps !== c.adaptive.min_fps ||
+    form.adaptiveMode !== c.adaptive.mode ||
+    form.adaptiveMinFps !== c.adaptive.min_fps ||
     form.audit !== c.log.audit ||
     form.audit_keep_days !== c.log.audit_keep_days
   )
@@ -76,7 +76,7 @@ async function onSave() {
   if (saving.value) return
   for (const [label, v] of [
     ['端口', form.port],
-    ['帧率下限', form.adaptive_min_fps],
+    ['帧率下限', form.adaptiveMinFps],
     ['审计留存天数', form.audit_keep_days],
   ] as const) {
     if (!Number.isFinite(Number(v))) {
@@ -98,7 +98,7 @@ async function onSave() {
   if (form.password) web.password = form.password
   const out = await save({
     web,
-    adaptive: { mode: form.adaptive_mode, min_fps: form.adaptive_min_fps },
+    adaptive: { mode: form.adaptiveMode, min_fps: form.adaptiveMinFps },
     log: { audit: form.audit, audit_keep_days: form.audit_keep_days },
   })
   saving.value = false
@@ -214,7 +214,7 @@ async function onFactoryReset() {
       <div class="field-row">
         <label class="field grow">
           <span>降载模式</span>
-          <select v-model="form.adaptive_mode">
+          <select v-model="form.adaptiveMode">
             <option value="off">不干预</option>
             <option value="throttle">自动丢帧（不够时只提示）</option>
             <option value="auto">自动降档（不用确认）</option>
@@ -222,7 +222,7 @@ async function onFactoryReset() {
         </label>
         <label class="field">
           <span>帧率下限</span>
-          <input v-model.number="form.adaptive_min_fps" type="number" min="1" max="60" />
+          <input v-model.number="form.adaptiveMinFps" type="number" min="1" max="60" />
         </label>
       </div>
       <p class="hint-block">
