@@ -215,3 +215,12 @@ class Runner:
 
     def find(self, root, path):
         return root.find(path, NS)
+
+    def findall(self, root, path):
+        """`ElementTree.findall` 的命名空间版。
+
+        和 `find` 成对：探针里凡是按前缀写路径的地方都该走这两个，免得
+        一半用 `NS`、另一半靠默认命名空间 —— 后者在带前缀的响应上恒为空，
+        而"空列表"和"查询失败"会长得一模一样。
+        """
+        return root.findall(path, NS)

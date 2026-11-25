@@ -2770,6 +2770,396 @@ def main():
                     "只判「发送成功」的话，一个把偏移算错的实现照样绿；"
                     "差 2 秒以内是目标时刻取整到秒带来的，不是错")
 
+    # ---- [14] 设备/网络/系统查询与可安全落盘的设置 ------------------------
+    #
+    # 这一段对应 issue #10b。**每个操作单独判形状**，而不是一句"Profile S
+    # 已支持"盖过去：Get 的判据是"响应元素在正确的命名空间里"，Set 的判据是
+    # "要么真的改了、要么回结构良好的 ter:ActionNotSupported" —— 最不能接受
+    # 的是"回 200 但什么都没做"。
+    print("\n[14] 设备/网络/系统：查询补齐、SetNTP 落盘、危险操作明确拒绝")
+
+    def dev_authed(op_name, inner=""):
+        return soap_authed(DEV, envelope(op_body(op_name, NS["tds"], inner)))
+
+    def expect_ok(st_, data_, op_name, what, media=False):
+        """200 + 正确的响应元素（按服务命名空间）。"""
+        pre = "trt:" if media else "tds:"
+        if not R.check(st_ == 200, f"{what} → HTTP {st_}", data_[:300]):
+            return None
+        root_ = R.strict_xml(data_, what)
+        if root_ is None:
+            return None
+        el = R.find(root_, ".//" + pre + op_name + "Response")
+        R.check(el is not None,
+                f"{what}：响应元素是 {pre[:-1]}:{op_name}Response")
+        return root_
+
+    def expect_not_supported(st_, data_, what, reason_needles=()):
+        """设备不支持这个可选操作：500 + Receiver + ter:ActionNotSupported。"""
+        R.check(st_ == 500, f"{what} → HTTP {st_}（不支持要走 Fault/500）",
+                data_[:300])
+        root_ = R.strict_xml(data_, what)
+        if root_ is None:
+            return
+        code = R.find(root_, ".//soap:Code/soap:Value")
+        got = code.text if code is not None else None
+        R.check(got == "soap:Receiver",
+                f"{what}：顶层码 = {got}（应为 soap:Receiver）")
+        sub = R.find(root_, ".//soap:Code/soap:Subcode/soap:Value")
+        got_sub = sub.text if sub is not None else None
+        R.check(got_sub == "ter:ActionNotSupported",
+                f"{what}：子码 = {got_sub}（应为 ter:ActionNotSupported）")
+        text = R.find(root_, ".//soap:Reason/soap:Text")
+        reason = (text.text or "") if text is not None else ""
+        if reason_needles:
+            low = reason.lower()
+            R.check(any(n.lower() in low for n in reason_needles),
+                    f"{what}：Fault 理由说清了原因（{reason!r}）",
+                    "理由里至少应当出现 " + " / ".join(reason_needles))
+
+    # -- 14a. GetScopes：固定 scope 列表，元素名与命名空间 -----------------
+    st, data = dev_authed("GetScopes")
+    root = expect_ok(st, data, "GetScopes", "GetScopes")
+    scopes = []
+    if root is not None:
+        items = R.findall(root, ".//tds:Scopes")
+        R.check(len(items) > 0, f"GetScopes 报出了 {len(items)} 条 scope")
+        bad = 0
+        for it in items:
+            d = R.find(it, "tt:ScopeDef")
+            i = R.find(it, "tt:ScopeItem")
+            if d is None or i is None or d.text != "Fixed" or not (i.text or ""):
+                bad += 1
+            else:
+                scopes.append(i.text)
+        R.check(bad == 0,
+                "每条都是 <tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef>"
+                "<tt:ScopeItem>…</tt:ScopeItem>",
+                f"{bad} 条形状不对")
+        R.check("onvif://www.onvif.org/type/video_encoder" in scopes,
+                "带 video_encoder 类型 scope（NVR 靠它认出这是摄像机）")
+        R.check("onvif://www.onvif.org/Profile/Streaming" in scopes,
+                "带 Profile/Streaming scope")
+
+    # -- 14b. SetScopes/AddScopes/RemoveScopes：没有存储就明确拒绝 --------
+    # 判据不只是"回 Fault"，还要看**拒绝之后 GetScopes 一个字都没变** ——
+    # 否则一个"先改内存再回 Fault"的实现也能过。
+    before_scopes = list(scopes)
+    for op_name in ("SetScopes", "AddScopes", "RemoveScopes"):
+        st, data = dev_authed(
+            op_name,
+            '<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef>'
+            '<tt:ScopeItem>onvif://www.onvif.org/name/E2E-CHANGED</tt:ScopeItem>'
+            '</tds:Scopes>')
+        expect_not_supported(st, data, op_name, ("scope",))
+    st, data = dev_authed("GetScopes")
+    root = expect_ok(st, data, "GetScopes", "拒绝之后回读 GetScopes")
+    after_scopes = []
+    if root is not None:
+        after_scopes = [(i.text or "") for i in R.findall(root, ".//tds:Scopes/tt:ScopeItem")]
+    if before_scopes:
+        R.check(after_scopes == before_scopes,
+                "三个 Set 都被拒之后，GetScopes 列表原样不变",
+                f"前 {before_scopes}，后 {after_scopes}")
+    else:
+        # 基线都没拿到时，"前后相同"是一条恒真的断言（陷阱 46 的形状）。
+        R.skip("三个 Set 被拒后 GetScopes 原样不变",
+               "14a 的 GetScopes 基线为空/失败，没有可比的对象")
+
+    # -- 14c. GetHostname ---------------------------------------------------
+    st, data = dev_authed("GetHostname")
+    root = expect_ok(st, data, "GetHostname", "GetHostname")
+    host_before = None
+    if root is not None:
+        dhcp = R.find(root, ".//tds:HostnameInformation/tt:FromDHCP")
+        name = R.find(root, ".//tds:HostnameInformation/tt:Name")
+        R.check(dhcp is not None and dhcp.text == "false",
+                f"HostnameInformation/FromDHCP = {dhcp.text if dhcp is not None else None}"
+                "（应从配置来，不是 DHCP）")
+        R.check(name is not None and bool((name.text or "").strip()),
+                f"HostnameInformation/Name = {name.text if name is not None else None!r}",
+                "取不到主机名时应当省掉 Name，但 GetHostname 至少要有 OS 主机名")
+        host_before = (name.text or "") if name is not None else None
+
+    # -- 14d. SetHostname：必须明确拒绝，且不能悄悄改掉 -------------------
+    st, data = dev_authed("SetHostname", "<tds:Name>e2e-should-not-apply</tds:Name>")
+    expect_not_supported(st, data, "SetHostname", ("restart", "system settings"))
+    st, data = dev_authed("GetHostname")
+    root = expect_ok(st, data, "GetHostname", "SetHostname 被拒后回读")
+    if root is not None:
+        name = R.find(root, ".//tds:HostnameInformation/tt:Name")
+        got = (name.text or "") if name is not None else None
+        if host_before:
+            R.check(got == host_before,
+                    f"主机名没有被改掉（仍是 {got!r}）",
+                    "回 Fault 却改了状态，比回成功更难查")
+        else:
+            R.skip("SetHostname 被拒后主机名不变",
+                   "14c 没读到主机名基线，没有可比的对象")
+
+    # -- 14e. GetNetworkProtocols / SetNetworkProtocols --------------------
+    st, data = dev_authed("GetNetworkProtocols")
+    root = expect_ok(st, data, "GetNetworkProtocols", "GetNetworkProtocols")
+    protos = {}
+    if root is not None:
+        for p in R.findall(root, ".//tds:NetworkProtocols"):
+            n = R.find(p, "tt:Name")
+            e = R.find(p, "tt:Enabled")
+            port = R.find(p, "tt:Port")
+            if n is None or e is None or port is None:
+                continue
+            protos[n.text] = (e.text == "true", int(port.text))
+        R.check(set(protos) >= {"HTTP", "RTSP"},
+                f"报出了 HTTP 和 RTSP：{protos}")
+        R.check(protos.get("HTTP", (False, -1))[1] == a.port,
+                f"HTTP 端口 = {protos.get('HTTP', (False, None))[1]}"
+                f"（测试连的就是 {a.port}）")
+
+    def set_network(entries):
+        inner = ""
+        for name, enabled, port in entries:
+            inner += ("<tds:NetworkProtocols><tt:Name>" + name + "</tt:Name>"
+                      "<tt:Enabled>" + ("true" if enabled else "false") +
+                      "</tt:Enabled><tt:Port>" + str(port) +
+                      "</tt:Port></tds:NetworkProtocols>")
+        return dev_authed("SetNetworkProtocols", inner)
+
+    if protos:
+        same = [(n, e, p) for n, (e, p) in protos.items()]
+        st, data = set_network(same)
+        expect_ok(st, data, "SetNetworkProtocols",
+                  "SetNetworkProtocols 送当前这份（应当接受）")
+
+        changed = []
+        for n, e, p in same:
+            changed.append((n, e, p + 1 if n == "HTTP" else p))
+        st, data = set_network(changed)
+        expect_not_supported(st, data, "SetNetworkProtocols（改端口）",
+                             ("restart",))
+
+        st, data = dev_authed("GetNetworkProtocols")
+        root = expect_ok(st, data, "GetNetworkProtocols", "拒绝之后回读")
+        if root is not None:
+            now = {}
+            for p in R.findall(root, ".//tds:NetworkProtocols"):
+                n = R.find(p, "tt:Name")
+                port = R.find(p, "tt:Port")
+                if n is not None and port is not None:
+                    now[n.text] = int(port.text)
+            R.check(now == {n: p for n, (_, p) in protos.items()},
+                    f"协议/端口没有被改掉：{now}")
+
+    # -- 14f. GetNTP / SetNTP：读、落盘、回读、复原 -----------------------
+    def ntp_server(root_):
+        host = R.find(root_, ".//tds:NTPInformation/tt:NTPManual")
+        if host is None:
+            return None
+        for tag in ("DNSname", "IPv4Address", "IPv6Address"):
+            el = R.find(host, "tt:" + tag)
+            if el is not None and (el.text or "").strip():
+                return el.text.strip()
+        return None
+
+    st, data = dev_authed("GetNTP")
+    root = expect_ok(st, data, "GetNTP", "GetNTP")
+    ntp_before = None
+    if root is not None:
+        dhcp = R.find(root, ".//tds:NTPInformation/tt:FromDHCP")
+        R.check(dhcp is not None and dhcp.text == "false",
+                f"NTPInformation/FromDHCP = {dhcp.text if dhcp is not None else None}")
+        ntp_before = ntp_server(root)
+        if ntp_before is not None:
+            host = R.find(root, ".//tds:NTPInformation/tt:NTPManual")
+            typ = R.find(host, "tt:Type") if host is not None else None
+            R.check(typ is not None and typ.text in ("IPv4", "IPv6", "DNS"),
+                    f"NTPManual/Type = {typ.text if typ is not None else None}")
+
+    new_ntp = "ntp-e2e-" + md5(str(a.port))[:8] + ".example"
+    st, data = dev_authed(
+        "SetNTP",
+        '<tds:FromDHCP>false</tds:FromDHCP><tds:NTPManual>'
+        '<tt:Type>DNS</tt:Type><tt:DNSname>' + new_ntp + '</tt:DNSname>'
+        '</tds:NTPManual>')
+    expect_ok(st, data, "SetNTP", f"SetNTP → {new_ntp}")
+
+    st, data = dev_authed("GetNTP")
+    root = expect_ok(st, data, "GetNTP", "SetNTP 之后回读")
+    if root is not None:
+        got = ntp_server(root)
+        R.check(got == new_ntp, f"GetNTP 回读到 {got!r}",
+                "SetNTP 回 200 但 GetNTP 还是旧值 = 改了没生效")
+    cfg_ntp = get_cfg()
+    if cfg_ntp is not None:
+        R.check((cfg_ntp.get("time") or {}).get("ntp_server") == new_ntp,
+                "运行中的 /api/config 也看到了新的 time.ntp_server")
+    if cfg_path:
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            R.check((disk.get("time") or {}).get("ntp_server") == new_ntp,
+                    f"配置文件 {cfg_path} 里也落了盘")
+        except (OSError, ValueError) as e:
+            R.check(False, f"读配置文件 {cfg_path}", e)
+    else:
+        R.skip("SetNTP 落盘到文件",
+               "没给 --config PATH，无法确认磁盘上的那份 —— 明说跳过，不猜路径")
+
+    # 从 DHCP 取 NTP：我们不支持，必须拒绝（不是静默忽略）。
+    st, data = dev_authed("SetNTP", "<tds:FromDHCP>true</tds:FromDHCP>")
+    expect_not_supported(st, data, "SetNTP（FromDHCP=true）", ("dhcp",))
+
+    # 复原。原配置里没有服务器时（manual 模式手工清空过）落到默认值，
+    # 并在输出里说明 —— 不能留下一个测试专用的服务器名。
+    restore_ntp = ntp_before if ntp_before else "ntp.aliyun.com"
+    st, data = dev_authed(
+        "SetNTP",
+        '<tds:FromDHCP>false</tds:FromDHCP><tds:NTPManual>'
+        '<tt:Type>DNS</tt:Type><tt:DNSname>' + restore_ntp + '</tt:DNSname>'
+        '</tds:NTPManual>')
+    expect_ok(st, data, "SetNTP", f"复原 NTP 服务器 → {restore_ntp}")
+    st, data = dev_authed("GetNTP")
+    root = expect_ok(st, data, "GetNTP", "复原之后回读")
+    if root is not None:
+        R.check(ntp_server(root) == restore_ntp,
+                f"GetNTP 复原到了 {restore_ntp!r}")
+
+    # -- 14g. GetSystemLog / GetEndpointReference --------------------------
+    st, data = dev_authed("GetSystemLog", "<tds:LogType>System</tds:LogType>")
+    root = expect_ok(st, data, "GetSystemLog", "GetSystemLog")
+    if root is not None:
+        log = R.find(root, ".//tds:SystemLog/tt:String")
+        R.check(log is not None, "SystemLog/String 存在（空日志也要有元素）")
+        if log is not None:
+            R.check(len(log.text or "") <= 70 * 1024,
+                    f"日志尾巴不超过 70 KB（实际 {len(log.text or '')} 字节）")
+
+    st, data = dev_authed("GetEndpointReference")
+    root = expect_ok(st, data, "GetEndpointReference", "GetEndpointReference")
+    if root is not None:
+        guid = R.find(root, ".//tds:GUID")
+        R.check(guid is not None and (guid.text or "").startswith("urn:uuid:"),
+                f"GUID = {guid.text if guid is not None else None!r}"
+                "（应与 WS-Discovery 的 endpoint reference 同源）")
+
+    # -- 14h. Relay / Digital：没有就回空列表，不是 Fault ------------------
+    for op_name, child in (("GetRelayOutputs", "tds:RelayOutputs"),
+                           ("GetDigitalInputs", "tds:DigitalInputs")):
+        st, data = dev_authed(op_name)
+        root = expect_ok(st, data, op_name, op_name)
+        if root is not None:
+            R.check(R.find(root, ".//" + child) is None,
+                    f"{op_name} 回的是空列表（没有物理 I/O，也不回 Fault）")
+
+    # -- 14i. 危险操作：明确拒绝，且设备确实没重启/没清配置 ----------------
+    info_before, st_info = device_info(a.user, a.password)
+    st, data = dev_authed("SystemReboot")
+    expect_not_supported(st, data, "SystemReboot")
+    st, data = dev_authed("SetSystemFactoryDefault",
+                          "<tds:FactoryDefault>Hard</tds:FactoryDefault>")
+    expect_not_supported(st, data, "SetSystemFactoryDefault")
+    info_after, st_after = device_info(a.user, a.password)
+    R.check(st_after == 200,
+            f"两个危险操作之后设备仍然在线（GetDeviceInformation → {st_after}）",
+            "回 Fault 之后真的重启了的话，这条会连不上")
+    R.check(info_before == info_after,
+            f"设备身份没有被恢复出厂（Model={None if not info_after else info_after.get('Model')}）")
+
+    # -- 14j. GetVideoSourceConfigurationOptions ---------------------------
+    st, data = media_authed(envelope(op_body(
+        "GetVideoSourceConfigurationOptions", NS["trt"])))
+    root = expect_ok(st, data, "GetVideoSourceConfigurationOptions",
+                     "GetVideoSourceConfigurationOptions", media=True)
+    if root is not None:
+        opts = R.find(root, ".//trt:Options")
+        R.check(opts is not None and opts.get("MaximumNumberOfProfiles") is not None,
+                "Options/@MaximumNumberOfProfiles 存在（属性，不是子元素）")
+        for tag in ("XRange", "YRange", "WidthRange", "HeightRange"):
+            el = R.find(root, ".//tt:BoundsRange/tt:" + tag + "/tt:Min")
+            R.check(el is not None,
+                    f"BoundsRange/{tag}/Min 存在")
+        tok = R.find(root, ".//tt:VideoSourceTokensAvailable")
+        R.check(tok is not None and tok.text == "VideoSource",
+                f"VideoSourceTokensAvailable = {tok.text if tok is not None else None}")
+
+    # -- 14k. 音频：未启用回空列表；启用时 AAC 可读、码率可落盘 ------------
+    cfg_a = get_cfg()
+    audio_cfg = (cfg_a or {}).get("audio") or {}
+    audio_on = bool(audio_cfg.get("enabled"))
+    print(f"  （音频 enabled={audio_on}，bitrate={audio_cfg.get('bitrate_kbps')}）")
+
+    for op_name in ("GetAudioSources", "GetAudioSourceConfigurations",
+                    "GetAudioEncoderConfigurations",
+                    "GetAudioEncoderConfigurationOptions"):
+        st, data = media_authed(envelope(op_body(op_name, NS["trt"])))
+        root = expect_ok(st, data, op_name, op_name, media=True)
+        if root is None:
+            continue
+        if audio_on:
+            if op_name == "GetAudioSources":
+                src = R.find(root, ".//trt:AudioSources")
+                R.check(src is not None and src.get("token") == "AudioSource",
+                        f"{op_name} 报出了 AudioSource")
+                ch = R.find(root, ".//trt:AudioSources/tt:Channels")
+                R.check(ch is not None and (ch.text or "").isdigit(),
+                        f"{op_name}：Channels = {ch.text if ch is not None else None}")
+            elif op_name in ("GetAudioSourceConfigurations",
+                             "GetAudioEncoderConfigurations"):
+                conf = R.find(root, ".//trt:Configurations")
+                R.check(conf is not None and conf.get("token"),
+                        f"{op_name} 报出了一份配置")
+            else:
+                enc = R.find(root, ".//trt:Options/tt:Options/tt:Encoding")
+                R.check(enc is not None and enc.text == "AAC",
+                        f"{op_name}：Encoding = {enc.text if enc is not None else None}")
+        else:
+            # 空列表 = 响应元素里没有**列表项**。**不能是 Fault** —— 这台设备
+            # 只是没有音轨，不是"不支持这个操作"。
+            #
+            # GetAudioEncoderConfigurationOptions 的响应里有一个**必填的**
+            # `trt:Options` 包装元素（类型是 tt:AudioEncoderConfigurationOptions），
+            # 空列表的表现是它里面没有 `tt:Options` 项，而不是连包装元素都没有。
+            if op_name == "GetAudioEncoderConfigurationOptions":
+                leftovers = R.findall(root, ".//trt:Options/tt:Options")
+            elif op_name == "GetAudioSources":
+                leftovers = R.findall(root, ".//trt:AudioSources")
+            else:
+                leftovers = R.findall(root, ".//trt:Configurations")
+            R.check(not leftovers,
+                    f"{op_name} 在音频关闭时回空列表（不是 Fault）")
+
+    def set_audio(bitrate, sample=48, encoding="AAC"):
+        inner = ('<Configuration token="AudioEncoderConfig">'
+                 '<Encoding>' + encoding + '</Encoding>'
+                 '<Bitrate>' + str(bitrate) + '</Bitrate>'
+                 '<SampleRate>' + str(sample) + '</SampleRate>'
+                 '</Configuration>')
+        return media_authed(envelope(op_body(
+            "SetAudioEncoderConfiguration", NS["trt"], inner)))
+
+    if not audio_on:
+        st, data = set_audio(64)
+        expect_not_supported(st, data, "SetAudioEncoderConfiguration（音频未启用）",
+                             ("audio",))
+    else:
+        old_br = int(audio_cfg.get("bitrate_kbps") or 64)
+        new_br = 96 if old_br != 96 else 64
+        st, data = set_audio(new_br)
+        expect_ok(st, data, "SetAudioEncoderConfiguration",
+                  f"SetAudioEncoderConfiguration → {new_br} kbps", media=True)
+        cfg_now = get_cfg() or {}
+        got_br = ((cfg_now.get("audio") or {}).get("bitrate_kbps"))
+        R.check(got_br == new_br,
+                f"音频码率写进了运行配置：{got_br}（应为 {new_br}）")
+        st, data = set_audio(64, encoding="G711")
+        expect_not_supported(st, data, "SetAudioEncoderConfiguration（G.711）",
+                             ("aac",))
+        st, data = set_audio(64, sample=8)
+        expect_not_supported(st, data, "SetAudioEncoderConfiguration（8 kHz）",
+                             ("fixed", "48"))
+        st, data = set_audio(old_br)
+        expect_ok(st, data, "SetAudioEncoderConfiguration",
+                  f"复原音频码率 → {old_br} kbps", media=True)
+
     print(f"\n{'=' * 60}\n通过 {R.passed} 项，失败 {R.failed} 项，"
           f"跳过 {R.skipped} 项。")
     return 1 if R.failed else 0

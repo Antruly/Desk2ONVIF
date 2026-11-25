@@ -10,6 +10,7 @@
 #include <webapp/uvcpp_web_response.h>
 #include <wsdl/uvcpp_soap_message.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -45,6 +46,10 @@ constexpr char kNsError[] = "http://www.onvif.org/ver10/error";
 // 令牌。全都**不含空格和特殊字符**：有些 NVR 会把它直接拼进 URL 查询串。
 constexpr char kTokenVideoSource[] = "VideoSource";
 constexpr char kTokenVsConfig[] = "VideoSourceConfig";
+// 音频只有一个源、一份配置、一路编码器。token 同样不含空格/特殊字符。
+constexpr char kTokenAudioSource[] = "AudioSource";
+constexpr char kTokenAudioSourceConfig[] = "AudioSourceConfig";
+constexpr char kTokenAudioEncoderConfig[] = "AudioEncoderConfig";
 
 /// 审计去重闸门的窗口（秒）。见 `OnvifService::Impl::note_audit`。
 ///
@@ -72,6 +77,26 @@ std::string xml_escape(std::string const& s) {
 /// 属性值也要转义。ONVIF 里 `Uri="rtsp://..."` 这类值出现得非常频繁，
 /// 忘了转义就是一个只在特定地址下才炸的 bug。
 std::string attr(std::string const& s) { return xml_escape(s); }
+
+/// 把**外部文本**（日志尾巴、主机名等）安全地放进 XML 字符数据。
+///
+/// `xml_escape` 只管五个实体，不管 XML 1.0 不允许的控制字符。日志尾巴是唯一
+/// 一处"内容不由我们拼"的响应体：一行 ANSI 颜色码、一个误进日志的 `\x1b`
+/// 都会让整条响应变成非良构 XML —— 而客户端看到的只是"设备回了坏数据"。
+/// 控制和非法字符换成空格；不可打印但从合法来源来的字符（制表/换行/回车）
+/// 保留。
+std::string xml_escape_text(std::string const& s) {
+  std::string cleaned;
+  cleaned.reserve(s.size());
+  for (unsigned char const c : s) {
+    if (c == '\t' || c == '\n' || c == '\r' || c >= 0x20) {
+      cleaned.push_back(static_cast<char>(c));
+    } else {
+      cleaned.push_back(' ');
+    }
+  }
+  return xml_escape(cleaned);
+}
 
 /// RFC 3986 的 userinfo 百分号编码：**unreserved 之外全部编码**。
 ///
@@ -158,6 +183,39 @@ std::string xml_block(std::string const& xml, std::string const& tag) {
       return xml.substr(body_from, end - body_from);
     }
     from = at + tag.size() + 1;
+  }
+}
+
+/// `xml_block` 的**复数**版本：返回**所有**同名块的内容，按出现顺序。
+///
+/// 只有需要遍历列表的几处用它（`SetNTP` 的多个 `NTPManual`、
+/// `SetNetworkProtocols` 的多个 `NetworkProtocols`）。匹配规则和 `xml_block`
+/// 完全一致（裸名或恰好一个前缀），否则同一个元素在"取第一个"和"取全部"
+/// 两条路上会得到两种待遇。
+std::vector<std::string> xml_all_blocks(std::string const& xml,
+                                        std::string const& tag) {
+  std::vector<std::string> out;
+  std::size_t from = 0;
+  while (true) {
+    std::size_t const at = xml.find(tag + ">", from);
+    if (at == std::string::npos) return out;
+    std::size_t const lt = xml.rfind('<', at);
+    if (lt == std::string::npos) return out;
+    std::string const qname = xml.substr(lt + 1, at + tag.size() - lt - 1);
+    bool const bare = qname.size() == tag.size();
+    bool const prefixed = qname.size() > tag.size() &&
+                          qname[qname.size() - tag.size() - 1] == ':';
+    from = at + tag.size() + 1;
+    if (!(bare || prefixed) ||
+        qname.compare(qname.size() - tag.size(), tag.size(), tag) != 0) {
+      continue;
+    }
+    std::size_t const body_from = at + tag.size() + 1;
+    std::string const close = "</" + qname + ">";
+    std::size_t const end = xml.find(close, body_from);
+    if (end == std::string::npos) return out;
+    out.push_back(xml.substr(body_from, end - body_from));
+    from = end + close.size();
   }
 }
 
@@ -283,6 +341,21 @@ bool xml_int(std::string const& xml, std::string const& tag, int lo, int hi,
 bool xml_attr_int(std::string const& xml, std::string const& name, int lo,
                   int hi, int& out) {
   return str_int_in_range(xml_attr(xml, name), lo, hi, out);
+}
+
+/// `xs:boolean` 的文本形式。**只认 XML Schema 的四个字面量**（`true`/`false`
+/// 和 `1`/`0`）—— 把 `yes` 之类当成真会让一个写错的客户端看起来像成功。
+bool xml_bool(std::string const& xml, std::string const& tag, bool& out) {
+  std::string const s = xml_text(xml, tag);
+  if (s == "true" || s == "1") {
+    out = true;
+    return true;
+  }
+  if (s == "false" || s == "0") {
+    out = false;
+    return true;
+  }
+  return false;
 }
 
 /// 取一个**属性**的浮点并检查范围。目前只有一个调用点：`tt:Pos` 的 `x`/`y`
@@ -664,6 +737,22 @@ bool profile_is_sub(OnvifStreamProfile const& p) {
 
 }  // namespace
 
+std::vector<std::string> default_device_scopes() {
+  // 类型 scope 必须带：NVR/ONVIF Device Manager 主要靠它认出"这是一台
+  // 摄像机"。`Network_Video_Transmitter` 的写法（含大写和下划线）是规范里
+  // 定死的，别改成小写。
+  //
+  // 这一份同时被 WS-Discovery 和 `GetScopes` 使用（见头文件里的说明）。
+  return {
+      "onvif://www.onvif.org/type/video_encoder",
+      "onvif://www.onvif.org/type/Network_Video_Transmitter",
+      "onvif://www.onvif.org/Profile/Streaming",
+      "onvif://www.onvif.org/name/Desk2ONVIF",
+      "onvif://www.onvif.org/hardware/Desk2ONVIF",
+      "onvif://www.onvif.org/location/desktop",
+  };
+}
+
 struct OnvifService::Impl {
   OnvifServiceOptions opt;
   bool anonymous_dt_ = true;
@@ -875,10 +964,28 @@ struct OnvifService::Impl {
          std::string(kTokenVsConfig) + "\">";
     x += video_source_config("", p);
     x += "</tt:VideoSourceConfiguration>";
+    // 音频配置**只有在音轨真的开着时才进 profile**。关着的时候报一份
+    // AudioEncoderConfiguration，NVR 就会以为这条流里有声音，然后建一个
+    // 永远没有音频的通道 —— 而协议层一切正常。元素顺序是 xsd 的 sequence
+    // 定的：AudioSourceConfiguration 在 VideoSource 之后、VideoEncoder 之前；
+    // AudioEncoderConfiguration 在 VideoEncoder 之后。
+    OnvifAudioConfig const a = audio_cfg();
+    if (a.enabled) {
+      x += "<tt:AudioSourceConfiguration token=\"" +
+           std::string(kTokenAudioSourceConfig) + "\">";
+      x += audio_source_config_body();
+      x += "</tt:AudioSourceConfiguration>";
+    }
     x += "<tt:VideoEncoderConfiguration token=\"VideoEncoderConfig_" +
          attr(p.token) + "\">";
     x += encoder_config("", p);
     x += "</tt:VideoEncoderConfiguration>";
+    if (a.enabled) {
+      x += "<tt:AudioEncoderConfiguration token=\"" +
+           std::string(kTokenAudioEncoderConfig) + "\">";
+      x += audio_encoder_config_body(a);
+      x += "</tt:AudioEncoderConfiguration>";
+    }
     x += "</trt:Profiles>";
     return x;
   }
@@ -1427,6 +1534,107 @@ struct OnvifService::Impl {
     return url_for(peer, "http", opt.http_port, path);
   }
 
+  // --- 设备/网络/系统：小块的响应拼装 --------------------------------------
+
+  /// 一条 NTP 地址 → `tt:NetworkHost`。
+  ///
+  /// 只做**保守的**形态判断：把 DNS 名字误报成 IP 只是显示得怪，而把一个 IP
+  /// 误报成 DNS 会让客户端去解析一个不存在的名字。所以只有"整串都是数字和点、
+  /// 且恰好三个点"才报 IPv4，只有含冒号才报 IPv6，其余一律 DNS。
+  static std::string ntp_host_block(std::string const& server) {
+    bool ipv4 = !server.empty();
+    int dots = 0;
+    for (char const c : server) {
+      if (c == '.') {
+        ++dots;
+        continue;
+      }
+      if (c < '0' || c > '9') {
+        ipv4 = false;
+        break;
+      }
+    }
+    ipv4 = ipv4 && dots == 3;
+    bool const ipv6 = !ipv4 && server.find(':') != std::string::npos;
+    std::string x = "<tt:NTPManual>";
+    if (ipv4) {
+      x += "<tt:Type>IPv4</tt:Type><tt:IPv4Address>" + xml_escape(server) +
+           "</tt:IPv4Address>";
+    } else if (ipv6) {
+      x += "<tt:Type>IPv6</tt:Type><tt:IPv6Address>" + xml_escape(server) +
+           "</tt:IPv6Address>";
+    } else {
+      x += "<tt:Type>DNS</tt:Type><tt:DNSname>" + xml_escape(server) +
+           "</tt:DNSname>";
+    }
+    x += "</tt:NTPManual>";
+    return x;
+  }
+
+  /// 当前生效的网络协议。回调优先；没有回调时按两个监听端口推。
+  std::vector<OnvifNetworkProtocol> current_network_protocols() const {
+    if (opt.system.network_protocols) return opt.system.network_protocols();
+    std::vector<OnvifNetworkProtocol> out;
+    if (opt.http_port > 0) out.push_back({"HTTP", true, opt.http_port});
+    if (opt.rtsp_port > 0) {
+      out.push_back({"RTSP", opt.system.rtsp_enabled, opt.rtsp_port});
+    }
+    return out;
+  }
+
+  static std::string network_protocol_block(OnvifNetworkProtocol const& p) {
+    std::string x = "<tds:NetworkProtocols>";
+    x += "<tt:Name>" + xml_escape(p.name) + "</tt:Name>";
+    x += p.enabled ? "<tt:Enabled>true</tt:Enabled>"
+                   : "<tt:Enabled>false</tt:Enabled>";
+    // `Port` 在 xsd 里是必填（maxOccurs unbounded），关掉的协议也照发 ——
+    // 省掉它会让严格解析器把整条响应判成不合法。
+    x += "<tt:Port>" + std::to_string(p.port) + "</tt:Port>";
+    x += "</tds:NetworkProtocols>";
+    return x;
+  }
+
+  /// 当前音轨状态。没接回调 = 音频未启用。
+  OnvifAudioConfig audio_cfg() const {
+    return opt.system.get_audio ? opt.system.get_audio() : OnvifAudioConfig{};
+  }
+
+  /// 一份 `tt:AudioSourceConfiguration` 的子元素（不含外层包装）。
+  static std::string audio_source_config_body() {
+    return "<tt:Name>AudioSourceConfig</tt:Name>"
+           "<tt:UseCount>1</tt:UseCount>"
+           "<tt:SourceToken>" + std::string(kTokenAudioSource) +
+           "</tt:SourceToken>";
+  }
+
+  /// 一份 `tt:AudioEncoderConfiguration` 的子元素（不含外层包装）。
+  ///
+  /// `Multicast` 和 `SessionTimeout` 在这个类型里是必填的（见 onvif.xsd），
+  /// 所以必须给。地址全 0 + `AutoStart=false` 表示"没有组播" —— 和视频编码器
+  /// 那边"干脆省掉 Multicast"不同，这里省掉就是不合 schema。
+  static std::string audio_encoder_config_body(OnvifAudioConfig const& a) {
+    std::string x;
+    x += "<tt:Name>AudioEncoderConfig</tt:Name>";
+    x += "<tt:UseCount>1</tt:UseCount>";
+    x += "<tt:Encoding>" + xml_escape(a.encoding) + "</tt:Encoding>";
+    x += "<tt:Bitrate>" + std::to_string(a.bitrate_kbps) + "</tt:Bitrate>";
+    x += "<tt:SampleRate>" + std::to_string(a.sample_rate_khz) +
+         "</tt:SampleRate>";
+    x += "<tt:Multicast><tt:Address><tt:Type>IPv4</tt:Type>"
+         "<tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>"
+         "<tt:Port>0</tt:Port><tt:TTL>0</tt:TTL>"
+         "<tt:AutoStart>false</tt:AutoStart></tt:Multicast>";
+    x += "<tt:SessionTimeout>PT60S</tt:SessionTimeout>";
+    return x;
+  }
+
+  /// `GetAudio*Configurations` 的列表项：外层是 `trt:Configurations`。
+  static std::string audio_encoder_config_block(OnvifAudioConfig const& a) {
+    return "<trt:Configurations token=\"" +
+           std::string(kTokenAudioEncoderConfig) + "\">" +
+           audio_encoder_config_body(a) + "</trt:Configurations>";
+  }
+
   std::string device_op(uvcpp_soap_version v, std::string const& op,
                         std::string const& body_xml, std::string const& peer);
   std::string media_op(uvcpp_soap_version v, std::string const& op,
@@ -1642,6 +1850,10 @@ std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
   }
 
   if (op == "GetCapabilities") {
+    // `SystemLogging` 要如实反映"GetSystemLog 有没有内容可给"。
+    // 从前这里是写死的 false —— 那时确实没有这个操作；现在有了还报 false，
+    // 客户端就会认为这台设备不支持系统日志，从而根本不来调它。
+    bool const has_log = static_cast<bool>(o.system.system_log);
     std::string inner;
     inner += "<tt:Capabilities>";
     // 只报 Device 和 Media。Events/PTZ/Imaging/Analytics 一个都没有 ——
@@ -1658,7 +1870,9 @@ std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
              "<tt:DiscoveryBye>true</tt:DiscoveryBye>"
              "<tt:RemoteDiscovery>false</tt:RemoteDiscovery>"
              "<tt:SystemBackup>false</tt:SystemBackup>"
-             "<tt:SystemLogging>false</tt:SystemLogging>"
+             "<tt:SystemLogging>" +
+             std::string(has_log ? "true" : "false") +
+             "</tt:SystemLogging>"
              "<tt:FirmwareUpgrade>false</tt:FirmwareUpgrade></tt:System>"
              "<tt:IO><tt:InputConnectors>0</tt:InputConnectors>"
              "<tt:RelayOutputs>0</tt:RelayOutputs></tt:IO>"
@@ -1684,6 +1898,7 @@ std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
   if (op == "GetServiceCapabilities") {
     // 设备服务的能力表。**和媒体服务那个同名但内容完全不同** —— 这正是
     // 按路由（而不是按 Body 的命名空间）分派的原因。
+    bool const has_log = static_cast<bool>(o.system.system_log);
     std::string inner;
     inner += "<tds:Capabilities>";
     inner += "<tds:Network IPFilter=\"false\" ZeroConfiguration=\"false\" "
@@ -1692,9 +1907,14 @@ std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
              "OnboardKeyGeneration=\"false\" AccessPolicyConfig=\"false\" "
              "X.509Token=\"false\" SAMLToken=\"false\" KerberosToken=\"false\" "
              "RELToken=\"false\"/>";
-    inner += "<tds:System DiscoveryResolve=\"true\" DiscoveryBye=\"true\" "
-             "RemoteDiscovery=\"false\" SystemBackup=\"false\" "
-             "SystemLogging=\"false\" FirmwareUpgrade=\"false\"/>";
+    // `SystemLogging` 必须和 GetSystemLog 有没有内容一致（理由见
+    // GetCapabilities 那一条）。
+    inner += std::string(
+                 "<tds:System DiscoveryResolve=\"true\" DiscoveryBye=\"true\" "
+                 "RemoteDiscovery=\"false\" SystemBackup=\"false\" "
+                 "SystemLogging=\"") +
+             (has_log ? "true" : "false") +
+             "\" FirmwareUpgrade=\"false\"/>";
     inner += "</tds:Capabilities>";
     return soap_response(v, kNsDevice, "GetServiceCapabilitiesResponse", inner);
   }
@@ -1733,6 +1953,269 @@ std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
         "<tt:SearchDomain>local</tt:SearchDomain>"
         "</tds:DNSInformation>";
     return soap_response(v, kNsDevice, "GetDNSResponse", inner);
+  }
+
+  // --- Scope -------------------------------------------------------------
+  //
+  // `GetScopes` 报的是**和 WS-Discovery 同一份** scope 表。三个 Set 操作
+  // 一律回 `ActionNotSupported`：这台设备没有可持久化的 scope 存储，而
+  // "回 200 但什么都没改"是最坏的一种——客户端会认为改成功了，下次重连
+  // 又看到旧值，然后开始怀疑自己的缓存。
+  if (op == "GetScopes") {
+    std::vector<std::string> scopes =
+        o.system.scopes ? o.system.scopes() : default_device_scopes();
+    std::string inner;
+    for (std::string const& s : scopes) {
+      if (s.empty()) continue;
+      inner += "<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>" +
+               xml_escape(s) + "</tt:ScopeItem></tds:Scopes>";
+    }
+    return soap_response(v, kNsDevice, "GetScopesResponse", inner);
+  }
+
+  if (op == "SetScopes" || op == "AddScopes" || op == "RemoveScopes") {
+    note_audit(peer, "onvif." + op, "拒绝：本设备没有可持久化的 scope 存储");
+    return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                 op + " is not supported: this device has no persistent scope "
+                      "storage; scopes are fixed and reported by GetScopes"});
+  }
+
+  // --- 主机名 -------------------------------------------------------------
+  //
+  // `GetHostname` 报的是 Windows 的主机名。`SetHostname` **不能**假装成功：
+  // 改主机名要改注册表并重启，而这件事不在这个进程的权限/生命周期里。
+  if (op == "GetHostname") {
+    std::string name;
+    if (o.system.hostname) {
+      name = o.system.hostname();
+    } else {
+      name = local_hostname();
+    }
+    std::string inner =
+        "<tds:HostnameInformation><tt:FromDHCP>false</tt:FromDHCP>";
+    // `Name` 是可选的（minOccurs=0）。取不到就省掉，而不是发一个空元素。
+    if (!name.empty()) {
+      inner += "<tt:Name>" + xml_escape(name) + "</tt:Name>";
+    }
+    inner += "</tds:HostnameInformation>";
+    return soap_response(v, kNsDevice, "GetHostnameResponse", inner);
+  }
+
+  if (op == "SetHostname") {
+    note_audit(peer, "onvif.SetHostname",
+               "拒绝：运行中不能改 Windows 主机名（需要重启/系统设置）");
+    return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                 "SetHostname is not supported: changing the Windows hostname "
+                 "requires a restart and must be done in system settings"});
+  }
+
+  // --- 网络协议 -----------------------------------------------------------
+  if (op == "GetNetworkProtocols") {
+    std::string inner;
+    for (OnvifNetworkProtocol const& p : current_network_protocols()) {
+      inner += network_protocol_block(p);
+    }
+    return soap_response(v, kNsDevice, "GetNetworkProtocolsResponse", inner);
+  }
+
+  if (op == "SetNetworkProtocols") {
+    // 只允许"和现在一模一样"的请求。改端口/开关要重新 bind，那是重启的事；
+    // 回成功会让 NVR 认为新端口已经生效，然后它下一次来连的就是一个没人
+    // 监听的端口 —— 症状比直接拒绝难查得多。
+    std::vector<OnvifNetworkProtocol> const cur = current_network_protocols();
+    std::vector<std::string> const blocks =
+        xml_all_blocks(body_xml, "NetworkProtocols");
+    std::vector<OnvifNetworkProtocol> req;
+    for (std::string const& b : blocks) {
+      OnvifNetworkProtocol p;
+      p.name = xml_text(b, "Name");
+      bool enabled = false;
+      if (p.name.empty() || !xml_bool(b, "Enabled", enabled)) {
+        return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                     "SetNetworkProtocols: every protocol needs Name and "
+                     "Enabled"});
+      }
+      p.enabled = enabled;
+      int port = 0;
+      if (xml_int(b, "Port", 0, 65535, port)) p.port = port;
+      if (p.name != "HTTP" && p.name != "RTSP") {
+        note_audit(peer, "onvif.SetNetworkProtocols",
+                   "拒绝：不支持的协议 " + p.name);
+        return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                     "SetNetworkProtocols: only HTTP and RTSP are supported"});
+      }
+      req.push_back(std::move(p));
+    }
+
+    auto same_as_current = [&cur](std::vector<OnvifNetworkProtocol> const& r) {
+      if (r.size() != cur.size()) return false;
+      for (OnvifNetworkProtocol const& want : r) {
+        bool hit = false;
+        for (OnvifNetworkProtocol const& have : cur) {
+          if (have.name != want.name) continue;
+          hit = (have.enabled == want.enabled) && (have.port == want.port);
+          break;
+        }
+        if (!hit) return false;
+      }
+      return true;
+    };
+
+    if (!same_as_current(req)) {
+      std::string detail;
+      for (OnvifNetworkProtocol const& p : req) {
+        if (!detail.empty()) detail += ", ";
+        detail += p.name + (p.enabled ? "=on" : "=off") + ":" +
+                  std::to_string(p.port);
+      }
+      note_audit(peer, "onvif.SetNetworkProtocols",
+                 "拒绝（需要重启）：" + detail);
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SetNetworkProtocols: changing HTTP/RTSP ports or switches "
+                   "requires a restart; only the current configuration is "
+                   "accepted"});
+    }
+    // 一模一样 = 客户端在确认它读到的那份。**这不是错误**，照常回成功。
+    return soap_response(v, kNsDevice, "SetNetworkProtocolsResponse", "");
+  }
+
+  // --- NTP ----------------------------------------------------------------
+  if (op == "GetNTP") {
+    OnvifNtpConfig c;
+    if (o.system.get_ntp) c = o.system.get_ntp();
+    std::string inner =
+        "<tds:NTPInformation><tt:FromDHCP>false</tt:FromDHCP>";
+    if (!c.server.empty()) inner += ntp_host_block(c.server);
+    inner += "</tds:NTPInformation>";
+    return soap_response(v, kNsDevice, "GetNTPResponse", inner);
+  }
+
+  if (op == "SetNTP") {
+    if (!o.system.set_ntp) {
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SetNTP is not available: this device has no persistent "
+                   "time configuration"});
+    }
+    bool from_dhcp = false;
+    if (xml_bool(body_xml, "FromDHCP", from_dhcp) && from_dhcp) {
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SetNTP: retrieving NTP servers from DHCP is not supported"});
+    }
+    // 规范允许一次给多个 `NTPManual`，而配置层只有一个 `ntp_server`。
+    // 取第一个非空的，并把"剩下的被丢掉了"说出来 —— 静默丢弃会让用户
+    // 在 NVR 上填了三个服务器、设备只认一个，而没有任何地方提示他。
+    std::string server;
+    int seen = 0;
+    for (std::string const& b : xml_all_blocks(body_xml, "NTPManual")) {
+      std::string s = xml_text(b, "DNSname");
+      if (s.empty()) s = xml_text(b, "IPv4Address");
+      if (s.empty()) s = xml_text(b, "IPv6Address");
+      if (s.empty()) continue;
+      ++seen;
+      if (server.empty()) server = s;
+    }
+    if (server.empty()) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                   "SetNTP: no manual NTP server address was given"});
+    }
+    if (seen > 1) {
+      D2O_WARN("SetNTP 给了 %d 个 NTP 服务器；配置层只支持一个，"
+               "只采用第一个（%s）。",
+               seen, server.c_str());
+    }
+
+    OnvifNtpConfig cfg;
+    cfg.server = server;
+    std::string const interval = xml_text(body_xml, "Interval");
+    if (!interval.empty()) {
+      int v = 0;
+      if (!str_int_in_range(interval, 0, 86400, v)) {
+        return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                     "SetNTP: Interval must be between 0 and 86400 seconds"});
+      }
+      cfg.interval_s = v;
+    }
+    o.system.set_ntp(cfg);
+    std::string detail = "NTP 服务器=" + server;
+    if (cfg.interval_s) {
+      detail += "，间隔=" + std::to_string(*cfg.interval_s) + " 秒";
+    }
+    note_audit(peer, "onvif.SetNTP", detail);
+    return soap_response(v, kNsDevice, "SetNTPResponse", "");
+  }
+
+  // --- 系统日志 / 端点引用 -----------------------------------------------
+  if (op == "GetSystemLog") {
+    // `LogType` 只有 `System` / `Access` 两种。我们只有调试日志（System），
+    // Access 那一份**不存在** —— 回空字符串比拿调试日志冒充访问日志诚实。
+    std::string const type = xml_text(body_xml, "LogType");
+    std::string text;
+    if ((type.empty() || type == "System") && o.system.system_log) {
+      text = o.system.system_log();
+    }
+    // SOAP 响应别超过几百 KB：日志文件本身封顶 4 MB，一次全塞进去会让
+    // 这条循环线程（和 NVR 的超时）一起难受。留最后 64 KB，那是最有用的
+    // 一截。
+    constexpr std::size_t kMaxLogBytes = 64u * 1024u;
+    if (text.size() > kMaxLogBytes) {
+      text.erase(0, text.size() - kMaxLogBytes);
+      // 按字节截断可能正好切在一个 UTF-8 多字节字符的中间。跳过开头的
+      // 续字节（10xxxxxx），从下一个字符边界开始 —— 否则日志里有一行中文
+      // 就会让这条响应不是合法 UTF-8。
+      while (!text.empty() &&
+             (static_cast<unsigned char>(text.front()) & 0xC0) == 0x80) {
+        text.erase(0, 1);
+      }
+    }
+    std::string inner = "<tds:SystemLog><tt:String>" + xml_escape_text(text) +
+                        "</tt:String></tds:SystemLog>";
+    return soap_response(v, kNsDevice, "GetSystemLogResponse", inner);
+  }
+
+  if (op == "GetEndpointReference") {
+    // `GUID` 就是设备的 endpoint reference。用和 WS-Discovery 同一个 UUID，
+    // 客户端据此把发现到的设备和这个端点对上号。
+    std::string inner = "<tds:GUID>" + xml_escape(o.uuid) + "</tds:GUID>";
+    return soap_response(v, kNsDevice, "GetEndpointReferenceResponse", inner);
+  }
+
+  // --- 物理 I/O：没有就回空列表 ------------------------------------------
+  //
+  // **不是 Fault。** 这台虚拟摄像机没有继电器和数字输入；"没有"是一个
+  // 合法答案，而 Fault 会让 NVR 认为整个设备不支持这类查询。空响应元素
+  // 就是 schema 里列表长度为零的表示。
+  if (op == "GetRelayOutputs") {
+    return soap_response(v, kNsDevice, "GetRelayOutputsResponse", "");
+  }
+  if (op == "GetDigitalInputs") {
+    return soap_response(v, kNsDevice, "GetDigitalInputsResponse", "");
+  }
+
+  // --- 危险操作：默认明确拒绝 --------------------------------------------
+  //
+  // 回调为空是**默认且测试机上的**状态。真要允许，调用方得显式注入一个
+  // 回调 —— "默认能做"和"不小心接上"之间的差别，就是测试机突不突然重启。
+  if (op == "SystemReboot") {
+    if (!o.system.system_reboot) {
+      note_audit(peer, "onvif.SystemReboot", "拒绝：本设备未启用远程重启");
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SystemReboot is disabled on this device"});
+    }
+    note_audit(peer, "onvif.SystemReboot", "执行远程重启");
+    o.system.system_reboot();
+    return soap_response(v, kNsDevice, "SystemRebootResponse", "");
+  }
+
+  if (op == "SetSystemFactoryDefault") {
+    if (!o.system.factory_default) {
+      note_audit(peer, "onvif.SetSystemFactoryDefault",
+                 "拒绝：本设备未启用远程恢复出厂");
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SetSystemFactoryDefault is disabled on this device"});
+    }
+    note_audit(peer, "onvif.SetSystemFactoryDefault", "执行远程恢复出厂");
+    o.system.factory_default();
+    return soap_response(v, kNsDevice, "SetSystemFactoryDefaultResponse", "");
   }
 
   return {};
@@ -1851,6 +2334,155 @@ std::string OnvifService::Impl::media_op(uvcpp_soap_version v,
     inner += "</trt:Options>";
     return soap_response(v, kNsMedia,
                          "GetVideoEncoderConfigurationOptionsResponse", inner);
+  }
+
+  // --- 视频源配置选项 -----------------------------------------------------
+  //
+  // 我们不支持裁剪，所以按 xsd 对"不支持裁剪的设备"的规定报：X/Y 范围
+  // Min=Max=0，宽/高范围就是视频源自己的尺寸。`Options` 的
+  // `MaximumNumberOfProfiles` 是**属性**，不在子元素里。
+  if (op == "GetVideoSourceConfigurationOptions") {
+    OnvifStreamProfile const& p = ps.front();
+    std::string inner = "<trt:Options MaximumNumberOfProfiles=\"" +
+                        std::to_string(ps.size()) + "\">";
+    inner += "<tt:BoundsRange>";
+    inner += "<tt:XRange><tt:Min>0</tt:Min><tt:Max>0</tt:Max></tt:XRange>";
+    inner += "<tt:YRange><tt:Min>0</tt:Min><tt:Max>0</tt:Max></tt:YRange>";
+    inner += "<tt:WidthRange><tt:Min>" + std::to_string(p.width) +
+             "</tt:Min><tt:Max>" + std::to_string(p.width) +
+             "</tt:Max></tt:WidthRange>";
+    inner += "<tt:HeightRange><tt:Min>" + std::to_string(p.height) +
+             "</tt:Min><tt:Max>" + std::to_string(p.height) +
+             "</tt:Max></tt:HeightRange>";
+    inner += "</tt:BoundsRange>";
+    inner += "<tt:VideoSourceTokensAvailable>" +
+             std::string(kTokenVideoSource) + "</tt:VideoSourceTokensAvailable>";
+    inner += "</trt:Options>";
+    return soap_response(v, kNsMedia,
+                         "GetVideoSourceConfigurationOptionsResponse", inner);
+  }
+
+  // --- 音频（只读 + 一个可落盘的码率） -----------------------------------
+  //
+  // 音频未启用时**一律回空列表，不回 Fault**：这台设备只是没有音轨，
+  // 不是"不支持这个操作"。有些 NVR 不管有没有音频都会把这一组挨个调一遍。
+  if (op == "GetAudioSources") {
+    OnvifAudioConfig const a = audio_cfg();
+    std::string inner;
+    if (a.enabled) {
+      inner += "<trt:AudioSources token=\"" + std::string(kTokenAudioSource) +
+               "\"><tt:Channels>" + std::to_string(clamp_int(a.channels, 1, 2)) +
+               "</tt:Channels></trt:AudioSources>";
+    }
+    return soap_response(v, kNsMedia, "GetAudioSourcesResponse", inner);
+  }
+
+  if (op == "GetAudioSourceConfigurations" ||
+      op == "GetAudioSourceConfiguration") {
+    OnvifAudioConfig const a = audio_cfg();
+    std::string inner;
+    if (a.enabled) {
+      inner += "<trt:Configurations token=\"" +
+               std::string(kTokenAudioSourceConfig) + "\">";
+      inner += audio_source_config_body();
+      inner += "</trt:Configurations>";
+    }
+    return soap_response(v, kNsMedia, op + "Response", inner);
+  }
+
+  if (op == "GetAudioEncoderConfigurations" ||
+      op == "GetAudioEncoderConfiguration") {
+    OnvifAudioConfig const a = audio_cfg();
+    std::string inner;
+    if (a.enabled) inner += audio_encoder_config_block(a);
+    return soap_response(v, kNsMedia, op + "Response", inner);
+  }
+
+  if (op == "GetAudioEncoderConfigurationOptions") {
+    OnvifAudioConfig const a = audio_cfg();
+    std::string inner = "<trt:Options>";
+    if (a.enabled) {
+      // 外层 `trt:Options` 的类型是 `tt:AudioEncoderConfigurationOptions`，
+      // 里面再装若干个 `tt:Options`（每个是一组编码参数）—— 两层同名，
+      // 层数少写一层的话客户端会看到"没有任何编码选项"。
+      inner += "<tt:Options><tt:Encoding>AAC</tt:Encoding>";
+      inner += "<tt:BitrateList>";
+      // 配置层能接受 8..512（见 validate_config 的 clamp）。这里只报几个
+      // **常见的**值：报满 505 个数字没有任何信息量，而且会让 NVR 的下拉框
+      // 长得没法用。当前值不在列表里时补进去（见下）。
+      std::vector<int> rates = {32, 48, 64, 96, 128, 192, 256};
+      bool has_current = false;
+      for (int r : rates) {
+        if (r == a.bitrate_kbps) has_current = true;
+      }
+      if (!has_current && a.bitrate_kbps >= 8 && a.bitrate_kbps <= 512) {
+        rates.push_back(a.bitrate_kbps);
+        std::sort(rates.begin(), rates.end());
+      }
+      for (int r : rates) {
+        inner += "<tt:Items>" + std::to_string(r) + "</tt:Items>";
+      }
+      inner += "</tt:BitrateList>";
+      inner += "<tt:SampleRateList><tt:Items>" +
+               std::to_string(a.sample_rate_khz) +
+               "</tt:Items></tt:SampleRateList>";
+      inner += "</tt:Options>";
+    }
+    inner += "</trt:Options>";
+    return soap_response(v, kNsMedia,
+                         "GetAudioEncoderConfigurationOptionsResponse", inner);
+  }
+
+  if (op == "SetAudioEncoderConfiguration") {
+    if (!opt.system.set_audio) {
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SetAudioEncoderConfiguration is not supported: this device "
+                   "has no persistent audio configuration"});
+    }
+    OnvifAudioConfig a = audio_cfg();
+    if (!a.enabled) {
+      // 音轨关着的时候 GetAudioEncoderConfigurations 是空的，此时接受一个
+      // Set 会造出"NVR 说设成功、回读却什么都没有"的不一致。明确拒绝，
+      // 并在理由里说清楚该去哪打开它。
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SetAudioEncoderConfiguration: the audio track is disabled; "
+                   "enable it in the web console first"});
+    }
+    std::string const token = xml_attr(body_xml, "token");
+    if (!token.empty() && token != kTokenAudioEncoderConfig) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", "NoConfig",
+                   "SetAudioEncoderConfiguration: unknown configuration token"});
+    }
+    std::string const enc = xml_text(body_xml, "Encoding");
+    if (!enc.empty() && enc != "AAC") {
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "SetAudioEncoderConfiguration: only AAC is supported"});
+    }
+    int bitrate = 0;
+    if (xml_int(body_xml, "Bitrate", 8, 512, bitrate)) {
+      a.bitrate_kbps = bitrate;
+    } else if (!xml_text(body_xml, "Bitrate").empty()) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                   "SetAudioEncoderConfiguration: Bitrate must be 8..512 kbps"});
+    }
+    int sample_rate = 0;
+    if (xml_int(body_xml, "SampleRate", 8, 192, sample_rate)) {
+      if (sample_rate != a.sample_rate_khz) {
+        // 采样率由 AudioMixer 统一成 48 kHz，不是可配项。假装接受会让
+        // NVR 回读到 48 而它以为设成了别的值。
+        return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                     "SetAudioEncoderConfiguration: the sample rate is fixed at " +
+                         std::to_string(a.sample_rate_khz) + " kHz"});
+      }
+    } else if (!xml_text(body_xml, "SampleRate").empty()) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                   "SetAudioEncoderConfiguration: invalid SampleRate"});
+    }
+    opt.system.set_audio(a);
+    note_audit(peer, "onvif.SetAudioEncoderConfiguration",
+               "AAC " + std::to_string(a.bitrate_kbps) + "kbps");
+    return soap_response(v, kNsMedia,
+                         "SetAudioEncoderConfigurationResponse", "");
   }
 
   // 两个 `Set*` 合在一起写：报文形状几乎一样（都是 `Configuration` 里带

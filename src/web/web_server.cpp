@@ -447,15 +447,11 @@ void WebServer::Impl::start_wsd(WebOptions const& o) {
   wo.extra = o.wsd_extra_endpoints;
   if (wo.scopes.empty()) {
     // 类型 scope 必须带：NVR/ONVIF Device Manager 主要靠它认出"这是一台摄像机"。
-    // Network_Video_Transmitter 的写法（含大写和下划线）是 ONVIF 规范里定死的。
-    wo.scopes = {
-        "onvif://www.onvif.org/type/video_encoder",
-        "onvif://www.onvif.org/type/Network_Video_Transmitter",
-        "onvif://www.onvif.org/Profile/Streaming",
-        "onvif://www.onvif.org/name/Desk2ONVIF",
-        "onvif://www.onvif.org/hardware/Desk2ONVIF",
-        "onvif://www.onvif.org/location/desktop",
-    };
+    //
+    // **这一份和 `GetScopes` 是同一个函数。** 从前这里是一段就地写死的列表，
+    // 而 GetScopes 也要报同一份 —— 两处各写一遍的话，NVR 通过发现看到的是一台
+    // 设备、通过 GetScopes 看到的又是另一台，而两边各自都"有出处"。
+    wo.scopes = d2o::default_device_scopes();
   }
 
   // 投递函数：WSD 要发 Hello/Bye/ProbeMatch，而发送只能在循环线程上做。

@@ -28,6 +28,14 @@ struct LocalAddr {
   std::string mac;            ///< 大写十六进制，无分隔
 };
 
+/// 本机主机名（Windows 的 DNS 主机名）。取不到时返回空串 —— 调用方应当
+/// 把它当成"没有可报告的主机名"，而不是猜一个。
+///
+/// ONVIF 的 `GetHostname` 报的就是这个。**它和 `machine_seed()` 吃的是同一个
+/// 事实**，所以放在这个文件里：两边各取一次的话，一台机器可能对外宣称两个
+/// 不同的名字。
+std::string local_hostname();
+
 /// 所有已启用、非环回的 IPv4 地址。
 std::vector<LocalAddr> local_ipv4_addresses();
 
