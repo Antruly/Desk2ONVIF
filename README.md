@@ -95,17 +95,44 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 当前版本 **v0.2.0**，直接下
 [`Desk2ONVIF_Setup_0.2.0.exe`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.2.0.exe)
 （全部版本见 [Releases](https://github.com/Antruly/Desk2ONVIF/releases)）。
-Inno Setup 简体中文向导，装到
-`%LOCALAPPDATA%\Programs\Desk2ONVIF`，**不弹 UAC**。
+Inno Setup 简体中文向导，**会请求管理员权限（UAC）**，默认装到
+`C:\Program Files\Desk2ONVIF`。
+
+向导里的附加任务 **“安装为 Windows 服务（推荐）”默认勾选**：
+
+- **勾选（默认）**：注册成 Windows 服务 `Desk2ONVIF`，`LocalSystem` 账户、
+  开机自动启动，崩溃后由 SCM 自动重启。桌面和开始菜单里放的是
+  `http://127.0.0.1:8080/` 的 **URL 快捷方式**，双击直接进 Web 控制台；
+  开始菜单里另有“服务状态”（等价于 `sc query Desk2ONVIF` /
+  `desk2onvif.exe --service status`）。
+- **不勾选**：控制台形态。桌面/开始菜单指向 `start-installed.bat`，
+  双击后窗口里能看到日志，关掉窗口就停止。
+
+两种形态的配置都在
+`C:\ProgramData\Desk2ONVIF\config.json`（安装器创建时给 Users 组修改权限，
+这样以登录用户身份运行的采集进程才能把网页上保存的配置写回去）。安装目录
+（Program Files）本身仍是只读的。
+
+> **从 0.2.0 早期安装包升级**：旧版是**每用户安装**
+> （`%LOCALAPPDATA%\Programs\Desk2ONVIF`，不弹 UAC），新版是机器级安装。
+> Inno 的 AppId 虽然相同，但安装模式变了，两者**不会被当成同一次安装** ——
+> 请先在“应用和功能”里卸载旧版，再运行新版安装包。旧版配置在旧安装目录的
+> `config.json` 里，需要的话先抄走。
+
+> **服务采集的是“登录用户”的桌面。** 服务进程跑在 Session 0，但 DXGI 桌面
+> 复制必须在交互会话（Session 1）里才能拿到画面，所以服务会把一个 worker
+> 进程拉进当前登录用户的会话，采集/推流/Web/ONVIF 都在 worker 里。
+> **未登录或锁屏时服务状态仍是 RUNNING，但不会采集**；等用户登录后自动拉起
+> worker。想不用服务、在桌面上手动跑，就在安装时取消勾选。
 
 向导里会让你填一对账号口令 —— 留意它其实写了**两个地方**（网页控制台一份、
 NVR 一份，互相独立），细节见[工程实录](docs/ENGINEERING.md#安装时的口令到底写进了什么)。
 
-装完之后：
+装完之后（默认服务形态）：
 
-1. 开始菜单启动 `Desk2ONVIF`
-2. 浏览器打开 `http://127.0.0.1:8080` 看控制台
-3. 在 NVR 里「添加 IP 通道」，应该能**自动发现**到这台设备；没发现就手动填
+1. 双击桌面/开始菜单里的 `Desk2ONVIF`（URL 快捷方式），或直接浏览器打开
+   `http://127.0.0.1:8080`
+2. 在 NVR 里「添加 IP 通道」，应该能**自动发现**到这台设备；没发现就手动填
    本机 IP + ONVIF 端口
 
 > 首次运行 Windows 防火墙会拦。仓库里带了辅助脚本
@@ -116,6 +143,7 @@ NVR 一份，互相独立），细节见[工程实录](docs/ENGINEERING.md#安�
 下
 [`Desk2ONVIF-0.2.0-win64.zip`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.2.0-win64.zip)，
 解压即用，整个目录拷走就能换机器。跑 `start.ps1`（或 `start-local.bat`）启动。
+**绿色版不需要管理员权限**，配置在 exe 旁边的 `config.json`，和服务模式无关。
 
 ### 方式三：从源码
 
@@ -272,7 +300,7 @@ ONVIF 的 SOAP 信封层要靠它，只能从源码编；从源码编就需要�
 
 | | 产物 | 说明 |
 |---|---|---|
-| 安装包 | `release\Desk2ONVIF_Setup_<版本>.exe` | Inno Setup 简体中文向导，不弹 UAC |
+| 安装包 | `release\Desk2ONVIF_Setup_<版本>.exe` | Inno Setup 简体中文向导，**需要管理员权限（UAC）**，默认装成 Windows 服务 |
 | 绿色版 | `release\Desk2ONVIF-<版本>-win64.zip` | 解压即用 |
 
 版本号只有 `CMakeLists.txt` 一个来源，由脚本传进 `.iss`。

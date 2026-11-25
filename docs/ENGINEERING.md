@@ -1363,12 +1363,12 @@ cmake --build build -j
 .\scripts\package.ps1 -AppUrl https://...   # 把项目主页写进安装程序的信息里
 ```
 
-产出两个交付物，**装出来的文件完全一样**，只是分发方式不同：
+产出两个交付物，**程序文件相同，但安装方式不同**：
 
 | | 产物 | 说明 |
 |---|---|---|
-| 安装包 | `release\Desk2ONVIF_Setup_<版本>.exe` | Inno Setup 简体中文向导，装到 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，**不弹 UAC** |
-| 绿色版 | `release\Desk2ONVIF-<版本>-win64.zip` | 解压即用，整个目录拷走就能换机器 |
+| 安装包 | `release\Desk2ONVIF_Setup_<版本>.exe` | Inno Setup 简体中文向导，**需要管理员权限（UAC）**，默认装到 `C:\Program Files\Desk2ONVIF` 并注册为 Windows 服务；配置在 `%ProgramData%\Desk2ONVIF` |
+| 绿色版 | `release\Desk2ONVIF-<版本>-win64.zip` | 解压即用，整个目录拷走就能换机器；**不需要管理员权限**，配置在 exe 旁边 |
 
 版本号只有 `CMakeLists.txt` 一个来源，由脚本传进 `.iss`；不传 `-AppUrl` 时安装程序里
 **不显示**发布者链接（以前那里是个指向 GitHub 首页的占位符，比没有链接更糟）。

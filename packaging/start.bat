@@ -13,10 +13,11 @@ REM  Extra arguments are passed straight through:
 REM      start.bat --fps 60
 REM =====================================================================
 chcp 65001 >nul
-REM  -Portable: config.json lives next to the exe. The installer uses a
-REM  per-user install dir (PrivilegesRequired=lowest -> %LOCALAPPDATA%\Programs),
-REM  which is writable, so this works identically for installed and unzipped.
-REM  Drop -Portable if you'd rather have %APPDATA%\Desk2ONVIF\config.json.
+REM  -Portable: config.json lives next to the exe. This is the portable zip's
+REM  entry point. A normal install (including console mode) uses
+REM  start-installed.bat instead, which passes
+REM  -Config "%ProgramData%\Desk2ONVIF\config.json" -- the installer no
+REM  longer writes config.json into {app}.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" -Portable %*
 echo.
 pause

@@ -7,10 +7,26 @@
 
 | | 怎么做 | 配置放在哪 |
 |---|---|---|
-| **安装包** `Desk2ONVIF_Setup_<版本>.exe` | 双击装即可，**不问管理员权限**，装到 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，带开始菜单项和卸载程序 | 装好的目录里的 `config.json` |
-| **绿色版** `Desk2ONVIF-<版本>-win64.zip` | 解压到任意目录就能跑；想搬到别的机器，**整个目录拷走**即可 | 同上，跟着目录走 |
+| **安装包** `Desk2ONVIF_Setup_<版本>.exe` | 双击装，**需要管理员权限（UAC）**，默认装到 `C:\Program Files\Desk2ONVIF`。向导默认勾选“安装为 Windows 服务”（开机自启）；取消勾选则是控制台形态。带开始菜单/桌面快捷方式和卸载程序 | `C:\ProgramData\Desk2ONVIF\config.json` |
+| **绿色版** `Desk2ONVIF-<版本>-win64.zip` | 解压到任意目录就能跑，**不需要管理员权限**；想搬到别的机器，**整个目录拷走**即可 | exe 旁边的 `config.json`，跟着目录走 |
 
-两种装法装出来的文件完全一样。绿色版没有安装程序，所以下面「静默安装」那一节可以跳过。
+安装包和绿色版共用同一份程序和大多数启动脚本，但**配置位置和入口不同**：
+安装包是机器级安装（服务/控制台二选一），绿色版仍是“解压即用、整包自包含”；
+`start-installed.bat` / `service-status.bat` 这类安装版入口不会放进绿色版 zip。
+绿色版没有安装程序，所以下面「静默安装」那一节可以跳过。
+
+> **从 0.2.0 早期安装包升级**：旧版是每用户安装
+> （`%LOCALAPPDATA%\Programs\Desk2ONVIF`，不弹 UAC），新版是机器级安装
+> （需要 UAC）。Inno 的 AppId 相同，但安装模式变了，两者**不会被当成同一次
+> 安装** —— 请先在“应用和功能”里卸载旧版，再装新版。旧版配置在旧安装目录的
+> `config.json` 里，需要的话先抄走。
+
+> **安装包默认装成服务后**，桌面/开始菜单里的 `Desk2ONVIF` 是
+> `http://127.0.0.1:8080/` 的 URL 快捷方式；开始菜单里还有“服务状态”。
+> 服务进程在 Session 0，采集进程（worker）由它拉进**当前登录用户**的会话
+> （DXGI 必须在交互桌面才能抓到画面）。**未登录/锁屏时服务仍是 RUNNING，
+> 但不会采集**，登录后自动拉起。安装时取消“安装为 Windows 服务”则使用
+> `start-installed.bat`，窗口里能看到日志。
 
 ---
 
@@ -23,7 +39,8 @@
 ```
 
 它会列出每个显示输出，**并且逐个真的建一次捕获会话**来探测能不能录。
-记下你想录的那个的序号，待会儿用 `start.bat --display 1` 指定。
+记下你想录的那个的序号：绿色版可以用 `start.bat --display 1` 指定；安装版
+（服务或控制台形态）在 Web 控制台的「配置 → 通道」里选。
 
 > 虚拟显示器（向日葵/ToDesk 的虚拟屏、部分远程桌面适配器）**不支持桌面复制**。
 > 选中它们的结果是**黑屏或定格，而任何地方都不报错** —— 因为 `DuplicateOutput`
@@ -31,11 +48,14 @@
 
 **2. 启动**
 
-```
-双击  start.bat
-```
+- **安装包（默认服务形态）**：装完已经在跑了。桌面/开始菜单里的
+  `Desk2ONVIF` 是 URL 快捷方式，直接打开控制台；开始菜单「服务状态」可以看
+  服务是否 RUNNING。**服务只有在用户登录的会话里才采集**。
+- **安装包（控制台形态）**：双击 `start-installed.bat`（或开始菜单
+  「启动 Desk2ONVIF」）。窗口里能看到日志，关窗口即停止。
+- **绿色版**：双击 `start.bat`。
 
-起来之后屏幕上会打出地址，浏览器打开 **Web 控制台**就能看到画面和配置：
+起来之后浏览器打开 **Web 控制台**就能看到画面和配置：
 
 | | 地址 |
 |---|---|
@@ -65,8 +85,10 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:554/live
 
 | 文件 | 用途 |
 |---|---|
-| `start.bat` | 正常启动：RTSP + Web + ONVIF。**监听 0.0.0.0**，局域网可访问 |
-| `start-local.bat` | 同上，但只监听 `127.0.0.1`。**不想让局域网碰你的机器时用这个** |
+| `start.bat` | 绿色版入口：RTSP + Web + ONVIF，配置在 exe 旁边。**监听 0.0.0.0**，局域网可访问 |
+| `start-local.bat` | 同上，但只监听 `127.0.0.1`。**不想让局域网碰你的机器时用这个**；绿色版读 exe 旁的配置，安装版读 `%ProgramData%` 那份 |
+| `start-installed.bat` | **安装版（控制台形态）的入口**：读 `%ProgramData%\Desk2ONVIF\config.json`，窗口里能看到日志 |
+| `service-status.bat` | **安装版（服务形态）**：显示服务状态和 `sc query` 结果，窗口停住 |
 | `list-displays.bat` | 列出显示输出 + 探测能不能录（第一次先跑这个） |
 | `selfcheck.bat` | 依赖自检。起不来时跑它，能把"DLL 缺失/端口被占/没有可录输出"分开 |
 | `firewall-print.bat` | 把需要的防火墙命令**打出来**。只读，不动你的防火墙 |
@@ -77,6 +99,7 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:554/live
 .\start.bat --display 1 --fps 60 --bitrate 8000
 .\start.bat -RtspPort 8554          # 554 被别的 RTSP 服务占了的话
 .\start.bat -NoOnvif                # 只推流，不做 ONVIF 设备模拟
+.\start-installed.bat -RtspPort 8554   # 安装版控制台形态同理
 ```
 
 ---
@@ -112,8 +135,15 @@ Web 控制台上**改完就能存**。其中：
 - **其余（分辨率、帧率、码率、端口…）—— 要重启**。页面上会**逐项列出**
   哪几项还没生效，不是笼统一句"要重启"。
 
-配置文件是 **这个目录下的 `config.json`**（不在 `%APPDATA%`，所以整个文件夹
-是自包含的，拷到别的机器也不会和别处的配置打架）。**想恢复出厂设置，删掉它就行。**
+配置文件的位置取决于装法：
+
+- **安装包**：`C:\ProgramData\Desk2ONVIF\config.json`（机器级；安装器给 Users
+  组修改权限，登录用户跑的采集进程才能在网页上保存配置）。
+- **绿色版**：**这个目录下的 `config.json`**（不在 `%APPDATA%`，整个文件夹
+  自包含，拷到别的机器也不会和别处的配置打架）。
+
+**想恢复出厂设置，删掉对应的 `config.json` 就行。** 安装版删掉后需要重启
+服务（`sc stop Desk2ONVIF` / `sc start Desk2ONVIF`，或开始菜单「服务状态」查看）。
 
 > 码率是**改不了**的，这一点是实验证明过的，不是没做：FFmpeg 的 libx264
 > 封装层不认运行中改 `bit_rate`，而 `x264_encoder_reconfig` 根本没从
@@ -130,7 +160,9 @@ Web 控制台上**改完就能存**。其中：
 | 8082/tcp、8083/tcp… | 通道 2、通道 3… 的 ONVIF SOAP（**`8080 + 通道号`**） |
 | 3702/udp | WS-Discovery，NVR 靠它自动搜到设备 |
 
-被占了就换：`start.bat -RtspPort 8554`。
+被占了就换：绿色版用 `start.bat -RtspPort 8554`；安装版在安装向导里选，或者改
+`%ProgramData%\Desk2ONVIF\config.json` 的 `rtsp.port` / `web.port` 后重启服务
+（服务形态重启 `Desk2ONVIF` 服务，控制台形态退出窗口重开）。
 
 > 每路 ONVIF 一个端口，是因为 ONVIF 的设备服务**没有**"你说的是哪一路"这个信息
 > （`GetDeviceInformation` 就是个没有参数的 SOAP 请求），只能靠端口区分。代价是
@@ -192,10 +224,18 @@ Web 控制台上**改完就能存**。其中：
 
 **用绿色版的话这一节整节跳过** —— 它没有安装程序。
 
+安装程序是 `PrivilegesRequired=admin`，**静默安装也需要管理员权限**（在
+已经提升的命令行里跑；UAC 会在启动时装程序那一步弹一次）。
+
 ```powershell
+# 默认：装成 Windows 服务（推荐）
 Desk2ONVIF_Setup_<版本>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
     /DIR="D:\apps\Desk2ONVIF" /LOG="$env:TEMP\d2o-install.log" `
     /D2ORTSPORT=554 /D2OHTTPPORT=8080 /D2OSCOPE=all /MERGETASKS=!desktopicon
+
+# 不做服务，只要控制台形态（桌面/开始菜单指向 start-installed.bat）
+Desk2ONVIF_Setup_<版本>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
+    /LOG="$env:TEMP\d2o-install.log" /MERGETASKS=!installservice
 ```
 
 | 参数 | 说明 |
@@ -203,9 +243,14 @@ Desk2ONVIF_Setup_<版本>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
 | `/D2ORTSPORT` `/D2OHTTPPORT` | 端口，默认 `554` / `8080`。两个不能填成一样 |
 | `/D2OSCOPE=all`（或 `lan`）/ `local` | 监听所有网卡，还是只监听 `127.0.0.1` |
 | `/D2OUSER` `/D2OPASS` | 账号口令，默认 `admin` / `admin`。**写进两个地方**：`web.user`/`web.password`（控制台登录）和 `onvif.user`/`onvif.password`（NVR 添加通道时填的） |
+| `/MERGETASKS=!installservice` | **不装服务**，退化成控制台形态（装完双击 `start-installed.bat`） |
 | `/MERGETASKS=!desktopicon` | 不建桌面快捷方式（开始菜单项照建） |
 | `/LOG=<路径>` | 安装日志。**静默安装下这是唯一能看到警告的地方** |
 | `/DIR=<路径>` `/VERYSILENT` `/SUPPRESSMSGBOXES` `/NORESTART` | Inno 自己的开关 |
+
+服务模式会把服务注册为 `SERVICE_AUTO_START`，并在安装结束时立刻启动；
+配置写入 `%ProgramData%\Desk2ONVIF\config.json`。**没有登录用户时服务虽然
+RUNNING，但不会采集** —— worker 要等交互会话。控制台形态不会注册服务。
 
 **口令请走环境变量，不要写 `/D2OPASS=`。** Inno 的开关解析不按 MSVC 那套
 反斜杠转义规则来 —— 值里出现一个双引号会被当成引号分隔符吃掉，传进去的就不是
@@ -237,28 +282,29 @@ Desk2ONVIF_Setup_<版本>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="$en
 一行停在问句上、目标目录根本没建。这个症状和"安装程序坏了"长得一模一样。所以静默
 路径上凡是需要确认的地方，答案一律由参数预先决定，或者干脆不问。
 
-- **卸载会把操作日志一起删掉。** `{app}\logs\` 里的 `audit-*.log`（第四轮起的操作日志，
-  见 README 的「操作日志」一节）和 `config.json` 一样属于安装目录，卸载时清掉；
-  要留就先自己抄走。这一条是**修出来的**：在那之前卸载只删 `config.json`、
-  把 `logs\` 剩了下来，于是 `{app}` 不空、目录本身也不被移除 —— 症状是
-  "卸载完了还剩一个目录，里面一份配置加一份日志"。`logs\` 是**运行期**才出现的文件，
-  不在 Inno 的安装清单里，所以必须在 `[UninstallDelete]` 里显式声明。
+- **卸载会把配置和日志一起删掉。** `%ProgramData%\Desk2ONVIF\` 里的
+  `config.json`、`service.log`、`desk2onvif.log` 和 `logs\audit-*.log` 都属于
+  机器级数据，静默卸载时随目录一起清掉；要留就先自己抄走。交互式卸载会问
+  要不要保留配置（选“否”复制到 `%APPDATA%\Desk2ONVIF\config.json`）。
+  这些都是**运行期**才出现的文件，不在 Inno 的安装清单里，所以必须在
+  `[UninstallDelete]` 里显式声明，否则 `{app}`/ProgramData 目录不空、也不会被移除。
 
-装和卸都不需要管理员权限，不弹 UAC。这是刻意的：程序要把 `config.json` 写在 exe
-旁边（删掉它就是恢复出厂设置），装到 `Program Files` 的话每次存配置都要提权，
-而失败的表现是"改了配置存不下来"，很难查。
+安装和卸载都需要管理员权限（`PrivilegesRequired=admin`），会弹 UAC。这是
+服务形态的要求：注册/删除服务、写 `C:\Program Files` 和 `%ProgramData%` 都
+需要提升。**绿色版仍然不需要管理员权限**，配置就在 exe 旁边。
 
 ---
 
 ## 安全
 
-**Web 控制台要登录，而 `start.bat` 默认监听 `0.0.0.0`。** 从安装包装出来的，
+**Web 控制台要登录，而默认监听 `0.0.0.0`。** 从安装包装出来的，
 口令是你自己在向导里填的那个；**绿色版的出厂值是 `admin`/`admin`**，那一对就印在
 `--help` 里 —— 在没有改掉它之前，同一局域网内任何机器都能用它进来
 **看你的桌面画面、读配置、改配置**。
 
-装完请先改它（控制台 → 配置 → 登录用户名/登录口令，**存完当场生效、不用重启**），
-或者干脆用 `start-local.bat` 只监听 `127.0.0.1`。
+装完请先改它（控制台 → 配置 → 登录用户名/登录口令，**存完当场生效、不用重启**）。
+只想本机访问：安装向导的“监听范围”页选“仅本机”；绿色版或控制台形态也可以
+改用 `start-local.bat`（服务形态要先停掉服务，否则会被单实例锁挡住）。
 
 要留意的是这里**有两套凭据，互不相干**：
 

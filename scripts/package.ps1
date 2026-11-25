@@ -298,6 +298,13 @@ if ($Zip) {
     Copy-Item -LiteralPath (Join-Path $pack 'README-release.md') -Destination (Join-Path $stage 'README.md')
     Copy-Item -Path (Join-Path $pack '*.bat') -Destination $stage
     Copy-Item -Path (Join-Path $pack '*.ps1') -Destination $stage
+    # 这三个是**安装版专用**的：start-installed.bat / service-status.bat 引用的
+    # 是 %ProgramData% 里的机器级配置和已注册的服务，wait-worker-exit.bat 只在
+    # 卸载器里用。放进绿色版只会让人点开一个不属于 zip 语义的东西。
+    # （start-local.bat 靠 start-installed.bat 是否存在来判断自己是不是安装版。）
+    foreach ($f in @('start-installed.bat', 'service-status.bat', 'wait-worker-exit.bat')) {
+        Remove-Item -LiteralPath (Join-Path $stage $f) -Force -ErrorAction SilentlyContinue
+    }
     Copy-Item -LiteralPath $ico -Destination $stage
 
     # 绿色版的 start.bat 必须显式带 -Portable（配置放 exe 旁边，整包自包含）
