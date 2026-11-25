@@ -78,7 +78,7 @@ endif()
 # 不加的话任务栏和资源管理器显示的是 Windows 默认图标 —— 安装包和快捷方式
 # 各自有图标，唯独跑起来的程序没有，而这三处互不相干。
 project(Desk2ONVIF
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "Windows desktop screen as an ONVIF Profile S IP camera"
   LANGUAGES C CXX RC)
 
