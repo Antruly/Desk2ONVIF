@@ -295,18 +295,20 @@ async function onCopy(text: string, key: string): Promise<void> {
 </script>
 
 <template>
-  <div class="page-head">
-    <h1>日志与告警</h1>
-    <span class="hint">
-      审计回答「谁改了什么」；异常日志回答「机器自己出了什么事」。
-    </span>
-    <button v-if="tab === 'audit'" :disabled="loading" @click="load()">
-      <Icon name="refresh" :size="14" />{{ loading ? '读取中…' : '刷新' }}
-    </button>
-    <button v-else :disabled="logLoading" @click="loadLogs()">
-      <Icon name="refresh" :size="14" />{{ logLoading ? '读取中…' : '刷新' }}
-    </button>
-  </div>
+  <section class="page-head">
+    <div>
+      <h1>日志与告警</h1>
+      <p class="sub">审计回答「谁改了什么」；异常日志回答「机器自己出了什么事」。</p>
+    </div>
+    <div class="page-head__actions">
+      <button v-if="tab === 'audit'" :disabled="loading" @click="load()">
+        <Icon name="refresh" :size="14" />{{ loading ? '读取中…' : '刷新' }}
+      </button>
+      <button v-else :disabled="logLoading" @click="loadLogs()">
+        <Icon name="refresh" :size="14" />{{ logLoading ? '读取中…' : '刷新' }}
+      </button>
+    </div>
+  </section>
 
   <div class="seg-tabs wide">
     <button type="button" :class="{ 'is-on': tab === 'audit' }" @click="tab = 'audit'">
@@ -317,7 +319,7 @@ async function onCopy(text: string, key: string): Promise<void> {
     </button>
   </div>
 
-  <div v-if="tab === 'errors'">
+  <div v-if="tab === 'errors'" class="tab-panel">
     <div v-if="logError" class="banner is-err">
       <strong>读不到调试日志。</strong>{{ logError }}
     </div>
@@ -347,7 +349,7 @@ async function onCopy(text: string, key: string): Promise<void> {
     </div>
   </div>
 
-  <div v-if="tab === 'audit'">
+  <div v-if="tab === 'audit'" class="tab-panel">
   <!-- 连不上后端 / 500：与「日志里没有记录」是两回事，所以单独一块。 -->
   <div v-if="loadError" class="banner is-err">
     读不到操作日志（{{ loadError }}）。

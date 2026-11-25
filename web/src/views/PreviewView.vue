@@ -1242,13 +1242,15 @@ const firstFrameNote = computed(() => {
 </script>
 
 <template>
-  <div class="page-head">
-    <h1>实时预览</h1>
-    <span class="hint">
-      上排是多画面墙（取缩略图），点一路看这一路的实时画面。预览走 WebSocket 上的
-      fMP4，和 NVR 拉的 RTSP 是两条独立链路；「真实延迟」= 分片滞后 + 缓冲。
-    </span>
-  </div>
+  <section class="page-head">
+    <div>
+      <h1>实时预览</h1>
+      <p class="sub">
+        上排是多画面墙（取缩略图），点一路看这一路的实时画面。预览走 WebSocket 上的
+        fMP4，和 NVR 拉的 RTSP 是两条独立链路；「真实延迟」= 分片滞后 + 缓冲。
+      </p>
+    </div>
+  </section>
 
   <div class="card">
     <div class="row" style="justify-content: space-between; margin-bottom: 12px">
