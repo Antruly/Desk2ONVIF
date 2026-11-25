@@ -47,11 +47,25 @@
 namespace uvcpp {
 class uvcpp_web_request;
 class uvcpp_web_response;
+class uvcpp_web_next;
 }  // namespace uvcpp
 
 namespace d2o {
 
 class DeviceState;
+
+/// 这条 SOAP 请求落在哪个端点上。
+///
+/// **按路由分派，不按 Body 里的命名空间猜。** `GetServiceCapabilities` 在四个
+/// 服务里同名，而"客户端把请求发到哪个 URL"才是它真正的意图。用枚举而不是
+/// 串/布尔：再加一个服务时，漏改某个 `if` 会变成编译期错误，而不是一条
+/// 悄悄走错分派的请求。
+enum class OnvifRoute {
+  kDevice,
+  kMedia,
+  kMedia2,
+  kEvents,
+};
 
 /// 一路码流。ONVIF 的 Profile 就是"视频源 + 编码配置"的一套绑定。
 struct OnvifStreamProfile {
@@ -266,6 +280,16 @@ struct OnvifServiceOptions {
   /// `--no-rtsp-auth`）时**不嵌** userinfo —— 一个不需要口令的地址里塞
   /// 口令只会误导客户端和排障的人。
   bool rtsp_auth_enabled = true;
+
+  /// Media2（`/onvif/media2_service`）与 Events（`/onvif/events_service`）
+  /// 是否对外提供。**默认开**：新一些的 NVR 会优先走 Media2，而 Events 的
+  /// PullPoint 是它们添加通道时的常规探测。
+  ///
+  /// 关掉时不只是不注册路由：`GetServices` / `GetCapabilities` 里也**不宣告**
+  /// 对应服务。宣告了却连不上，比根本不宣告更糟 —— 客户端会卡在一个必然
+  /// 失败的探测上，而日志里看不出是我们主动关掉的。
+  bool media2_enabled = true;
+  bool events_enabled = true;
 
   /// Digest 凭据。`GetSystemDateAndTime` 之外的操作都要过这一关。
   std::string user = "admin";
@@ -564,14 +588,29 @@ class OnvifService {
   /// 同样**只能在循环线程上调**。
   void set_video_size(std::size_t index, int w, int h);
 
-  /// 处理一条 SOAP 请求。返回 true 表示响应**已经写完**（含 401 和 Fault）。
+  /// 处理一条 SOAP 请求。返回 true 表示这条请求已经被接手（含 401、Fault，
+  /// 以及 Events 的延迟响应）。
   ///
-  /// `media_service` 为真表示路由到媒体服务，否则设备服务。两个服务的操作名
-  /// 有重叠的可能（都有 `GetServiceCapabilities`），所以按**路由**而不是按
-  /// Body 的命名空间来分派 —— 后者的行为取决于客户端写了什么，而路由是我们
-  /// 自己定的，稳定得多。
+  /// `route` 决定落在哪个服务。四个服务的操作名有重叠（都有
+  /// `GetServiceCapabilities`），所以按**路由**而不是按 Body 的命名空间来
+  /// 分派 —— 后者的行为取决于客户端写了什么，而路由是我们自己定的。
+  ///
+  /// `next` 只有 Events 的长轮询用得上：没有它就只能立即回空消息。Web 那边
+  /// 把框架给的 `next` 原样传进来；单元测试/其它调用方不传，PullMessages
+  /// 仍然会给出结构良好的响应，只是不等那个 Timeout。
   bool handle(uvcpp::uvcpp_web_request& req, uvcpp::uvcpp_web_response& resp,
-              bool media_service);
+              OnvifRoute route);
+  bool handle(uvcpp::uvcpp_web_request& req, uvcpp::uvcpp_web_response& resp,
+              OnvifRoute route, uvcpp::uvcpp_web_next next);
+
+  /// Events 的延迟响应跑在**循环线程**上，但 OnvifService 拿不到 loop。
+  /// 由 Web 层注入一个"过 `delay_ms` 毫秒后在循环线程上执行"的投递器
+  /// （`delay_ms == 0` 表示下一拍立即执行）。
+  ///
+  /// **只能在循环线程起来之前调一次**（和 `set_options` 同一个时机）。
+  /// 空 = 不做长轮询，PullMessages 立即返回空消息。
+  void set_deferred_runner(
+      std::function<void(int delay_ms, std::function<void()>)> runner);
 
   /// 关掉之后连 `GetSystemDateAndTime` 也要鉴权。默认开着 —— 规范要求它是
   /// 匿名可访问的（客户端要先拿到时间才能算 Digest 的时钟偏移）。

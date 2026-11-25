@@ -26,6 +26,12 @@ NS = {
     "soap11": "http://schemas.xmlsoap.org/soap/envelope/",
     "tds": "http://www.onvif.org/ver10/device/wsdl",
     "trt": "http://www.onvif.org/ver10/media/wsdl",
+    "tr2": "http://www.onvif.org/ver20/media/wsdl",
+    "tev": "http://www.onvif.org/ver10/events/wsdl",
+    "wsnt": "http://docs.oasis-open.org/wsn/b-2",
+    "wstop": "http://docs.oasis-open.org/wsn/t-1",
+    "wsa": "http://www.w3.org/2005/08/addressing",
+    "d2o": "urn:desk2onvif:events",
     "tt": "http://www.onvif.org/ver10/schema",
     "ter": "http://www.onvif.org/ver10/error",
     "wsse": "http://docs.oasis-open.org/wss/2004/01/"
