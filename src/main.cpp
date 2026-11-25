@@ -2361,6 +2361,14 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
 
   std::string err;
   int tmp = 0;
+  // **通道 1 的来源先从配置落地。** 服务拉起的 worker 命令行只有
+  // `--worker --parent-pid --config`，没有 `--camera`，所以这是服务形态能选
+  // 摄像头的唯一入口。老配置没有 `capture.source` 时结构体默认 `display`，
+  // 这一段与引入它之前的行为逐字节相同。
+  opt.source.kind = cfg.capture.source.empty() ? "display" : cfg.capture.source;
+  opt.source.camera = cfg.capture.camera;
+  bool const display_given = args.has("--display");
+  bool const camera_given = args.has("--camera");
   if (!int_option(args, "--display", cfg.capture.display_index, 0, 64, tmp, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
   opt.source.display_index = static_cast<unsigned>(tmp);
   // `--camera <名|链接>`：把**通道 1** 的画面来源从桌面换成摄像头。
@@ -2373,7 +2381,7 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
   // **值不能为空**（`--record` 同一条纪律）：`--camera` 后面什么都没有时，
   // 悄悄退回"第一台"会让一条漏掉参数的启动命令看起来完全正常 —— 而它选中
   // 的可能是你根本不打算推出去的那一台。
-  if (args.has("--camera")) {
+  if (camera_given) {
     std::string const cam = args.value("--camera", std::string());
     if (cam.empty()) {
       std::printf("--camera 后面要给摄像头名字或符号链接，先用 --list-cameras "
@@ -2382,8 +2390,38 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     }
     // `kind` 一旦设成 webcam 就**不再回到 display** —— `apply_config_to_options`
     // 刻意原样保留它，所以重载（换分辨率 / 点降档）之后这一路还是摄像头。
+    // 命令行是**最高优先级**：它压过配置里的 `capture.source/camera`。
     opt.source.kind = "webcam";
     opt.source.camera = cam;
+    // 只有这一种情形允许运行侧覆盖文件里的 `capture.source/camera`（见
+    // `SessionOptions::source_from_cli`）。
+    opt.source_from_cli = true;
+  }
+  // `--display` 只对 `display` 来源有意义。来源是摄像头时它被忽略，而且
+  // **必须说出来**：否则用户会以为 `--display 1` 有作用，实际抓的是摄像头，
+  // 现象是"选了错的那块屏"——一个没有线索的错。
+  if (display_given && opt.source.kind != "display") {
+    std::string const cam_desc =
+        opt.source.camera.empty() ? std::string("第一台摄像头")
+                                  : ("摄像头「" + opt.source.camera + "」");
+    if (camera_given) {
+      D2O_WARN("--camera 与 --display 同时给了：画面来源以 --camera 为准（%s），"
+               "--display %u 不起作用。",
+               cam_desc.c_str(), opt.source.display_index);
+    } else {
+      D2O_WARN("配置里 capture.source=webcam（%s），--display %u 不起作用；"
+               "只有 capture.source=display 时 --display 才有意义。",
+               cam_desc.c_str(), opt.source.display_index);
+    }
+  }
+  {
+    std::string const src_desc =
+        opt.source.kind == "webcam"
+            ? (opt.source.camera.empty()
+                   ? std::string("摄像头（第一台）")
+                   : ("摄像头「" + opt.source.camera + "」"))
+            : d2o::fmt("桌面（显示器 %u）", opt.source.display_index);
+    D2O_INFO("通道 1 画面来源：%s", src_desc.c_str());
   }
   if (!int_option(args, "--fps", cfg.capture.fps, 1, 240, opt.fps, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
   if (!int_option(args, "--bitrate", cfg.capture.bitrate_kbps, 100, 100000, opt.bitrate_kbps, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }

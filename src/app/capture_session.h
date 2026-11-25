@@ -55,6 +55,14 @@ struct SessionOptions {
   /// 报的清单对得上（否则用户按清单上第 2 台的名字写进配置，程序按"第一个
   /// 非空字符串"去理解）。
   SourceSpec source;
+  /// `--camera` 是否在命令行上显式给了。**只影响“生效值回写”**：
+  ///
+  /// `sync_options_to_config()` 会在开机/重载之后把运行侧的值写回 `cfg`。
+  /// 如果用户在网页上把 `capture.source` 从 display 改成 webcam、还没重启，
+  /// 运行侧仍是 display；这时无条件回写会把用户刚存的值在内存里抹回
+  /// display，`GET /api/config` 和下一次保存都看到旧值。命令行显式覆盖是
+  /// 唯一“运行侧优先于文件”的情形，所以只在那时允许覆盖。
+  bool source_from_cli = false;
   int fps = 25;
   int bitrate_kbps = 2048;
   int gop_seconds = 2;
