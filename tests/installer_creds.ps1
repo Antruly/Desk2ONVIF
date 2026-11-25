@@ -11,18 +11,19 @@
     而修好两条、第三条没修，用户照样登不进去：
 
       断链 1  desk2onvif.iss 的 WriteConfig 只写了 onvif 那一组 —— Web 那份
-              落回出厂 admin/admin（`{app}\config.json` 里根本没有 web.user）
+              落回出厂 admin/admin（config.json 里根本没有 web.user）
       断链 2  start.ps1 无条件追加 `--onvif-user admin --onvif-password admin`
               —— 安装时填的那一对**每次启动都被踩掉**（NVR 那一侧）
-      断链 3  start-local.bat 漏了 `-Portable` —— 它去读
-              %APPDATA%\Desk2ONVIF\config.json，而安装包写的是 {app}\config.json
+      断链 3  start-local.bat 选错配置 —— 安装版必须读
+              %ProgramData%\Desk2ONVIF\config.json（-Config），而不是
+              %APPDATA% 或 exe 旁边那份
 
     所以判据分三层，每层**各自**盯住一条（每一层都配一个变异检验，见
     out\creds-mut\ 里那一轮的记录）：
 
-      [2] 读安装写出来的 {app}\config.json                  → 断链 1
-      [3] 用真的 start-local.bat 起服务，判「配置落在 exe 旁边，
-          而且被这次的命令行刷新过 + %APPDATA% 一字未动」   → 断链 3
+      [2] 读安装写出来的 %ProgramData%\Desk2ONVIF\config.json → 断链 1
+      [3] 用真的 start-local.bat 起服务，判"读的是 ProgramData 那份，
+          而且被这次的命令行刷新过 + %APPDATA% 一字未动"     → 断链 3
       [4] /api/login：填的那对能进、admin/admin 进不去       → 断链 1 / 3 的行为面
       [5] /api/config 的 web.user 与 **onvif.user**          → 断链 2 的正脸
 
@@ -57,7 +58,7 @@ param(
     [int]    $InstallRtspPort = 8562,
     [int]    $InstallHttpPort = 8205,
     # 起服务时命令行传的端口。**故意与上面那一对不同**：它是"start.ps1 读的是
-    # 哪一份配置"唯一的正面判据 —— 只有它读了 {app}\config.json 并走了启动回写，
+    # 哪一份配置"唯一的正面判据 —— 只有它读了 ProgramData 那份并走了启动回写，
     # 盘上那一份才会被刷成这两个数（见 [3] 段）。
     [int]    $RunRtspPort = 8563,
     [int]    $RunHttpPort = 8206,
@@ -113,7 +114,10 @@ if (-not $InstallDir) {
 }
 $log    = Join-Path $env:TEMP 'd2o-verify-creds-install.log'
 $apDir  = Join-Path $env:APPDATA 'Desk2ONVIF'
-$cfgPath = Join-Path $InstallDir 'config.json'
+# 安装版从 0.2.0 起把配置写在机器级的 ProgramData，不再是安装目录。
+# 这个脚本只验**控制台形态**（下面 /MERGETASKS 会取消 installservice），
+# 所以不会注册服务；配置仍是 ProgramData 那份。
+$cfgPath = Join-Path $env:ProgramData 'Desk2ONVIF\config.json'
 
 # 口令同时含 **引号 / 反斜杠 / 非 ASCII** 三样东西，一样都不是装饰：
 #   · 引号和反斜杠 —— `JsonEscape` 存在的全部理由。少了它，一份语法非法的
@@ -153,6 +157,17 @@ Check ($TestUser -cmatch '^[A-Za-z]') "用户名是纯 ASCII（$TestUser）" `
 
 # --- 前置：确认没有别的 Desk2ONVIF 在跑 --------------------------------
 Section "[1] 前置检查"
+# 这个脚本只验控制台形态，装的时候会取消 installservice。如果机器上已经有
+# 服务，它的 worker 会占着端口和 ProgramData 配置，验出来的是两件事混在一起。
+$svc = Invoke-Capture 'sc.exe' @('query', 'Desk2ONVIF') 20000 $root
+Check ($svc.ExitCode -ne 0) '没有已安装的 Desk2ONVIF 服务（本脚本只验控制台形态）' `
+      '先 desk2onvif.exe --service uninstall，或换一台机器再跑。'
+if ($svc.ExitCode -eq 0) {
+    throw '已存在 Desk2ONVIF 服务：先卸载它，否则这个脚本会把它和验证安装混在一起。'
+}
+if (Test-Path -LiteralPath $cfgPath) {
+    Write-Host "  （注意：$cfgPath 已存在；安装会覆盖它，静默卸载会删掉它）" -ForegroundColor Yellow
+}
 $running = @(Get-Process -Name 'desk2onvif' -ErrorAction SilentlyContinue)
 Check ($running.Count -eq 0) "没有正在运行的 desk2onvif（找到 $($running.Count) 个）" `
       '先关掉它再验：多个实例抢同一个 RTSP 端口，验出来的是噪音。'
@@ -180,7 +195,7 @@ if ($apBefore -eq '<不存在>') {
 }
 
 # --- [2] 静默安装，参数真的落进 config.json（断链 1）-------------------
-Section "[2] 静默安装 → 读 {app}\config.json（断链 1：安装包到底写没写 web 那份）"
+Section "[2] 静默安装 → 读 %ProgramData%\Desk2ONVIF\config.json（断链 1：安装包到底写没写 web 那份）"
 if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force }
 
 $env:DESK2ONVIF_PASSWORD = $TestPass
@@ -195,7 +210,9 @@ $sw = @(
     "/D2OUSER=$TestUser",
     "/D2ORTSPORT=$InstallRtspPort",
     "/D2OHTTPPORT=$InstallHttpPort",
-    '/MERGETASKS=!desktopicon'
+    # 这个脚本验的是控制台形态的凭据链路，不装服务（服务形态由
+    # scripts\verify_installer.ps1 覆盖）。
+    '/MERGETASKS=!desktopicon,!installservice'
 )
 Write-Host ("  命令行  " + ($sw -join ' ') + "  (+ DESK2ONVIF_PASSWORD 环境变量)")
 $inst = Invoke-Capture $Setup $sw 600000 $root
@@ -242,7 +259,8 @@ if (Test-Path -LiteralPath $cfgPath) {
 # --- [3] 用包里那份 start-local.bat 起服务（断链 3）--------------------
 #
 # 起的**就是用户双击的那个批处理**，不是把 start.ps1 的参数在这里再拼一遍：
-# 断链 3 恰恰在批处理那一行里（少一个 `-Portable`），绕开它就永远验不到。
+# 断链 3 恰恰在批处理那一行里（安装版该传 -Config 而不是 -Portable），
+# 绕开它就永远验不到。
 # 调用形态是 `cmd.exe /c call "<bat>" …` —— 已实测（out\creds-mut\launch-probe\）：
 # `/c` 后面第一个字符不是引号，于是 cmd 那条"剥掉命令行首尾引号"的老规则不
 # 参与，`> "out" 2> "err"` 照常工作，参数也逐字送到（含带空格的引号路径）。
@@ -265,15 +283,15 @@ try {
 
     if ($up) {
         # (a) 正面判据：盘上那一份被**这一次的命令行端口**刷新过。
-        #     只有 start.ps1 真的把 {app}\config.json 交给了 exe（-Portable），
+        #     只有 start-local.bat 真的把 ProgramData 那份交给了 exe（-Config），
         #     而且启动回写真的落了盘，才会有这个数。
         $cfg1 = $null
         try { $cfg1 = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
         if ($cfg1) {
             Check ($cfg1.web.port -eq $RunHttpPort) `
-                  "-Portable：配置落在 exe 旁边，且被这次的命令行端口刷新（web.port = $($cfg1.web.port)，期望 $RunHttpPort）" `
-                  ('对不上有两个可能，都要查：start-local.bat 没把 -Portable 传给 start.ps1' +
-                   '（于是它去读了 %APPDATA% 那份），或者启动回写没有落盘。')
+                  "-Config：配置在 ProgramData，且被这次的命令行端口刷新（web.port = $($cfg1.web.port)，期望 $RunHttpPort）" `
+                  ('对不上有两个可能，都要查：start-local.bat 没把 -Config 传给 start.ps1' +
+                   '（于是它去读了 %APPDATA%/exe 旁边那份），或者启动回写没有落盘。')
             # 顺带：这一份里那一对还是装的时候填的，命令行没有把它踩掉。
             Check ($cfg1.web.user -ceq $TestUser) "跑完之后 config.json 里的 web.user 仍是 $($cfg1.web.user)"
         } else {
@@ -296,7 +314,7 @@ try {
         Check ($outTxt.Length -gt 50) "start.ps1 的告示牌有输出（$($outTxt.Length) 字符）" `
               '空输出说明这条路根本没跑到打印那一步 —— 那样下面"没回落到 %APPDATA%"就是白过的。'
         Check (-not $outTxt.Contains($apDir)) 'start.ps1 没有回落到 %APPDATA% 那份配置' `
-              ("输出里出现了 $apDir —— 那就是断链 3（start-local.bat 少了 -Portable）。")
+              ("输出里出现了 $apDir —— start-local.bat 没有把 -Config 传给 start.ps1。")
         # 正面形态：命令行参数确实送到了 exe（告示牌上念的是这个端口）。
         Check ($outTxt -match [regex]::Escape(":$RunRtspPort/live")) `
               "告示牌上的 RTSP 地址是这次传的端口（$RunRtspPort）" `

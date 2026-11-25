@@ -407,8 +407,13 @@ jobs:
 
             | 文件 | 说明 |
             |---|---|
-            | `Desk2ONVIF_Setup_${{ steps.ver.outputs.version }}.exe` | 安装包。简体中文向导，装到 `%LOCALAPPDATA%\Programs\Desk2ONVIF`，**不弹 UAC** |
-            | `Desk2ONVIF-${{ steps.ver.outputs.version }}-win64.zip` | 绿色版。解压即用，整个目录拷走就能换机器 |
+            | `Desk2ONVIF_Setup_${{ steps.ver.outputs.version }}.exe` | 安装包。简体中文向导，**需要管理员权限（UAC）**，默认装到 `C:\Program Files\Desk2ONVIF` 并注册为开机自启的 Windows 服务 |
+            | `Desk2ONVIF-${{ steps.ver.outputs.version }}-win64.zip` | 绿色版。解压即用，整个目录拷走就能换机器，**不需要管理员权限** |
+
+            默认装成服务后，桌面/开始菜单里的快捷方式直接打开 `http://127.0.0.1:8080`
+            控制台；服务会在登录用户的会话里拉起采集进程（DXGI 需要交互桌面，未登录
+            时等待登录，不采集）。安装时取消“安装为 Windows 服务”则退化成控制台形态。
+            配置在 `C:\ProgramData\Desk2ONVIF\config.json`。
 
             装完浏览器打开 `http://127.0.0.1:8080` 就是控制台；NVR 那边添加 IP 通道时
             应该能自动发现它。**首次运行记得放行防火墙**（包里带了 `firewall-allow.bat`）。

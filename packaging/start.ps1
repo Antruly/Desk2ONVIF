@@ -9,6 +9,8 @@
       .\start.ps1 -RtspPort 8554           # 554 被占时换个端口
       .\start.ps1 -NoOnvif                 # 只推流，不做 ONVIF 设备模拟
       .\start.ps1 -Extra '--fps','60'      # 任何原样透传给 exe 的参数
+      .\start.ps1 -Config "$env:ProgramData\Desk2ONVIF\config.json"
+                                           # 安装版：用安装器写的那份配置
 
   这个脚本只做三件事：把路径拼对、把地址打出来、把进程跑起来。
   真正的参数解析在 exe 里（exe --help 是唯一的权威来源）。
@@ -29,6 +31,11 @@ param(
     # %APPDATA%\Desk2ONVIF\config.json —— 那是 Windows 上应用配置该在的地方，
     # 而且装在 Program Files 之类的只读目录时，往 exe 旁边写是要管理员权限的。
     [switch] $Portable,
+    # 安装版：显式指定配置文件。给了它就不再走 -Portable / %APPDATA% 那两条
+    # 分支 —— 安装包把配置写在 %ProgramData%\Desk2ONVIF\config.json，端口、
+    # 监听地址和凭据都在里面，所以 start-installed.bat 走这条路。绿色版的
+    # start.bat 不传它，行为不变。
+    [string] $Config,
     # 认不出来的参数也照收 —— 这样 `start.bat --fps 60` 能直接用，
     # 而不必逼人写成 -Extra '--fps','60'。这些同样原样透传给 exe。
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -66,14 +73,38 @@ if (-not (Test-Path -LiteralPath $web)) {
 #     用户看到的是"推流时不时连不上"，而不是任何一句能读懂的话。
 #   * 没有日志文件：窗口一关，stderr 跟着消失，出过什么问题一点痕迹都不留。
 # 这两样只属于长驻形态，所以显式声明，而不是让"传了 --rtsp 就算长驻"。
-$argv = @(
-    '--console',
-    '--rtsp', '--rtsp-port', "$RtspPort",
-    '--http', '--http-port', "$HttpPort",
-    '--web-root', $web
-)
+# --- 端口 / 监听地址：安装版以配置文件为准 ---------------------------------
+#
+# 绿色版和老的无参数用法：脚本的默认值（554 / 8080 / 0.0.0.0）就是"这次想用
+# 的值"，照旧显式传给 exe。
+#
+# 安装版（-Config）：这些值在安装器写的 config.json 里。脚本再传一遍默认值的话，
+# 会把安装时选的端口和"仅本机"悄悄洗掉 —— 而用户看到的现象只是"我装的时候
+# 选了 8554，怎么还是 554"。所以只有调用方**显式**给了 -RtspPort / -HttpPort /
+# -LocalOnly 时才覆盖。判据用 $PSBoundParameters，理由同下面 ONVIF 凭据那段：
+# "没传"和"传了默认值"必须分得开。
+$overrideRtspPort = $PSBoundParameters.ContainsKey('RtspPort')
+$overrideHttpPort = $PSBoundParameters.ContainsKey('HttpPort')
 
-if ($Portable) {
+$argv = @('--console')
+if (-not $Config -or $overrideRtspPort) {
+    $argv += @('--rtsp', '--rtsp-port', "$RtspPort")
+}
+if (-not $Config -or $overrideHttpPort) {
+    $argv += @('--http', '--http-port', "$HttpPort")
+}
+$argv += @('--web-root', $web)
+
+if ($Config) {
+    # 安装版：安装器写的配置在 ProgramData 里（Users 组可修改，网页保存配置
+    # 才写得进去）。**显式路径**，不依赖 exe 的默认值 —— exe 的默认是
+    # %APPDATA%，那是另一份，装完用它会读出一套全新的默认值。
+    $cfg = $Config
+    $argv += @('--config', $cfg)
+    if (-not (Test-Path -LiteralPath $cfg)) {
+        Write-Host "[!] $cfg 还不存在 —— 这次按内置默认值启动，保存时创建。" -ForegroundColor Yellow
+    }
+} elseif ($Portable) {
     # 绿色版：配置落在 exe 旁边，整个目录自包含，拷到别的机器也不打架。
     $cfg = Join-Path $root 'config.json'
     $argv += @('--config', $cfg)
@@ -81,14 +112,20 @@ if ($Portable) {
         Write-Host '[i] 绿色版模式：还没有 config.json，这次用内置默认值，保存时创建。'
     }
 } else {
-    # 安装版：不传 --config，用它自己的默认值 %APPDATA%\Desk2ONVIF\config.json。
+    # 无 -Config / -Portable：用它自己的默认值 %APPDATA%\Desk2ONVIF\config.json。
     # 这样升级、卸载、重装都不会把配置弄丢，也不要求安装目录可写。
     $cfg = Join-Path $env:APPDATA 'Desk2ONVIF\config.json'
     if (-not (Test-Path -LiteralPath $cfg)) {
         Write-Host "[i] $cfg 还不存在，这次用内置默认值，保存时创建。"
     }
 }
-if ($LocalOnly) { $argv += @('--http-host', '127.0.0.1') } else { $argv += @('--http-host', '0.0.0.0') }
+# -Config 形态下没给 -LocalOnly 就**不传** --http-host，让 config 里的
+# web.host 决定；否则安装时选的"仅本机"会被这里的 0.0.0.0 覆盖。
+if ($LocalOnly) {
+    $argv += @('--http-host', '127.0.0.1')
+} elseif (-not $Config) {
+    $argv += @('--http-host', '0.0.0.0')
+}
 if ($NoSub)     { $argv += '--no-sub' }
 
 # --- ONVIF 凭据：**只在调用方显式给了的时候**才覆盖 ------------------------
@@ -144,7 +181,6 @@ function Get-LanAddress {
 }
 
 $lan = Get-LanAddress
-$hostForUrl = if ($LocalOnly -or -not $lan) { '127.0.0.1' } else { $lan }
 
 $subPath = if ($NoSub) { $null } else { 'live_sub' }
 
@@ -158,6 +194,7 @@ $subPath = if ($NoSub) { $null } else { 'live_sub' }
 # 只差一个截图。忘了口令就在控制台里改一个新的。
 $effWebUser   = $null
 $effOnvifUser = $null
+$j = $null
 $cfgKnown = Test-Path -LiteralPath $cfg
 if ($cfgKnown) {
     try {
@@ -169,6 +206,26 @@ if ($cfgKnown) {
         Write-Host '    下面的登录名按**出厂值**显示，未必是程序实际用的那个。' -ForegroundColor Yellow
     }
 }
+
+# 端口和监听地址也念有效值。-Config 形态下它们以配置文件为准（脚本没有
+# 显式覆盖的话）；其他形态下脚本参数就是有效值。不这么做的话，安装时选了
+# 8554/仅本机，告示牌上却印着 554/0.0.0.0 —— 用户照着念的地址去连，连不上，
+# 而程序本身是对的。
+$effRtspPort  = $RtspPort
+$effHttpPort  = $HttpPort
+$effLocalOnly = [bool]$LocalOnly
+if ($cfgKnown -and $j) {
+    if (-not $overrideRtspPort -and $j.rtsp -and $j.rtsp.port) {
+        $effRtspPort = [int]$j.rtsp.port
+    }
+    if (-not $overrideHttpPort -and $j.web -and $j.web.port) {
+        $effHttpPort = [int]$j.web.port
+    }
+    if (-not $LocalOnly -and $Config -and $j.web -and $j.web.host) {
+        $effLocalOnly = ([string]$j.web.host -eq '127.0.0.1')
+    }
+}
+$hostForUrl = if ($effLocalOnly -or -not $lan) { '127.0.0.1' } else { $lan }
 # 命令行显式给了 ONVIF 用户名就以它为准（与 exe 的优先级一致）。
 $shownOnvifUser = if ($onvifUserGiven) { $OnvifUser } elseif ($effOnvifUser) { $effOnvifUser } else { 'admin' }
 # Web 口令没有命令行覆盖（本脚本不传 --http-user/--http-password），所以 Web 那份看配置文件。
@@ -176,18 +233,18 @@ $shownOnvifUser = if ($onvifUserGiven) { $OnvifUser } elseif ($effOnvifUser) { $
 Write-Host ''
 Write-Host '  Desk2ONVIF —— 桌面 → RTSP + ONVIF + Web 控制台' -ForegroundColor Cyan
 Write-Host ('  ' + ('-' * 58))
-Write-Host ("  主码流      rtsp://${hostForUrl}:${RtspPort}/live")
+Write-Host ("  主码流      rtsp://${hostForUrl}:${effRtspPort}/live")
 if ($subPath) {
-    Write-Host ("  子码流      rtsp://${hostForUrl}:${RtspPort}/${subPath}   （给 NVR 多画面网格用）")
+    Write-Host ("  子码流      rtsp://${hostForUrl}:${effRtspPort}/${subPath}   （给 NVR 多画面网格用）")
 }
-Write-Host ("  Web 控制台  http://${hostForUrl}:${HttpPort}/")
+Write-Host ("  Web 控制台  http://${hostForUrl}:${effHttpPort}/")
 if ($effWebUser) {
     Write-Host ("  Web 登录    ${effWebUser} / （口令不显示；忘了就在控制台里改一个新的）")
 } else {
     Write-Host  ("  Web 登录    admin / admin   （出厂值；${cfg} 还不存在）")
 }
 if (-not $NoOnvif) {
-    Write-Host ("  ONVIF       http://${hostForUrl}:${HttpPort}/onvif/device_service")
+    Write-Host ("  ONVIF       http://${hostForUrl}:${effHttpPort}/onvif/device_service")
     if ($effOnvifUser -or $onvifUserGiven) {
         Write-Host ("  NVR 凭据    用户名 ${shownOnvifUser}（口令不显示，和 Web 那份装完默认相同、之后各自独立）")
     } elseif ($cfgKnown) {
@@ -198,7 +255,7 @@ if (-not $NoOnvif) {
 }
 Write-Host ('  ' + ('-' * 58))
 
-if (-not $LocalOnly) {
+if (-not $effLocalOnly) {
     Write-Host '  [!] Web 控制台要登录，但出厂口令 admin/admin 是公开的，' -ForegroundColor Yellow
     Write-Host '      而这里监听的是 0.0.0.0 —— 在改掉口令之前，局域网内任何机器' -ForegroundColor Yellow
     Write-Host '      都能进来看你的桌面画面、读配置、改配置。' -ForegroundColor Yellow

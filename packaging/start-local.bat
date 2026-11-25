@@ -17,12 +17,15 @@ REM
 REM  An NVR on another machine will NOT be able to reach this. For NVR use,
 REM  run start.bat instead and mind the firewall.
 REM
-REM  -Portable is not decoration here. The installer writes config.json next
-REM  to the exe (desk2onvif.iss: Path := ExpandConstant('{app}\config.json')).
-REM  Without -Portable, start.ps1 looks for
-REM  %APPDATA%\Desk2ONVIF\config.json instead -- which for an installed copy
-REM  does not exist, so the run silently falls back to the built-in defaults
-REM  and the username/password typed during setup never apply.
+REM  Config location depends on which flavour this copy is:
+REM    * portable zip  -> config.json sits next to the exe; use -Portable
+REM    * installed     -> the installer also ships start-installed.bat and writes
+REM                       %ProgramData%\Desk2ONVIF\config.json; use -Config
+REM  The presence of start-installed.bat is the marker: only the installer
+REM  puts it here (the portable zip deliberately excludes it). Using
+REM  -Portable on an installed copy would read {app}\config.json, which no
+REM  longer exists, so the username/password typed during setup would
+REM  silently fall back to the built-in defaults.
 REM
 REM  This file is deliberately ASCII-only, for the same reason start.bat is:
 REM  cmd.exe under codepage 936 mis-pairs the quotes in non-ASCII comments
@@ -32,6 +35,10 @@ REM  Extra arguments are passed straight through:
 REM      start-local.bat --fps 60
 REM =====================================================================
 chcp 65001 >nul
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" -LocalOnly -Portable %*
+if exist "%~dp0start-installed.bat" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" -LocalOnly -Config "%ProgramData%\Desk2ONVIF\config.json" %*
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" -LocalOnly -Portable %*
+)
 echo.
 pause

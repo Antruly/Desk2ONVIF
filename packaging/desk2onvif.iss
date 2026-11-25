@@ -42,15 +42,20 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppUrl}
 #endif
 
-; PrivilegesRequired=lowest + {autopf} ⇒ 装到 %LOCALAPPDATA%\Programs\Desk2ONVIF。
-; 这是**刻意**的选择，不是省事：
-;   1. 装的时候不弹 UAC，用完卸载也不留残留；
-;   2. 那个目录**当前用户可写** —— 程序要把 config.json 写在 exe 旁边
-;      （绿色版语义，删掉就是恢复默认值）。装到 Program Files 的话，
-;      写配置每次都要管理员权限，而失败的表现是"改了配置存不下来"，很难查；
-;   3. 这个程序必须由**登录用户**在他的桌面会话里运行才抓得到画面。
-;      装成服务或在 Session 0 跑，DXGI 根本抓不到用户桌面 —— 和核心需求相冲。
-PrivilegesRequired=lowest
+; 安装包默认装成 Windows 服务（issue #8）。为此安装程序必须是 admin：
+;   · 服务要用 SCM 注册（CreateService 需要管理员），并从 {autopf}（Program Files）
+;     运行 —— Program Files 对普通用户只读，配置不能再写在 exe 旁边；
+;   · 机器级配置因此落在 %ProgramData%\Desk2ONVIF\config.json，[Dirs] 给
+;     Users 组 modify 权限（worker 以登录用户身份跑，网页保存配置要能写）。
+; 安装向导里的 "安装为 Windows 服务" 任务默认勾选；不勾则退化成控制台形态：
+; 仍然装到 Program Files、配置仍在 ProgramData，但由 start-installed.bat 在
+; 用户会话里前台启动。
+;
+; 为什么服务不是"在 Session 0 里采集"：DXGI 桌面复制必须在交互会话（Session 1）
+; 才能抓到用户桌面。desk2onvif.exe --service run 是 Session 0 的看门狗，它用
+; WTSQueryUserToken 把 worker 拉进当前登录用户的会话；没有登录/锁屏时服务
+; 状态仍是 RUNNING，只是等交互会话出现。
+PrivilegesRequired=admin
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -71,7 +76,29 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Name: "chinesesimplified"; MessagesFile: "languages\ChineseSimplified.isl"
 
 [Tasks]
+; 默认装服务。checkedonce = 首次安装默认勾选，升级时沿用上次的选择（用户
+; 明确取消过的话，不要每次都替他把服务装回来）。
+Name: "installservice"; Description: "安装为 Windows 服务（推荐：开机自启，登录后自动采集）"; GroupDescription: "附加任务："; Flags: checkedonce
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："
+
+[Dirs]
+; 机器级配置目录。worker 以**登录用户**身份运行，而网页上保存配置是它写的 ——
+; 只给管理员/System 权限的话，用户点"保存"会失败，症状是"改了配置存不下来"
+; 而没有任何更具体的提示。users-modify 让 Users 组可写；Program Files 里
+; 的 exe 仍然只有管理员能改。
+Name: "{commonappdata}\{#MyAppName}"; Permissions: users-modify
+
+[InstallDelete]
+; 升级时清掉**上一种形态**留下的入口。服务形态的桌面/开始菜单是 .url，
+; 控制台形态是 .lnk（或指向 start-installed.bat）—— 扩展名不同，不会互相
+; 覆盖。不删的话，从 0.2.0（桌面指向 start.bat）升上来会同时看到新旧两个
+; 图标，旧的那个还会去读已经不存在的 exe 旁边配置。
+; [InstallDelete] 在 [Icons] 之前执行，所以这里删完，下面按当前形态重建。
+Type: files; Name: "{autodesktop}\{#MyAppName}.lnk"
+Type: files; Name: "{autodesktop}\{#MyAppName}.url"
+Type: files; Name: "{group}\启动 {#MyAppName}.lnk"
+Type: files; Name: "{group}\打开 Web 控制台.url"
+Type: files; Name: "{group}\服务状态.lnk"
 
 [Files]
 Source: "..\build\bin\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -96,6 +123,12 @@ Source: "..\packaging\README-release.md"; DestDir: "{app}"; DestName: "README.md
 Source: "..\packaging\start.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\start.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\start-local.bat"; DestDir: "{app}"; Flags: ignoreversion
+; 安装版的控制台入口：读 %ProgramData% 里那份配置，窗口里能看到日志。
+Source: "..\packaging\start-installed.bat"; DestDir: "{app}"; Flags: ignoreversion
+; 开始菜单"服务状态"用：--service status + sc query，窗口停住给人看。
+Source: "..\packaging\service-status.bat"; DestDir: "{app}"; Flags: ignoreversion
+; 卸载时等 Session 1 的 worker 退出，再让 Inno 删文件（见 [UninstallRun]）。
+Source: "..\packaging\wait-worker-exit.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\list-displays.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\selfcheck.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\firewall-allow.bat"; DestDir: "{app}"; Flags: ignoreversion
@@ -103,44 +136,63 @@ Source: "..\packaging\firewall-print.bat"; DestDir: "{app}"; Flags: ignoreversio
 Source: "..\resources\desk2onvif.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-; 主入口走 start.bat 而不是 exe：批处理会先把端口/监听地址/凭据拼好再启动，
-; 直接点 exe 的话用的是内置默认值，装的时候选的那些设置就白选了。
-Name: "{group}\启动 {#MyAppName}"; Filename: "{app}\start.bat"; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"
+; 两种形态的入口不一样，但共用同一个 AppId / 安装目录：
+;   · 服务模式：程序已经在跑，用户要的是网页。所以建的是 **URL 快捷方式**
+;     （.url），指向安装时选的 Web 端口 —— 不是 exe、也不是 start.bat。
+;   · 控制台模式：没有常驻进程，入口是 start-installed.bat（窗口里能看到日志）。
+; Check 函数定义在 [Code]；**不要**写 "Tasks: not installservice" ——那不是
+; Inno 的语法，编译期不会报错，运行时却会安静地不选中/选不中。
+Name: "{group}\打开 Web 控制台"; Filename: "http://127.0.0.1:{code:GetWebPort}/"; IconFilename: "{app}\desk2onvif.ico"; Check: IsServiceMode
+Name: "{group}\服务状态"; Filename: "{app}\service-status.bat"; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"; Check: IsServiceMode
+Name: "{group}\启动 {#MyAppName}"; Filename: "{app}\start-installed.bat"; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"; Check: IsConsoleMode
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\start.bat"; Tasks: desktopicon; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "http://127.0.0.1:{code:GetWebPort}/"; Tasks: desktopicon; IconFilename: "{app}\desk2onvif.ico"; Check: IsServiceMode
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\start-installed.bat"; Tasks: desktopicon; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"; Check: IsConsoleMode
 
 [Run]
-; 装完问一句要不要立刻启动。skipifsilent 是给无人值守安装用的。
-Filename: "{app}\start.bat"; Description: "立即启动 {#MyAppName}"; Flags: postinstall nowait skipifsilent
+; 服务模式：写配置是 ssPostInstall，[Run] 在它之后执行，所以 --service install
+; 读到的已经是一份完整的 config.json。这里**不能**加 skipifsilent —— 静默
+; 安装正是最需要把服务装起来的那条路。
+; 配置路径必须是绝对路径：服务进程的 cwd 是 C:\Windows\System32，相对路径
+; 在那边指向别处，而症状是"服务起来了、worker 也在跑，读的却是默认配置"。
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--service install --config ""{commonappdata}\{#MyAppName}\config.json"" --start"; Flags: runhidden waituntilterminated; Check: IsServiceMode
+; 控制台模式：装完问一句要不要立刻启动，窗口里能看到日志。skipifsilent 是
+; 给无人值守安装用的（那时也不该弹一个前台窗口）。
+Filename: "{app}\start-installed.bat"; Description: "立即启动 {#MyAppName}（控制台模式）"; Flags: postinstall nowait skipifsilent; Check: IsConsoleMode
+; 这两项两种形态都适用。
 Filename: "{app}\README.md"; Description: "打开使用说明"; Flags: postinstall shellexec skipifsilent unchecked
 Filename: "{app}\list-displays.bat"; Description: "先看看这台机器能不能录（推荐第一次运行前跑）"; Flags: postinstall nowait skipifsilent unchecked
 
+[UninstallRun]
+; **顺序不能反，中间也不能省掉等待。** 先停服务、删服务对象；worker 是服务
+; 拉进 Session 1 的另一个进程，它比服务晚几百毫秒到几秒退出。Inno 在
+; [UninstallRun] 之后立刻删文件 —— 如果 worker 还活着，Windows 会拒绝删除
+; 正在运行的 exe 和它打开的 desk2onvif.log，留下一个半删的目录。
+; 所以第二条用 wait-worker-exit.bat 有界等待（最多 30 秒）。
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--service uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "D2OUninstallService"
+Filename: "{cmd}"; Parameters: "/C ""{app}\wait-worker-exit.bat"""; Flags: runhidden waituntilterminated; RunOnceId: "D2OUninstallWaitWorker"
+
 [UninstallDelete]
-; config.json 是 [Code] 在 ssPostInstall 里写的，**不在** Inno 的安装清单里
-; （unins000.dat 只记 [Files] 装下去的那些）。什么都不写的话，静默卸载会把
-; 整个目录删干净、只留一个 config.json，于是 {app} 目录不空、不会被移除 ——
-; 表现为"卸载完了还剩一个目录，里面一份配置"。
-; 交互式卸载里选"保留配置"的那条路会先把它抄到 {userappdata}，所以这里
-; 无条件删是安全的：要留的已经留过了。usUninstall 阶段跑在这之前。
+; 机器级配置/日志目录。**交互式卸载里选"保留配置"的那条路会先在
+; CurUninstallStepChanged(usUninstall) 里把 config.json 抄到
+; {userappdata}\Desk2ONVIF**，而 usUninstall 跑在本节之前，所以这里无条件
+; 删整个目录是安全的：要留的已经留过了。静默卸载不问，直接删（见下面的代码）。
+; filesandordirs 而不是 files：service.log / desk2onvif.log / logs\ 都是
+; 运行期才出现的，不在这里声明的话目录不空、也不会被移除。
+Type: filesandordirs; Name: "{commonappdata}\{#MyAppName}"
+
+; --- 以下三条是**旧布局**（0.2.0 及以前）的清理项 --------------------------
+; 从那些版本升级上来时，{app} 里可能还留着 config.json / logs\ /
+; desk2onvif.log。新的配置和日志都在上面的 ProgramData 目录里；这几条留下
+; 只是为了让升级后的卸载不把旧文件剩在 {app} 里（旧文件不属于新安装清单，
+; 不显式声明就会让 {app} 不空、目录不被移除）。
 Type: files; Name: "{app}\config.json"
 Type: files; Name: "{app}\config.json.bak"
 
-; 上面那条判据漏了一整类：**运行期才出现的文件**。【2026-10-08 实测】
-; 操作日志（第四轮 Phase V）落在 {app}\logs\audit-YYYY-MM-DD.log —— 同样是运行时
-; 才建的，不在 unins000.dat 里。不声明的话，静默卸载把 config.json 删掉、
-; 却把 logs\ 整个留下，{app} 于是照样不空、照样不被移除：
-;   [FAIL] 安装目录还在（C:\...\Desk2ONVIF-verify）
-;   [FAIL] 卸载没有留下多余东西（剩 2 项）
-;          logs, logs\audit-2026-10-08.log
-; 症状与 config.json 那一版一模一样，只是文件多了一层目录。绿色版验收没有这一条
-; （它靠 harness 删临时目录），所以只有安装包这一路能照出来。
+; 操作日志（第四轮 Phase V）在旧布局里落在 {app}\logs\audit-YYYY-MM-DD.log。
 ; filesandordirs 而不是 files：目录本身也得删掉，否则 {app}\logs 空着一样让
 ; {app} 不空。范围限死在 {app} 里面，不递归到别处。
 Type: filesandordirs; Name: "{app}\logs"
-; 同一类：控制台形态（--console）会写 <配置目录>\desk2onvif.log 及其轮转的 .old。
-; 这一次的验收没跑到它们（验收里起的是裸形态 --http，那条路按设计不写日志文件），
-; 所以这两条**不是实测出来的**，是按上面同一个机制补上的 —— 写在这里以免
-; 下次有人以为是漏了。它们同样只落在 {app} 里。
 Type: files; Name: "{app}\desk2onvif.log"
 Type: files; Name: "{app}\desk2onvif.log.old"
 
@@ -154,6 +206,67 @@ var
   SelectedHost:     String;
   SelectedUser:     String;
   SelectedPass:     String;
+
+{ 安装形态判定。[Icons] / [Run] 的 Check: 用这两个函数。
+  任务名叫 installservice（[Tasks] 里默认 checkedonce = 首次勾选）。
+  **不要**写 "Tasks: not installservice" —— Inno 没有这个语法；编译不报错，
+  运行时只会安静地不选中，症状是"服务装了但开始菜单里没有入口"。 }
+function IsServiceMode: Boolean;
+begin
+  Result := WizardIsTaskSelected('installservice');
+end;
+
+function IsConsoleMode: Boolean;
+begin
+  Result := not IsServiceMode;
+end;
+
+{ URL 快捷方式的目标端口。只在安装阶段被 [Icons] 调用 —— 卸载时 Inno 用的是
+  unins000.dat 里记录好的快捷方式名，不会重新展开这个常量。 }
+function GetWebPort(Param: String): String;
+begin
+  Result := IntToStr(SelectedHttpPort);
+end;
+
+{ --- 升级时等旧的 worker 退出 --------------------------------------------
+  `--service uninstall` 只等 SCM 的服务对象变成 STOPPED；它拉进 Session 1 的
+  worker 会晚几百毫秒到几秒才退出。Inno 在 ssInstall 之后马上往 app 目录覆盖
+  文件 —— 旧 exe 还在跑时 Windows 拒绝覆盖，结果可能是"旧服务已经删了、
+  新文件没换上去"的半状态。所以这里轮询 tasklist（最多 30 秒）。
+
+  为什么用 cmd/tasklist 而不是 PowerShell：ssInstall 阶段 app 目录里可能还是
+  旧版本的文件，能依赖的只有系统自带的命令。 }
+function AnyDesk2OnvifRunning: Boolean;
+var
+  ResultCode: Integer;
+  OutFile: String;
+  Text: AnsiString;
+begin
+  Result := False;
+  OutFile := ExpandConstant('{tmp}\d2o_tasklist.txt');
+  if FileExists(OutFile) then DeleteFile(OutFile);
+  if Exec(ExpandConstant('{cmd}'),
+          '/C tasklist /FI "IMAGENAME eq desk2onvif.exe" /NH > "' + OutFile + '"',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    if LoadStringFromFile(OutFile, Text) then
+      Result := Pos('DESK2ONVIF.EXE', Uppercase(Text)) > 0;
+  end;
+end;
+
+procedure WaitForDesk2OnvifExit;
+var
+  I: Integer;
+begin
+  for I := 1 to 60 do
+  begin
+    if not AnyDesk2OnvifRunning then Exit;
+    Sleep(500);
+  end;
+  { 不中止安装：用户可能正开着控制台实例，Inno 自己还有"文件正在使用"的
+    处理路径。写进日志，免得事后只看到"覆盖失败"却不知道是谁占着。 }
+  Log('警告：30 秒后还有 desk2onvif.exe 在运行，安装可能无法替换正在使用的文件。');
+end;
 
 { 端口是否已被占用。用 PowerShell 试连一次 —— 比在 Pascal 里手搓
   winsock 短得多，而且失败时不会把安装程序带崩。 }
@@ -230,10 +343,24 @@ end;
   "invalid literal"，而读配置失败是**拒绝启动**的。UTF-8 无 BOM 两边都对。 }
 procedure WriteConfig;
 var
-  Json, Path, Bak: String;
+  Json, Path, Bak, Legacy: String;
   Lines: TArrayOfString;
 begin
-  Path := ExpandConstant('{app}\config.json');
+  { 机器级配置。安装器是 admin，写这里不需要额外提权；[Dirs] 给 Users 组
+    modify 权限，所以 worker（登录用户身份）在网页上保存配置时也写得进去。
+    不再写到 app 目录里的 config.json：Program Files 对普通用户只读。 }
+  Path := ExpandConstant('{commonappdata}\{#MyAppName}\config.json');
+  ForceDirectories(ExpandConstant('{commonappdata}\{#MyAppName}'));
+
+  { 0.2.0 及以前把配置写在 app 目录的 config.json 里。升级时那份不会被
+    程序再读，而下面会写一份新的；先把它抄成 ProgramData 里的 .bak，至少
+    端口/口令还有据可查（不做自动迁移：旧文件可能来自另一台机器的绿色版）。 }
+  Legacy := ExpandConstant('{app}\config.json');
+  if FileExists(Legacy) and not FileExists(Path) then
+  begin
+    if CopyFile(Legacy, Path + '.bak', False) then
+      Log('旧布局的 config.json 已备份为 ' + Path + '.bak');
+  end;
 
   { 重装/升级时会**覆盖**已有的 config.json，而向导里的端口默认是 554/8080 ——
      用户上次填的可能是别的，一路点"下一步"就把自己的配置洗掉了。
@@ -542,22 +669,66 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  OldExe: String;
 begin
-  { 配置写在**装完**这一步，而不是 [Files] 里带一个模板文件 ——
-     模板没法把用户在向导里选的端口填进去。 }
-  if CurStep = ssPostInstall then
+  if CurStep = ssInstall then
+  begin
+    { 升级/重装：**旧服务必须先停再删**，而且在 Inno 覆盖文件之前等 worker
+      退出。完整顺序：
+        ssInstall  --service uninstall（停 + 删服务对象）
+                   等 worker 退出
+        文件复制     覆盖 exe/dll
+        ssPostInstall  写新的 ProgramData 配置
+        Run 阶段     --service install --start
+      不能省掉第一步：新文件覆盖不上（旧 exe 正在运行）或者旧服务还占着
+      554/8080，两种都会留下"服务在、版本旧"或"文件新、服务旧"的半状态。 }
+    OldExe := ExpandConstant('{app}\{#MyAppExeName}');
+    if FileExists(OldExe) then
+    begin
+      Log('升级/重装：先停止并删除旧服务（如果装过）……');
+      if Exec(OldExe, '--service uninstall', ExpandConstant('{app}'),
+              SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+        Log('旧版 --service uninstall 退出码：' + IntToStr(ResultCode))
+      else
+        Log('警告：无法运行旧版 --service uninstall（' + IntToStr(ResultCode) + '）');
+      { 旧版（或异常退出）没把服务删掉时兜底。sc stop/delete 不需要旧 exe
+        支持 --service；服务名是固定的。不存在时两条都会安静失败，不影响
+        全新安装。 }
+      if ResultCode <> 0 then
+      begin
+        Log('尝试用 sc stop/delete 兜底清理旧服务。');
+        Exec(ExpandConstant('{cmd}'),
+             '/C sc stop Desk2ONVIF >nul 2>&1 & sc delete Desk2ONVIF >nul 2>&1',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      end;
+      WaitForDesk2OnvifExit;
+    end;
+  end
+  else if CurStep = ssPostInstall then
+  begin
+    { 配置写在**装完**这一步，而不是 [Files] 里带一个模板文件 ——
+       模板没法把用户在向导里选的端口填进去。 }
     WriteConfig;
+  end;
 end;
 
-{ 卸载时问一句要不要连配置一起删掉。选"否"就把 config.json 先挪出来 ——
-   换版本重装时不用再填一遍端口和凭据。 }
+{ 卸载时问一句要不要连配置一起删掉。选"否"就把 config.json 先抄出来 ——
+   换版本重装时不用再填一遍端口和凭据。
+
+   配置现在在 %ProgramData%\Desk2ONVIF（机器级），选"保留"时抄到
+   userappdata 目录（当前卸载者）。[UninstallDelete] 随后会无条件
+   删掉 ProgramData 整个目录，所以复制**必须**发生在这里（usUninstall 早于
+   UninstallRun 和文件删除）。 }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  Cfg, Keep: String;
+  Cfg, Keep, CommonDir: String;
+  I: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
-    Cfg := ExpandConstant('{app}\config.json');
+    Cfg := ExpandConstant('{commonappdata}\{#MyAppName}\config.json');
     if FileExists(Cfg) then
     begin
       { 静默卸载**不问**，直接按"一起删掉"走。理由和上面那些 MsgBox 一样：
@@ -571,9 +742,27 @@ begin
                 '下次重装不用再填一遍。', mbConfirmation, MB_YESNO) = IDNO then
       begin
         Keep := ExpandConstant('{userappdata}\Desk2ONVIF');
-        if not DirExists(Keep) then CreateDir(Keep);
-        CopyFile(Cfg, Keep + '\config.json', False);
+        ForceDirectories(Keep);
+        if CopyFile(Cfg, Keep + '\config.json', False) then
+          Log('配置已保留到 ' + Keep)
+        else
+          Log('警告：复制配置到 ' + Keep + ' 失败。');
       end;
     end;
+  end
+  else if CurUninstallStep = usPostUninstall then
+  begin
+    { 兜底：wait-worker-exit.bat 已经等过 worker，但若某个文件仍被占用，
+      UninstallDelete 会安静地留下目录。这里重试几次 DelTree。
+      keep 的那份已经复制到 userappdata 目录，删 ProgramData 是安全的。 }
+    CommonDir := ExpandConstant('{commonappdata}\{#MyAppName}');
+    for I := 1 to 10 do
+    begin
+      if not DirExists(CommonDir) then Exit;
+      Sleep(500);
+      DelTree(CommonDir, True, True, True);
+    end;
+    if DirExists(CommonDir) then
+      Log('警告：卸载后 %ProgramData%\Desk2ONVIF 仍在，可能有进程占着里面的文件。');
   end;
 end;
