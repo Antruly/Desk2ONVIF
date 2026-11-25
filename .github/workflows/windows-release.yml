@@ -38,21 +38,21 @@ env:
   #
   # 这一条不是"求稳"，是功能上的硬要求：Desk2ONVIF 的 ONVIF 层调的是
   # `uvcpp_soap_*` / `uvcpp_wsdl_*`，而 Windows 动态库下**一个 SOAP 符号都不导出**
-  # 那个 bug 是先修在 release 分支上、再合进 tag 的：
+  # 那个 bug 历史上是先修在 release 分支上、再合进 tag 的：
   #
-  #   v1.6.2 / v1.6.3 / v1.6.4  → 含该修复
-  #   master (c8950ae)          → **不含**
+  #   v1.6.2 及以后的 release tag（含当前钉的 v1.11.0） → 含该修复
+  #   当时的 master (c8950ae)                          → **不含**
   #
-  # 也就是说钉 master 会编出一个 import 表里没有 uvcpp_soap_* 的 DLL，症状是
+  # 所以钉 master 会编出一个 import 表里没有 uvcpp_soap_* 的 DLL，症状是
   # Desk2ONVIF 链接期一串 `undefined reference to 'uvcpp_soap_...'`，而报错指向
   # 我们自己的 .cpp —— 看起来像我们漏了实现，实际是上游 DLL 没导出。
   # 验证方法：
   #   objdump -p libuvcpp.dll | grep -c uvcpp_soap
   #
   # 钉 tag 而不是 commit：release tag 就是"发出去的那一版"，跟着它走语义清楚，
-  # 升级时改这一行即可。当前 v1.6.4 解析到
-  # faf1e50ade221203e0e86d7eb084bcd21577da23（2026-10-12）。
-  UVCPP_REF: v1.6.4
+  # 升级时改这一行即可。当前 v1.11.0 解析到
+  # 3613c81c2f3349702c9ec6f9a79ce23019736115（2026-11-23）。
+  UVCPP_REF: v1.11.0
 
   # 两个脚本都打印中文。原生 python 写管道时按 locale 选编码（runner 上是
   # cp1252）⇒ UnicodeEncodeError 直接在打印那行崩掉，看着像脚本 bug。

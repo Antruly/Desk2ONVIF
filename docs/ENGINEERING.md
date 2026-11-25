@@ -607,6 +607,27 @@ x264 于是把档位降到 **Constrained Baseline，不管 `--profile` 写的是
 
 它**不碰**防火墙规则、不碰 `%APPDATA%` 以外的数据、不碰 `Temp\`。
 
+## 服务形态：为什么没有直接用 `uvcpp_service_run()`
+
+libuvcpp 1.11.0 新增的 `uvcpp_service_run()` 能把一个 `uvcpp_web_app` 直接装成
+Windows 服务：SCM 拉起、失败后自动重启、单实例、日志重定向与轮转都由它负责。
+**本项目没有换过去**，原因不在接口，在会话。
+
+`uvcpp_service_run()` 的服务模式下，`uvcpp_web_app` 就跑在 SCM 拉起的那个进程
+里 —— 也就是 **Session 0**。而本项目的采集是 DXGI 桌面复制，它**在 Session 0
+里抓不到交互用户的桌面**。把 HTTP / ONVIF / RTSP 和采集一起搬进服务进程，等于
+把画面弄没。
+
+所以服务形态仍然是 `src/service/service_host.cpp` 的那一套：**Session 0 只放
+看门狗**（等交互会话出现、拿那个会话的用户令牌、把同一个 exe 以 `--worker`
+丢进 `winsta0\default`、worker 退出按退避重拉），**采集 / 编码 / HTTP / ONVIF /
+RTSP 全部在 Session 1 的 worker 里**。这个架构的边界和理由（包括为什么 worker 盯
+父进程句柄而不是命名事件）写在 [`src/service/service_host.h`](../src/service/service_host.h)
+的文件头注释里。
+
+1.11.0 提供的是 web / SOAP / 进程监管等底层能力，本项目照常受益；它**不替换**
+本项目的服务形态。
+
 ## 版本号：一个来源，每次打包自增
 
 版本号只有**一个来源**：`CMakeLists.txt` 里 `project(Desk2ONVIF VERSION x.y.z)`

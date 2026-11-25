@@ -16,7 +16,7 @@ GPL 要求分发二进制时能让接收者拿到对应源码，所以每一项�
 | 组件 | 版本 | 许可证 | 文件 | 源码 |
 |---|---|---|---|---|
 | FFmpeg | 9.0.2 (gyan.dev full_build shared) | **GPL-3.0-or-later** | `avcodec-63.dll` `avdevice-63.dll` `avfilter-12.dll` `avformat-63.dll` `avutil-61.dll` `swresample-7.dll` `swscale-10.dll` | https://ffmpeg.org/download.html |
-| libuvcpp | 1.5.0 | MIT | `libuvcpp.dll` | https://github.com/Antruly/libuvcpp |
+| libuvcpp | 1.11.0 | MIT | `libuvcpp.dll` | https://github.com/Antruly/libuvcpp |
 | libuv | 1.51 | MIT | `libuv.dll` | https://github.com/libuv/libuv |
 | llhttp | 9.x | MIT | `libllhttp.dll` | https://github.com/nodejs/llhttp |
 | OpenSSL | 3.5.x | Apache-2.0 | `libssl-3-x64.dll` `libcrypto-3-x64.dll` | https://www.openssl.org/source/ |

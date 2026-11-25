@@ -101,8 +101,10 @@ Windows 上创建不了且会让 tar 报错退出 —— 脚本用
 
 ## libuvcpp — 唯一一个要自己编的
 
-**所有预编译包里 `UVCPP_WSDL_ENABLE` 都是 0**，也就是头文件在、`uvcpp_soap_*`
-的符号不在。ONVIF 的 SOAP 信封层就靠它，所以必须从源码编全量版本。
+当前钉的版本是 **v1.11.0**（`.github/workflows/windows-release.yml` 的
+`UVCPP_REF`）。**v1.11.0 的预编译包里 `UVCPP_WSDL_ENABLE` 仍然是 0**，也就是
+头文件在、`uvcpp_soap_*` 的符号不在 —— 这一点从 v1.6.x 到现在没变过。ONVIF 的
+SOAP 信封层就靠它，所以本项目仍然必须从源码编全量版本。
 
 源码：`D:\public\libuvcpp\libuvcpp`（可用 `-Source` 或环境变量
 `UVCPP_SOURCE` 改）。构建产物在 `build-mingw64-full/`。
@@ -134,6 +136,10 @@ cmake --build build-mingw64-full -j
 
 `FETCHCONTENT_SOURCE_DIR_*` 全部指向源码树里的 `_local_deps/`，所以构建
 **完全离线**。`UVCPP_ENABLE_WSDL=ON` 要求 `UVCPP_BUILD_WEBAPP=ON`。
+
+这套开关在 v1.11.0 上仍然有效：CI 用同一份（只去掉离线用的
+`FETCHCONTENT_SOURCE_DIR_*`）编出了带 `uvcpp_soap_*` 的 DLL，安装包与绿色版
+验收都跑通了。
 
 `fetch_uvcpp.ps1` 之后做的是搬运和校验，不重新编库：
 

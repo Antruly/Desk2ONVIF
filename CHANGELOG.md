@@ -24,6 +24,13 @@
 - 新增 `tests/rtsp_auth_probe.py`（纯标准库），并接进 `rtsp_sub_e2e.ps1`：
   匿名 401、错口令 401、对口令 200 + `m=video`，主/子两路都验。
 
+**依赖**
+
+- libuvcpp 1.6.4 → **1.11.0**（服务化、跨进程 WebSocket 广播、进程监管重启策略、
+  作业队列持久化与异步 handler、共享会话等）。服务形态仍由 `src/service/` 的
+  **Session 0 看门狗 + Session 1 worker** 负责，没有改用 `uvcpp_service_run()`
+  —— 原因见 [`docs/ENGINEERING.md`](docs/ENGINEERING.md) 的「服务形态」一节。
+
 ## [0.2.0] — 2026-11-19
 
 **通道**
