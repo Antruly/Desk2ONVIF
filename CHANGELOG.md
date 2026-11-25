@@ -8,6 +8,15 @@
 > 所以不在这里编造条目。需要考古的话，`docs/ENGINEERING.md` 里按「轮次」
 > 记了那几轮各做了什么。
 
+## [Unreleased]
+
+**依赖**
+
+- libuvcpp 1.6.4 → **1.11.0**（服务化、跨进程 WebSocket 广播、进程监管重启策略、
+  作业队列持久化与异步 handler、共享会话等）。服务形态仍由 `src/service/` 的
+  **Session 0 看门狗 + Session 1 worker** 负责，没有改用 `uvcpp_service_run()`
+  —— 原因见 [`docs/ENGINEERING.md`](docs/ENGINEERING.md) 的「服务形态」一节。
+
 ## [0.2.0] — 2026-11-19
 
 **通道**
