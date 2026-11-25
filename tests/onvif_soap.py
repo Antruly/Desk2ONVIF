@@ -14,6 +14,9 @@
     python -I -X utf8 tests/onvif_soap.py --host 127.0.0.1 --port 8080
     python -I -X utf8 tests/onvif_soap.py --user admin --password admin
 
+多通道聚合端点（issue #9）可以用 `--expected-profiles N` / `--profile-token T`
+把 [5]/[6] 的判据对准那张整表；**不传时行为与单通道时代逐字相同**。
+
 `--user`/`--password` 是 **ONVIF Digest** 那一对（NVR 添加通道时填的）。
 第 [9] 段要打 `/api/config`，那一条走的是 **Web 控制台登录**，凭据用
 `--web-user`/`--web-password`（默认 admin/admin）—— 两套凭据刻意分开，
@@ -347,6 +350,14 @@ def main():
                     help="被测进程的**配置文件**路径（第 [11e2] 段判「防抖有没有"
                          "做事」用）。**不给就明说跳过，不判** —— 见那一段的"
                          "注释：猜一个路径会得到一条恒绿的断言")
+    # 多通道聚合端点（issue #9）专用。**默认值保持单通道的既有行为**：
+    # 不传这两个参数时，[5] 仍然要求"主 + 子"（或只有主）。
+    ap.add_argument("--expected-profiles", type=int, default=None,
+                    help="主端点聚合了多个通道时，GetProfiles 期望的条数"
+                         "（例如两通道 × 主/子 = 4）。不传 = 按单通道路径判")
+    ap.add_argument("--profile-token", default=None,
+                    help="[5]/[6] 只对这个 token 做单路断言（如 ch2_main）；"
+                         "不传 = 用响应里的第一条")
     a = ap.parse_args()
 
     cfg_path = a.config_path
@@ -766,7 +777,16 @@ def main():
         # 尺寸"的老写法），而现象是 NVR 把子码流当主码流拉 —— 画面是对的，
         # 只是带宽白烧，没有任何报错。
         blocks.update({p.get("token"): p for p in root.findall(".//trt:Profiles", NS)})
-        if len(blocks) > 1:
+        if a.expected_profiles is not None:
+            # 聚合端点：条数由调用方给（通道数 × 主/子）。token 命名规则也
+            # 在这里钉一下，免得"少报了一路"被当成正常。
+            R.check(len(blocks) == a.expected_profiles,
+                    f"profile 数 = {len(blocks)}（期望 {a.expected_profiles}）",
+                    f"实际 token：{sorted(blocks)}")
+            if a.profile_token:
+                R.check(a.profile_token in blocks,
+                        f"聚合表里有 {a.profile_token}：{sorted(blocks)}")
+        elif len(blocks) > 1:
             R.check(len(blocks) == 2, f"profile 数 = {len(blocks)}（主 + 子）")
             R.check(set(blocks) == {"main", "sub"}, f"token 集合 = {sorted(blocks)}")
             dims = {}
@@ -785,11 +805,21 @@ def main():
             # 没开子码流也合法（--no-sub）。那就只有一路，且不报错。
             R.check(len(blocks) == 1, "只报了一路（未开子码流）")
 
+        # 聚合端点上挑指定的那一路做 [6] 的单路断言；默认仍是第一条。
+        if a.profile_token and a.profile_token in blocks:
+            token = a.profile_token
+
     # ---- 6. GetStreamUri -------------------------------------------------
     print("\n[6] GetStreamUri —— 主机地址必须按请求来源反推")
     uri = None
     uris = {}
-    for tok in (sorted(blocks) if root is not None and len(blocks) > 1 else [token]):
+    if a.profile_token:
+        tokens_to_probe = [a.profile_token]
+    elif root is not None and len(blocks) > 1:
+        tokens_to_probe = sorted(blocks)
+    else:
+        tokens_to_probe = [token]
+    for tok in tokens_to_probe:
         if not tok:
             continue
         inner = f"<trt:ProfileToken>{tok}</trt:ProfileToken>"

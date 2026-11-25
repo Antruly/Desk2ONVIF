@@ -1675,12 +1675,74 @@ struct ExtraChannel {
   }
 };
 
+/// 一个通道的 ONVIF profile 表（主/子各一条）。
+///
+/// ## token 与顺序
+///
+/// 通道 1 保持 `main` / `sub` —— 已有 NVR 配置里存的就是这两个 token，改名
+/// 会让所有老设备"掉线"。通道 N（N≥2）用 `ch<N>_main` / `ch<N>_sub`，和
+/// `web.port + N` 的端口约定同一个通道号。
+///
+/// 顺序即下标：调用方**先放通道 1，再按通道号升序**追加。`set_video_size(i)`
+/// 靠这个下标找 profile（见 `OnvifService::set_video_size`），错位了会把子
+/// 码流的分辨率报成主码流的。
+///
+/// ## 来源参数
+///
+/// `streams` 就是这一路真正挂上共享 RTSP 服务器的那几条（`options_for_channel`
+/// 已经处理过"子码流路径为空/与主码流相同"这类情况）；这里不再自己判断。
+std::vector<d2o::OnvifStreamProfile> build_channel_onvif_profiles(
+    unsigned channel, std::vector<d2o::RtspStreamOptions> const& streams,
+    int gop_seconds, std::string const& preset, int sub_height) {
+  std::vector<d2o::OnvifStreamProfile> out;
+  out.reserve(streams.size());
+  for (std::size_t i = 0; i < streams.size(); ++i) {
+    bool const sub = (i > 0);
+    d2o::OnvifStreamProfile p;
+    if (channel == 1) {
+      p.token = sub ? "sub" : "main";
+    } else {
+      p.token = d2o::fmt("ch%u_%s", channel, sub ? "sub" : "main");
+    }
+    p.name = p.token;
+    p.channel = channel;
+    p.fps = streams[i].fps;
+    p.bitrate_kbps = streams[i].bitrate_kbps;
+    p.gop_seconds = gop_seconds;
+    p.rtsp_path = "/" + streams[i].path;
+    // `preset=ultrafast` 会把档位压到 Constrained Baseline（x264 关掉了
+    // CABAC/8x8dct），此时报 Main 是有 NVR 会拒绝的 —— 报低不报高。
+    p.h264_profile = (preset == "ultrafast") ? "Baseline" : "Main";
+    if (sub) {
+      // 子码流的初始高度按配置给一个**合理**的猜测，真实值由统计钩子覆盖。
+      // 不能照抄主码流的默认 1920x1080：那会让 GetProfiles 在采集起来之前的
+      // 那几秒里报"两路一样大"，而 NVR 完全可能在启动后立刻就来拉一次。
+      int const sh = std::max(2, sub_height / 2 * 2);
+      int const sw = std::max(2, (1920 * sh / 1080) / 2 * 2);
+      p.width = sw;
+      p.height = sh;
+    }
+    // 快照按通道取，但**不能**指向 `/api/channels/<n>/snapshot.jpg`：那条
+    // 路由在 `/api/` 鉴权中间件后面，只认 Web 会话 cookie，而 NVR 拿到的
+    // `GetSnapshotUri` 必须用 ONVIF Digest 才能取图。所以走 `/snapshot.jpg`
+    // 这条**认 ONVIF Digest** 的路由，通道号放在查询串里；WebServer 侧按
+    // `channel` 参数取对应通道的帧。
+    p.snapshot_path = channel == 1
+                          ? std::string("/snapshot.jpg")
+                          : d2o::fmt("/snapshot.jpg?channel=%u", channel);
+    out.push_back(std::move(p));
+  }
+  return out;
+}
+
 /// 通道 1 的静态那几行 + 攒好的 `channels` JSON，共用一把锁。
 ///
 /// 通道 1 没有 `ExtraChannel` 那样的对象（它跑在 `cmd_run` 自己那条路径上），
-/// 所以它那几行信息得有个地方放。**只有主线程写**：建完这一趟的通道之后写
-/// 一次、`run()` 返回之后再写一次状态；读它的是通道 1 每秒一次的统计钩子
-/// （跑在采集线程上）。
+/// 所以它那几行信息得有个地方放。
+///
+/// **写的人有两类，都走这把锁**：主线程在建完这一趟的通道之后重建整张
+/// `onvif_profiles`；采集线程每秒把这一路的真实编码尺寸写回来（两路的
+/// 真值都只有采集侧知道）。读它的是 provider（web 循环线程）。
 struct ChannelBoard {
   struct Ch1Info {
     std::string name = "通道 1";
@@ -1718,6 +1780,42 @@ struct ChannelBoard {
   Ch1Info ch1;
   /// `/api/status` 里那个 `channels` 数组，已经序列化好。
   std::string json = "[]";
+  /// 主端点 `GetProfiles` 的**整张**表（通道 1 + 全部已启用扩展通道）。
+  ///
+  /// 主线程每次重建通道之后整表重写；采集线程只改其中两条的宽高。provider
+  /// 读的时候拷一份（`get_onvif_profiles`），所以这里不返回引用 —— 主线程
+  /// 随时可能重建它。
+  std::vector<d2o::OnvifStreamProfile> onvif_profiles;
+
+  /// 把某一路的真实编码尺寸写回聚合表。采集线程每秒调一次。
+  ///
+  /// 只匹配 `channel` + 主/子那一对；找不到就静默返回 —— 表可能正好处在
+  /// "上一趟拆掉、这一趟还没重建"的空窗里，而这条路每秒走一次，不该炸。
+  void set_onvif_size(unsigned channel, bool sub, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    std::lock_guard<std::mutex> lk(mu);
+    for (d2o::OnvifStreamProfile& p : onvif_profiles) {
+      if (p.channel != channel) continue;
+      bool const is_sub =
+          p.token == "sub" ||
+          (p.token.size() >= 4 &&
+           p.token.compare(p.token.size() - 4, 4, "_sub") == 0);
+      if (is_sub != sub) continue;
+      p.width = w;
+      p.height = h;
+    }
+  }
+
+  void set_onvif_profiles(std::vector<d2o::OnvifStreamProfile> ps) {
+    std::lock_guard<std::mutex> lk(mu);
+    onvif_profiles = std::move(ps);
+  }
+
+  /// provider 的返回值：**一份拷贝**。理由见上面 `onvif_profiles`。
+  std::vector<d2o::OnvifStreamProfile> get_onvif_profiles() const {
+    std::lock_guard<std::mutex> lk(mu);
+    return onvif_profiles;
+  }
 
   void set_ch1(Ch1Info info) {
     std::lock_guard<std::mutex> lk(mu);
@@ -2087,37 +2185,12 @@ d2o::OnvifIdentity channel_identity(d2o::OnvifConfig const& base,
   return id;
 }
 
-/// 把一个名字百分号编码成 scope 值里能放的样子。
-///
-/// **不是为了好看，是为了不坏。** scope 的值是一个 URI 的一段，而通道名里带
-/// `#` —— 自动发现建出来的就叫「显示器 #2」—— `#` 在 URI 里是 fragment 的分界符，
-/// 原样写进去，NVR 解析出来的名字只剩 `显示器 `。中文则要按 UTF-8 逐字节编码
-/// （百分号编码本来就是干这个的）。
-std::string scope_escape(std::string const& s) {
-  static char const* const kHex = "0123456789ABCDEF";
-  std::string out;
-  out.reserve(s.size());
-  for (unsigned char const c : s) {
-    bool const safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                      (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-                      c == '.' || c == '~';
-    if (safe) {
-      out.push_back(static_cast<char>(c));
-    } else {
-      out.push_back('%');
-      out.push_back(kHex[c >> 4]);
-      out.push_back(kHex[c & 0x0F]);
-    }
-  }
-  return out;
-}
-
 /// 一路通道（2 起）跑完它的全部段落。**在它自己那条线程上跑。**
 ///
 /// 形状和 `cmd_run` 里那个主循环一样（换分辨率 → 整条链重建、文件名加序号），
 /// 少掉的是配置重载那一半：通道 2 起的选项来自**启动时**算好的计划，而计划改了
-/// 要重启进程（`channels.*` 在 `pending` 里）。这不是省事 —— 端口、设备 UUID、
-/// WS-Discovery 的宣告表全绑在计划上，允许"重载就换端口"会让那三样对不上。
+/// 要重启进程（`channels.*` 在 `pending` 里）。这不是省事 —— 端口和设备 UUID
+/// 绑在计划上，允许"重载就换端口"会让通道管理里写的地址与实际监听对不上。
 ///
 /// `total_seconds` 是**整段运行**的预算，不是每一路各一份：`--seconds 20` 在每一条
 /// 通道上都是 20 秒，和主循环里"时间预算是整段运行的"是同一条规矩。
@@ -3411,67 +3484,55 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     // `OnvifServiceOptions::osd` 的注释里。
     wo.onvif.osd = cfg.osd;
 
-    // 每一路 RTSP 就是一个 ONVIF Profile，**顺序和 opt.rtsp.streams 一致**。
-    // 不从 streams 直接生成而是逐个填，是因为 Profile 里还有几项和推流无关的
-    // 描述（name、h264_profile）；但循环的下标必须对齐 —— `set_video_size(i,…)`
-    // 就是靠这个下标找 profile 的，错位了会让 NVR 把子码流的分辨率报成主码流的。
+    // 通道 1 的 Profile。**顺序和 opt.rtsp.streams 一致**：`set_video_size(i,…)`
+    // 靠这个下标找 profile，错位了会让 NVR 把子码流的分辨率报成主码流的。
     //
-    // 分辨率暂时用默认值，采集打开后会由统计通道上报真实尺寸 —— Web 服务比
+    // 分辨率暂时用默认值，采集打开后会由统计钩子上报真实尺寸 —— Web 服务比
     // 采集先起，这里拿不到桌面尺寸。
-    for (std::size_t i = 0; i < opt.rtsp.streams.size(); ++i) {
-      d2o::OnvifStreamProfile p;
-      // token **不要带空格**：有些 NVR 会把它原样拼进 URL 查询串而不做转义。
-      p.token = (i == 0) ? "main" : "sub";
-      p.name = (i == 0) ? "main" : "sub";
-      p.fps = opt.fps;
-      p.bitrate_kbps = (i == 0) ? opt.bitrate_kbps : opt.sub_bitrate_kbps;
-      p.gop_seconds = opt.gop_seconds;
-      p.rtsp_path = "/" + opt.rtsp.streams[i].path;
-      // `preset=ultrafast` 会把档位压到 Constrained Baseline（x264 关掉了
-      // CABAC/8x8dct），此时报 Main 是有 NVR 会拒绝的 —— 报低不报高。
-      p.h264_profile = (opt.preset == "ultrafast") ? "Baseline" : "Main";
-      // 子码流的初始高度按配置给一个**合理**的猜测，真实值由统计通道覆盖。
-      // 不能照抄主码流的默认 1920x1080：那会让 GetProfiles 在采集起来之前的
-      // 那几秒里报"两路一样大"，而 NVR 完全可能在启动后立刻就来拉一次。
-      if (i > 0) {
-        int const sh = std::max(2, opt.sub_height / 2 * 2);
-        int const sw = std::max(2, (1920 * sh / 1080) / 2 * 2);
-        p.width = sw;
-        p.height = sh;
-      }
-      wo.onvif.profiles.push_back(std::move(p));
-    }
+    wo.onvif.profiles = build_channel_onvif_profiles(
+        1, opt.rtsp.streams, opt.gop_seconds, opt.preset, opt.sub_height);
 
-    // --- 多通道（第五轮 Phase AD）：宣告表与状态数组 ---------------------
+    // --- 主端点聚合：GetProfiles 报全部已启用通道 -------------------------
     //
-    // 通道 2 起各是一个**独立的 ONVIF 设备**（各占一个端口，见「已确认的取舍」），
-    // 所以它们要一起出现在 WS-Discovery 的宣告表里 —— 否则 NVR 自动扫描只能
-    // 扫到通道 1，其余几路得手工填地址。
+    // 通道 2 起**不再各自广播成一台设备**。NVR 现在应该在通道 1 的端点上看到
+    // 一台多通道摄像机：`GetProfiles` 一张表里既有 `main`/`sub`，也有
+    // `ch2_main`/`ch2_sub`…… `GetStreamUri` 按 profile 给各自的 RTSP 路径。
     //
-    // **只挂在通道 1 这一个 WebServer 上**：UDP 3702 只有一个 socket，N 个
-    // responder 各自回答会让 NVR 收到 N 份互相矛盾的应答。`Wsd` 那边一次
-    // Probe 回**一个报文里 N 条 ProbeMatch**（见 wsd.cpp 的 `on_datagram`）——
-    // 一次单播里齐活，丢包不会只丢其中一路。
-    for (d2o::ChannelPlan const& p : channel_plans) {
-      if (!p.enabled) continue;   // 关掉的通道不宣告，NVR 里也就不会多一台连不上的设备
-      d2o::WsdEndpoint ep;
-      ep.uuid = d2o::make_uuid_urn(d2o::fmt("%s|ch%u", seed.c_str(), p.index));
-      ep.http_port = cfg.web.port + static_cast<int>(p.index);
-      // 类型那一半和主设备逐字相同（NVR 靠它认出"这是一台摄像机"），
-      // 名字换成这一路自己的 —— 名字里那个 `#`（"显示器 #2"）必须百分号编码，
-      // scope 是个 URI，原样的 `#` 会被当成 fragment 的分界符，于是 NVR 那边
-      // 解析出来的名字只剩前半截。
-      ep.scopes = {
-          "onvif://www.onvif.org/type/video_encoder",
-          "onvif://www.onvif.org/type/Network_Video_Transmitter",
-          "onvif://www.onvif.org/Profile/Streaming",
-          "onvif://www.onvif.org/name/" +
-              scope_escape(p.name.empty() ? d2o::fmt("通道 %u", p.index) : p.name),
-          "onvif://www.onvif.org/hardware/Desk2ONVIF",
-          "onvif://www.onvif.org/location/desktop",
-      };
-      wo.wsd_extra_endpoints.push_back(std::move(ep));
+    // 这张表是**运行期的**：用户加一路通道（不需要重启进程，重新跑一段即可）
+    // 之后 `GetProfiles` 下一拍就要能看到。所以 provider 读 `ch_board` 里
+    // 那份快照，而主线程在下面每一段重建完通道之后整表重写。
+    //
+    // 初始先按启动时的计划填一份：`web.start()` 在这段之后，NVR 可能在第一段
+    // 循环还没重建之前就来拉一次 —— 空表会让它认为这台设备没有码流。
+    {
+      std::vector<d2o::OnvifStreamProfile> table = wo.onvif.profiles;
+      for (d2o::ChannelPlan const& p : channel_plans) {
+        if (!p.enabled) continue;   // 关掉的/被挡住的通道不报
+        // 和运行时同一条构造路径：路径、子码流开关都由 `options_for_channel`
+        // 决定，避免"启动时猜的和之后重建出来的不一致"。
+        d2o::SessionOptions const chopt =
+            d2o::options_for_channel(p, opt, std::string());
+        std::vector<d2o::OnvifStreamProfile> const ps = build_channel_onvif_profiles(
+            p.index, chopt.rtsp.streams, chopt.gop_seconds, chopt.preset,
+            chopt.sub_height);
+        table.insert(table.end(), ps.begin(), ps.end());
+      }
+      ch_board.set_onvif_profiles(std::move(table));
     }
+    wo.onvif.profiles_provider = [&ch_board] {
+      return ch_board.get_onvif_profiles();
+    };
+
+    // --- 多通道：WS-Discovery 只宣告**主端点一次** ------------------------
+    //
+    // 上一版把通道 2 起也塞进 `wsd_extra_endpoints`，于是 NVR 把一台机器识别
+    // 成 N 台独立设备 —— 通道管理里是 N 个条目，不是一台摄像机下的 N 路。
+    // 现在媒体入口聚合在主端点，组播里也就只该有一个 UUID、一个 XAddrs。
+    //
+    // 通道 N 的端口仍然保留（`web.port + N`），作为直连调试和旧配置的入口；
+    // 它只是不再广播。`wo2.wsd_enabled = false` 保证那边也不会另起 responder，
+    // 而 UDP 3702 只有一个 socket 这件事也因此更明确。
+    wo.wsd_extra_endpoints.clear();
 
     // `/api/status` 的 `channels` 数组。**只有通道 1 这个 WebServer 填它** ——
     // 状态是全机一份，而通道 2 起那些端点只为 ONVIF 存在（它们连静态文件都
@@ -4354,6 +4415,13 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       // 主线程此刻正阻塞在 `session.run()` 里（改 `extra_channels` 只发生在
       // 两次 `run()` 之间）。每秒一次也正好是 `channels` 该有的刷新率。
       //
+      // 这一路的**真实编码尺寸**也要写进聚合 profile 表。主端点的
+      // `GetProfiles` 读的是 provider 那份快照，而 `web.publish()` 下面的
+      // `OnvifService::set_video_size` 只改 `opt.profiles` —— 聚合之后那份
+      // 不再被 provider 采用，不写这里 NVR 会一直看到启动时那个猜测值。
+      ch_board.set_onvif_size(1, false, s.video_width, s.video_height);
+      ch_board.set_onvif_size(1, true, s.sub_width, s.sub_height);
+
       // **顺序是先写 board 再拼**，不能反：`build_channels_json` 读的是
       // `board.get_ch1()`，先拼后写会让通道 1 那一行永远慢一拍。
       ch_board.set_json(
@@ -4556,12 +4624,19 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         // `run()` 在"不录也不推流"时会当场判定 Failed（见 capture_session.cpp
         // 里那条守卫），而"只录不推流"是合法配置。
         ExtraChannel* const c = ch.get();
-        ch->session->set_stats_hook([c](d2o::SessionStats const& s) {
+        unsigned const onvif_channel = ch->plan.index;
+        ch->session->set_stats_hook([c, &ch_board, onvif_channel](
+                                        d2o::SessionStats const& s) {
           c->offline.store(s.source_offline, std::memory_order_relaxed);
           c->fps.store(s.effective_fps, std::memory_order_relaxed);
           c->bitrate_kbps.store(
               static_cast<double>(bitrate_kbps_of(s.bytes, s.elapsed_s)),
               std::memory_order_relaxed);
+          // 主端点聚合表里的这一路也跟着真值走（理由同通道 1 那条）。
+          ch_board.set_onvif_size(onvif_channel, false, s.video_width,
+                                  s.video_height);
+          ch_board.set_onvif_size(onvif_channel, true, s.sub_width,
+                                  s.sub_height);
           // 这一路真实的编码尺寸也报给它自己的 ONVIF 端点。
           //
           // **不报的话 `GetProfiles` 会永远停在启动时那个猜出来的尺寸上**：
@@ -4620,6 +4695,32 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         ch->set_state("未启动");
       }
       extra_channels.push_back(std::move(ch));
+    }
+
+    // --- 主端点的聚合 profile 表：这一趟重建一次 --------------------------
+    //
+    // 用户新加一路通道后 `POST /api/reload` 会重跑这一段（不需要重启进程），
+    // 主端点的 `GetProfiles` 下一拍就能看到它。顺序固定为：
+    // **通道 1 主/子，然后按通道号升序、每路主/子** —— `set_video_size(i)`
+    // 依赖这个下标，错位会把某一路的分辨率报到另一路上。
+    //
+    // 只放 `enabled` 的通道：用户关掉的和规划期被挡住的都不出现在 NVR 的
+    // 通道列表里（它们也没有可拉的码流）。
+    {
+      std::vector<d2o::OnvifStreamProfile> table = build_channel_onvif_profiles(
+          1, seg.rtsp.streams, seg.gop_seconds, seg.preset, seg.sub_height);
+      // 用 map 排通道号：`extra_channels` 的顺序是配置里的顺序，不是通道号。
+      std::map<unsigned, std::vector<d2o::OnvifStreamProfile>> by_channel;
+      for (auto const& ch : extra_channels) {
+        if (!ch->plan.enabled) continue;
+        by_channel[ch->plan.index] = build_channel_onvif_profiles(
+            ch->plan.index, ch->opt.rtsp.streams, ch->opt.gop_seconds,
+            ch->opt.preset, ch->opt.sub_height);
+      }
+      for (auto& kv : by_channel) {
+        table.insert(table.end(), kv.second.begin(), kv.second.end());
+      }
+      ch_board.set_onvif_profiles(std::move(table));
     }
 
     // --- 共享的 RTSP 服务器：一台，全部通道挂在上面，靠路径区分 ------------
@@ -4786,7 +4887,9 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         wo2.auth_user = cfg.onvif.user;
         wo2.auth_password = cfg.onvif.password;
         // **WS-Discovery 只能起一次**：UDP 3702 只有一个 socket，第二个
-        // `bind` 必冲突。全表挂在通道 1 那个 app 上（见 `wsd_extra_endpoints`）。
+        // `bind` 必冲突。组播里只宣告通道 1 那个主端点（它聚合了全部通道的
+        // profile），所以这里彻底关掉 —— 这个端口的定位是"直连调试/旧配置"，
+        // 不再广播成另一台设备。
         wo2.wsd_enabled = false;
         wo2.device_state = &device_state;
         wo2.device_uuid = d2o::make_uuid_urn(
@@ -4822,6 +4925,10 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
           // token **不要带空格**：有些 NVR 会把它原样拼进 URL 查询串而不转义。
           sp.token = (i == 0) ? "main" : "sub";
           sp.name = sp.token;
+          // 兼容端点上的 profile 仍然只描述**这一路自己**。`channel` 记的是
+          // 归属，不是"聚合表里的 token" —— 它让快照/排障时能一眼看出这张表
+          // 属于哪一路；`GetSnapshotUri` 用的是本端口的 `/snapshot.jpg`。
+          sp.channel = ch->plan.index;
           sp.fps = ch->opt.fps;
           sp.bitrate_kbps = (i == 0) ? ch->opt.bitrate_kbps : ch->opt.sub_bitrate_kbps;
           sp.gop_seconds = ch->opt.gop_seconds;

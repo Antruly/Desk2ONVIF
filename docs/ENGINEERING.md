@@ -45,7 +45,7 @@ libuvcpp（HTTP / WebSocket / ONVIF SOAP / WS-Discovery UDP 3702）
 | Phase 6 | 子码流、快照、持久化、指针合成、防火墙辅助 | ✅ |
 | Phase 6 | 配置热生效（ONVIF 身份当场生效，其余逐字段报"要重启"） | ✅ |
 | Phase 6 | DXGI 自恢复的实机验证（换刷新率 / 换分辨率 / 关显示器电源） | ✅ |
-| 第五轮 | 多通道：一块屏一路（**自动发现、默认开**）、摄像头可加成一路、**每通道一个 ONVIF 端口** | ✅ |
+| 第五轮 | 多通道：一块屏一路、摄像头可加成一路、每通道保留一个兼容 ONVIF 端口 | ✅ |
 | 第五轮 | 硬件码 / 序列号 / 设备 UUID 在界面上**锁死**（逃生门：手改 `config.json`） | ✅ |
 | 第五轮 | 安装向导里填的账号口令**真的写进配置**（原来有三条断链，见「安装时的口令」） | ✅ |
 
@@ -900,13 +900,18 @@ MAC 集合从第五轮起**不参与**派生（插拔网卡、扩展坞、禁用
 
 ### NVR 那边会看到什么
 
-WS-Discovery 一次会报 **N 条 ProbeMatch**（N 路）。有些 NVR 按 IP 归并，于是
-"明明有三路，只搜到一台"。退路是**手工添加**每一路：
+WS-Discovery 一次只报 **一条 ProbeMatch、一条 XAddrs**（通道 1 的主端点）。
+NVR 在它下面看到的是**一台多通道摄像机**：`GetProfiles` 一张表里报
+`main`/`sub`、`ch2_main`/`ch2_sub`…，`GetStreamUri` 按 profile 给各自的
+RTSP 路径。这是 issue #9 之后的形状；更早的版本把每个通道都广播成一台
+独立设备，于是有些 NVR 按 IP 归并成"明明有三路，只搜到一台"。
+
+通道 N 的兼容端口（`web.port + 通道号`）仍然监听，可以手工直连调试：
 
 ```
-http://<本机IP>:8080/onvif/device_service     # 通道 1
-http://<本机IP>:8082/onvif/device_service     # 通道 2
-http://<本机IP>:8083/onvif/device_service     # 通道 3
+http://<本机IP>:8080/onvif/device_service     # 主端点（全部通道）
+http://<本机IP>:8082/onvif/device_service     # 通道 2 的兼容端点（只有它自己）
+http://<本机IP>:8083/onvif/device_service     # 通道 3 的兼容端点（只有它自己）
 ```
 
 凭据是 `onvif.user` / `onvif.password`（和通道 1 同一对）。

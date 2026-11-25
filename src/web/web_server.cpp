@@ -407,6 +407,9 @@ struct WebServer::Impl {
   /// 快照的公共部分（取帧 → 按需重建编码器 → MJPEG → 响应）。
   /// 鉴权在外面分两条路做完，这里只管干活。
   void serve_snapshot(uvcpp_web_response& resp);
+  /// 同上，但用调用方给的帧。主端点的 `/snapshot.jpg?channel=N` 走这条。
+  void serve_snapshot(uvcpp_web_response& resp,
+                      std::shared_ptr<BgraFrame const> const& img);
   /// 给一个预览客户端发一块。积压超限就把它从表里摘掉并断开。只在 loop 线程上跑。
   void send_preview_block(std::shared_ptr<PreviewConn> conn,
                           std::shared_ptr<std::vector<std::uint8_t> const> bytes);
@@ -840,7 +843,11 @@ void WebServer::Impl::on_preview_socket(uvcpp_web_ws_request& ws) {
 }
 
 void WebServer::Impl::serve_snapshot(uvcpp_web_response& resp) {
-  std::shared_ptr<BgraFrame const> img = opt.snapshot_source();
+  serve_snapshot(resp, opt.snapshot_source());
+}
+
+void WebServer::Impl::serve_snapshot(
+    uvcpp_web_response& resp, std::shared_ptr<BgraFrame const> const& img) {
   if (!img || img->pixels.empty() || img->width <= 0 || img->height <= 0) {
     // 503 而不是一张黑图：还没开始采集时给张黑的，NVR 那边只会显示
     // "画面正常但全黑"，而真正的原因（还没采到帧）一点线索都不留。
@@ -1348,7 +1355,26 @@ void WebServer::Impl::register_routes() {
                 return;
               }
             }
-            serve_snapshot(resp);
+            // `?channel=N`：主端点的聚合 profile 用这条路由取**那一路**的
+            // 快照。不能指到 `/api/channels/<n>/snapshot.jpg` —— 那条在
+            // `/api/` 的会话中间件后面，NVR 拿 ONVIF Digest 进不来。
+            int channel = 1;
+            if (std::string const* q = req.query("channel")) {
+              try {
+                channel = std::stoi(*q);
+              } catch (...) {
+                channel = 0;
+              }
+              if (channel < 1 || channel > 999) {
+                resp.status(400).text("channel 必须是 1–999 的整数。").end();
+                return;
+              }
+            }
+            if (opt.channel_snapshot_of) {
+              serve_snapshot(resp, opt.channel_snapshot_of(channel));
+            } else {
+              serve_snapshot(resp);
+            }
           });
   }
 

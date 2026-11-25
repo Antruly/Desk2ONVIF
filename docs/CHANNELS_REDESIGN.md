@@ -115,18 +115,16 @@ ONVIF 的 `GetProfiles` / `GetOSDs` 对通道 2 起报的是这一份，不再�
 本身就是"以当前值为底合并"，前端发 `{"channels":{"items":[...]}}` 这种整数组
 替换即可，不需要为增删改各开一条专用路由。
 
-### 3.1 已知边界：新通道的 WS-Discovery
+### 3.1 新通道的可见性（issue #9 之后）
 
-WS-Discovery 的宣告表（`WebOptions::wsd_extra_endpoints`）在 `web.start()` 时
-固定。**通过网页新加的通道，ONVIF 端点会立刻起来，但不会自动出现在 NVR 的
-"搜索设备"结果里**，直到进程重启或用户在 NVR 里手动填地址：
+媒体入口聚合在通道 1 的主端点上：`GetProfiles` 通过运行期 provider 读
+`ChannelBoard` 的整张表，**网页新加通道 + `POST /api/reload` 之后，不用重启
+进程，主端点的 `GetProfiles` 下一拍就能看到它**（token `ch<N>_main` /
+`ch<N>_sub`）。WS-Discovery 仍然只有一个 XAddrs、一个 UUID —— 一台机器是
+一台多通道摄像机，而不是 N 台设备。
 
-```
-http://<本机IP>:<web.port + 通道号>/onvif/device_service
-```
-
-详情页把这一行直接显示出来了。要把新通道也纳入自动发现，需要给 `WsdResponder`
-加一个"更新 extra 表"的入口（`WsdOptions::extra` 现在是只读副本）。
+通道 N 的兼容端点（`http://<本机IP>:<web.port + 通道号>/onvif/device_service`）
+继续在 `web.start()` 时建好，用于直连调试/旧配置；它不再单独广播。
 
 ---
 
