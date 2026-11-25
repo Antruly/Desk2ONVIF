@@ -123,6 +123,108 @@ struct OnvifDevicePatch {
   }
 };
 
+/// 一个网络协议（`GetNetworkProtocols` / `SetNetworkProtocols`）。
+///
+/// **名字用 ONVIF 的字面量**（`HTTP` / `RTSP`），不是我们自己起的名字 ——
+/// 客户端拿这个字符串做比较，大小写和拼写都是协议的一部分。
+struct OnvifNetworkProtocol {
+  std::string name;
+  bool enabled = false;
+  int port = 0;
+};
+
+/// NTP 配置。配置层只有一个服务器字段（`time.ntp_server`）。
+///
+/// `interval_s` **只在 SetNTP 里有意义**：ONVIF 的 `tt:NTPInformation` 没有
+/// 间隔这一项，所以 GetNTP 不报它。SetNTP 认一个厂商扩展元素 `<tt:Interval>`
+/// （秒），带上了就一起写回 `time.ntp_interval_s`；没带 = 不动那一项。
+struct OnvifNtpConfig {
+  std::string server;
+  std::optional<int> interval_s;
+};
+
+/// 音轨的当前状态。`enabled == false` 时所有 GetAudio* 都回空列表。
+struct OnvifAudioConfig {
+  bool enabled = false;
+  /// 目前只有 AAC（`AacEncoder`）。G.711/G.726 我们产不出来，报出去只会
+  /// 引出必然失败的 Set。
+  std::string encoding = "AAC";
+  int bitrate_kbps = 64;
+  /// 采集层把每一路统一成 48 kHz 立体声（见 `AudioMixer::Options` 的说明），
+  /// 配置里没有采样率/声道字段。这两个数是**事实**，不是可配项。
+  int sample_rate_khz = 48;
+  int channels = 2;
+};
+
+/// 设备 / 网络 / 系统管理这一组操作的落点。**由 `main.cpp` 注入**。
+///
+/// ## 为什么单独一组，不塞进 `OnvifDevicePatch`
+///
+/// `OnvifDevicePatch` 描述的是"一次 `SetVideoEncoderConfiguration` 想改的
+/// 那几个码流字段"，它的每一项都直接对应 `AppConfig` 里的一个字段。而这里
+/// 这些操作（主机名、网络协议、NTP、日志尾巴、重启）的权威副本各自在别处：
+/// 主机名归 Windows、协议/端口归监听 socket、日志归 `Log`。把它们塞进 patch
+/// 会让 `OnvifService` 以为它们和码率是同一种东西 —— 而"同一件事的第二个
+/// 副本"正是这个文件里反复警告的那种错误。
+///
+/// ## 线程
+///
+/// 所有回调都**在循环线程上**被调（SOAP 处理器就在那条线程）。实现里可以
+/// 直接读 `cfg`，不必加锁 —— 写它的网页 handler 也是同一条线程。
+struct OnvifSystemOptions {
+  /// 当前主机名（`GetHostname`）。空 = 由服务向操作系统要。
+  ///
+  /// **没有 setter**：Windows 的主机名不能在运行中的进程里改，所以
+  /// `SetHostname` 一律回 `ter:ActionNotSupported` 并说明要重启/系统设置。
+  /// 给一个假的 setter 只会让 NVR 以为改成功了。
+  std::function<std::string()> hostname;
+
+  /// `GetScopes` 要报的 scope 列表。**必须和 WS-Discovery 宣告的是同一份**
+  /// （客户端会拿两边对照）。空 = 用 `default_device_scopes()`。
+  std::function<std::vector<std::string>()> scopes;
+
+  /// 当前网络协议。空 = 由 `http_port` / `rtsp_port` / `rtsp_enabled` 推。
+  std::function<std::vector<OnvifNetworkProtocol>()> network_protocols;
+
+  /// RTSP 是否在监听。只有没给 `network_protocols` 时用它推 `GetNetworkProtocols`。
+  bool rtsp_enabled = false;
+
+  /// 当前 NTP 配置（`GetNTP`）。空 = 没有可报告的服务器。
+  std::function<OnvifNtpConfig()> get_ntp;
+
+  /// `SetNTP` 的落盘 + 通知落点。
+  ///
+  /// **返回 void 是刻意的**：和 `on_patch` 一样，落盘失败不回 SOAP Fault
+  /// （NVR 的配置流程会因此当场失败），由实现自己打 ERROR。空 = 没有可持久化
+  /// 的时间配置，`SetNTP` 回 `ActionNotSupported`，而不是假装写进去了。
+  std::function<void(OnvifNtpConfig const&)> set_ntp;
+
+  /// `GetSystemLog` 的日志尾巴。空 = 回一个结构良好的空字符串。
+  /// **它会读文件**，实现里只该读最后几百行，不要把整个日志塞进 SOAP。
+  std::function<std::string()> system_log;
+
+  /// `SystemReboot`。空 = `ActionNotSupported`（默认，也是测试机的行为）。
+  std::function<void()> system_reboot;
+
+  /// `SetSystemFactoryDefault`。空 = `ActionNotSupported`。
+  std::function<void()> factory_default;
+
+  /// 音轨的当前状态。空 = 音频未启用（所有 GetAudio* 回空列表）。
+  std::function<OnvifAudioConfig()> get_audio;
+
+  /// `SetAudioEncoderConfiguration` 的落盘点。空 = 只读，回 Fault。
+  ///
+  /// 和 `on_patch` 同样的语义：失败不回 Fault，实现自己打 ERROR。
+  std::function<void(OnvifAudioConfig const&)> set_audio;
+};
+
+/// WS-Discovery 与 `GetScopes` 共用的默认 scope 表。
+///
+/// **只能有一份。** 从前它写在 `web_server.cpp` 的 WS-Discovery 分支里；
+/// 现在 GetScopes 也要报同一份，两处各写一遍的话，NVR 通过发现看到的是一台
+/// 设备、通过 GetScopes 看到的又是另一台 —— 而两边各自都"有出处"。
+std::vector<std::string> default_device_scopes();
+
 struct OnvifServiceOptions {
   /// `urn:uuid:...`。**必须跨重启稳定**，否则 NVR 会重复添加同一台设备。
   std::string uuid;
@@ -329,6 +431,9 @@ struct OnvifServiceOptions {
   std::function<void(AuditWho const& who, std::string const& action,
                      std::string const& detail)>
       audit;
+
+  /// 设备 / 网络 / 系统管理这一组的回调。见上面 `OnvifSystemOptions`。
+  OnvifSystemOptions system;
 };
 
 /// `AppConfig::onvif` 里**可以运行中改**的那一段：身份与凭据。

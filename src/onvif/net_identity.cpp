@@ -87,6 +87,13 @@ std::string hostname() {
 
 }  // namespace
 
+std::string local_hostname() {
+  // **和 `machine_seed()` 走同一个 helper。** 两处各取一次主机名的话，一台
+  // 机器可能对外宣称两个不同的名字（比如一个读环境变量、一个读 Win32），
+  // 而 NVR 那边只会把差异记成"设备换了一台"。
+  return hostname();
+}
+
 std::vector<LocalAddr> local_ipv4_addresses() {
   std::vector<LocalAddr> out;
 

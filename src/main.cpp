@@ -2166,6 +2166,27 @@ std::string build_log_tail(int lines) {
   return out.dump();
 }
 
+/// `GetSystemLog` 要的**纯文本**尾巴。
+///
+/// 不重新实现一遍"读文件、留最后 N 行"：那条规则（上限、轮转文件、读不到
+/// 时返回空）已经写在 `build_log_tail` 里了。这里只是把它的 `lines` 数组拼回
+/// 文本 —— 两处各写一遍的话，网页上看到的日志和 NVR 看到的日志迟早不是
+/// 同一份。`parse` 用非抛出版本：日志尾巴读坏了不该让一条 SOAP 请求炸掉。
+std::string build_log_tail_text(int lines) {
+  nlohmann::json const j =
+      nlohmann::json::parse(build_log_tail(lines), nullptr, false);
+  if (j.is_discarded() || !j.contains("lines") || !j["lines"].is_array()) {
+    return {};
+  }
+  std::string out;
+  for (auto const& line : j["lines"]) {
+    if (!line.is_string()) continue;
+    out += line.get<std::string>();
+    out += '\n';
+  }
+  return out;
+}
+
 /// 通道 N 的 ONVIF 身份：主身份那份原样拿过来，只换掉**能区分通道的那几样**。
 ///
 /// `uuid` 不在这里（`OnvifIdentity` 里没有这个字段）—— 它归 `WebOptions::device_uuid`，
@@ -3512,6 +3533,10 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     // RTSP 没开的时候也报 554：NVR 会把 GetStreamUri 的地址存下来，
     // 报 0 毫无意义，而报真实端口只会让"没开 RTSP"这件事更晚被发现。
     wo.onvif.rtsp_port = opt.rtsp.enabled ? opt.rtsp.port : 554;
+    // `GetNetworkProtocols` 要报"RTSP 开没开"。端口照旧报 554（NVR 会把
+    // GetStreamUri 的地址存下来；报 0 只会让"没开 RTSP"这件事更晚被发现），
+    // 但这个布尔值必须是真的 —— 它和 `SetNetworkProtocols` 的比对都用它。
+    wo.onvif.system.rtsp_enabled = opt.rtsp.enabled;
     wo.onvif.http_port = tmp;   // 先填着，真实值由 start() 覆盖
     // 水印配置的**权威副本**。`GetOSDs` 直接答它，所以这份必须和存盘的一致
     // （含 `--osd` / `--no-osd` 这些命令行覆盖 —— 上一行那个 `cfg.osd` 在
@@ -4244,6 +4269,103 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       }
       D2O_INFO("NVR 设的设备时间偏移 %+d 秒已写进配置（重启后仍然有效）。",
                offset_s);
+    };
+
+    // ---- 设备 / 网络 / 系统管理（#10b）---------------------------------
+    //
+    // 这一组是**只读 + 一处可安全落盘**（SetNTP），另外两个危险操作
+    // （SystemReboot / SetSystemFactoryDefault）**故意不接回调**：那意味着
+    // 它们默认回 `ter:ActionNotSupported`，测试机和用户的机器都不会因为
+    // 一条 NVR 请求突然重启或清配置。要放开得在这里显式注入一个回调。
+    //
+    // 主机名：`SetHostname` 不接（Windows 的主机名改不了运行中的进程），
+    // 只接 `GetHostname` 的读。scope 表和 WS-Discovery 共用同一个函数，
+    // 否则 NVR 从发现里看到一台、从 GetScopes 里看到另一台。
+    wo.onvif.system.hostname = []() { return d2o::local_hostname(); };
+    wo.onvif.system.scopes = []() { return d2o::default_device_scopes(); };
+
+    // NTP 的读：直接读**当前生效**的配置，不拷一份进 `OnvifServiceOptions`
+    // —— 网页上改完服务器之后，NVR 下一次 `GetNTP` 就该看到新值。
+    // 写：走和网页保存同一条 `apply_config`，它负责落盘并 `ntp_syncer.set_config`。
+    // 之后再 `request_now()` 一次（只在 NTP 模式下），让对时不用等下一个周期。
+    wo.onvif.system.get_ntp = [&cfg]() {
+      d2o::OnvifNtpConfig c;
+      c.server = cfg.time.ntp_server;
+      return c;
+    };
+    wo.onvif.system.set_ntp = [&cfg, &apply_config, &ntp_syncer](
+                                  d2o::OnvifNtpConfig const& n) {
+      bool const same_server = (cfg.time.ntp_server == n.server);
+      bool const same_interval =
+          !n.interval_s || (cfg.time.ntp_interval_s == *n.interval_s);
+      if (same_server && same_interval) {
+        D2O_INFO("NVR 设的 NTP 服务器「%s」与当前配置相同，不重复写盘。",
+                 n.server.c_str());
+      } else {
+        d2o::AppConfig next = cfg;
+        next.time.ntp_server = n.server;
+        if (n.interval_s) next.time.ntp_interval_s = *n.interval_s;
+        d2o::ConfigApplyResult res;
+        std::string cerr;
+        if (!apply_config(std::move(next), res, cerr)) {
+          // 和别的 `Set*` 一样：落盘失败**不回 Fault**，日志是唯一出口。
+          D2O_ERROR("NVR 设的 NTP 服务器「%s」没能写进配置（%s）——"
+                    "这次改动重启后会丢。",
+                    n.server.c_str(), cerr.c_str());
+          return;
+        }
+        D2O_INFO("NVR 设的 NTP 服务器「%s」已写进配置%s。", n.server.c_str(),
+                 n.interval_s ? "（含对时间隔）" : "");
+      }
+      if (cfg.time.mode == "ntp") {
+        ntp_syncer.request_now();
+      } else {
+        D2O_INFO("NTP 配置已更新，但当前是「手动」时间模式：不发起对时。"
+                 "要让它跟着 NTP 走，请在时间设置里把模式改成「NTP」。");
+      }
+    };
+
+    // `GetSystemLog`：用网页那个「日志尾巴」的同一个实现（见
+    // `build_log_tail_text`）。行数压到 200：SOAP 这条路上客户端超时比网页
+    // 短，而且日志尾部的前几页才是排障要看的那一段。
+    wo.onvif.system.system_log = []() { return build_log_tail_text(200); };
+
+    // 音频：配置里只有 `enabled` 和 `bitrate_kbps`；采样率/声道是采集层的
+    // 事实（48 kHz 立体声，见 `AudioMixer::Options` 的说明），不是可配项。
+    wo.onvif.system.get_audio = [&cfg]() {
+      d2o::OnvifAudioConfig a;
+      a.enabled = cfg.audio.enabled;
+      a.encoding = "AAC";
+      a.bitrate_kbps = cfg.audio.bitrate_kbps;
+      a.sample_rate_khz = 48;
+      a.channels = 2;
+      return a;
+    };
+    wo.onvif.system.set_audio = [&cfg, &apply_config](
+                                    d2o::OnvifAudioConfig const& a) {
+      if (cfg.audio.bitrate_kbps == a.bitrate_kbps) return;
+      d2o::AppConfig next = cfg;
+      next.audio.bitrate_kbps = a.bitrate_kbps;
+      d2o::ConfigApplyResult res;
+      std::string cerr;
+      if (!apply_config(std::move(next), res, cerr)) {
+        D2O_ERROR("NVR 设的音频码率 %d kbps 没能写进配置（%s）——"
+                  "重启之后这次改动会丢。",
+                  a.bitrate_kbps, cerr.c_str());
+        return;
+      }
+      bool pending = false;
+      for (std::string const& f : res.pending) {
+        if (f == "audio.bitrate_kbps") pending = true;
+      }
+      if (pending) {
+        D2O_WARN("NVR 把音频码率设成了 %d kbps，已存盘，但要重启才生效"
+                 "（音频编码器不支持运行中改码率）。",
+                 a.bitrate_kbps);
+      } else {
+        D2O_INFO("NVR 把音频码率设成了 %d kbps，已存盘并生效。",
+                 a.bitrate_kbps);
+      }
     };
 
     // 快照取帧。`session` 在上面就构造好了，这里只是按引用捕获它。

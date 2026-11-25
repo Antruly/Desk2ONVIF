@@ -167,13 +167,29 @@ ffplay -rtsp_transport tcp rtsp://admin:admin@127.0.0.1:554/live_sub   # 子码�
 
 | 能力 | 实现的操作 |
 |---|---|
-| 设备管理 | `GetDeviceInformation` `GetCapabilities` `GetServices` `GetServiceCapabilities` |
+| 设备管理 | `GetDeviceInformation` `GetCapabilities` `GetServices` `GetServiceCapabilities` `GetEndpointReference` |
+| 设备名 / Scope | `GetHostname` `GetScopes` |
+| 网络 | `GetNetworkInterfaces` `GetDNS` `GetNetworkProtocols` `GetHostname` `GetNTP` `SetNTP` |
+| 系统 | `GetSystemLog`（调试日志尾部）；`GetRelayOutputs` `GetDigitalInputs` 回空列表 |
 | 媒体 | `GetProfiles` `GetProfile` `GetStreamUri` `GetSnapshotUri` `GetVideoSources` |
-| 视频源 | `GetVideoSourceConfigurations` `SetVideoSourceConfiguration` |
+| 视频源 | `GetVideoSourceConfigurations` `SetVideoSourceConfiguration` `GetVideoSourceConfigurationOptions` |
 | 编码器 | `GetVideoEncoderConfigurations` `SetVideoEncoderConfiguration` `GetVideoEncoderConfigurationOptions` |
-| OSD | `GetOSDs` `GetOSD` `SetOSD` `GetOSDOptions` |
+| 音频 | `GetAudioSources` `GetAudioSourceConfigurations` `GetAudioEncoderConfigurations` `GetAudioEncoderConfigurationOptions` `SetAudioEncoderConfiguration`（仅 AAC 码率；音频未启用时 Get 回空列表） |
+| OSD | `GetOSDs` `GetOSD` `SetOSD` `CreateOSD` `DeleteOSD` `GetOSDOptions` |
 | 时间 | `GetSystemDateAndTime` `SetSystemDateAndTime` |
-| 网络 | `GetNetworkInterfaces` `GetDNS` |
+
+**明确返回 `ter:ActionNotSupported` 的操作**（不假装成功）：
+
+| 操作 | 原因 |
+|---|---|
+| `SetHostname` | Windows 主机名不能在运行中改，要重启/系统设置 |
+| `SetScopes` `AddScopes` `RemoveScopes` | 没有可持久化的 scope 存储；`GetScopes` 报的是固定列表 |
+| `SetNetworkProtocols` | 只接受与当前 HTTP/RTSP 端口/开关完全一致的请求；改端口要重启 |
+| `SystemReboot` `SetSystemFactoryDefault` | 默认关闭；只有调用方显式注入回调才执行（测试机不会真的重启/清配置） |
+
+`SetNTP` 写回 `time.ntp_server`；如果报文里附带厂商扩展元素 `<tt:Interval>`
+（秒，0 = 只在启动时对一次），也一并写回 `time.ntp_interval_s`。`GetNTP`
+只报服务器 —— ONVIF 的 `tt:NTPInformation` 里没有间隔这一项。
 
 发现走 **WS-Discovery**（UDP 3702 组播），鉴权走 **HTTP Digest**
 （ONVIF 要求的 WS-UsernameToken 也在）。NVR 那边看到的就是一台普通的
