@@ -11,13 +11,23 @@
     -->
     <link
       rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1120'/%3E%3Cg fill='none' stroke='%2300d4ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 12h13a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z'/%3E%3Cpath d='M24 16l4-3v9l-4-3z'/%3E%3C/g%3E%3C/svg%3E"
+      href="data:image/svg+xml,%3Csvg xmlns='http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23070a10'/%3E%3Cg fill='none' stroke='%234be3c2' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 12h13a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z'/%3E%3Cpath d='M24 16l4-3v9l-4-3z'/%3E%3C/g%3E%3C/svg%3E"
     />
-    <!-- 让手机浏览器的地址栏也跟着变深，不然上面会留一条白边。 -->
-    <meta name="theme-color" content="#070b14" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#070a10" />
+    <meta name="color-scheme" content="dark light" />
     <meta name="description" content="Desk2ONVIF 控制台：桌面推流与 ONVIF 设备模拟的本地管理界面" />
     <title>Desk2ONVIF 控制台</title>
+    <!--
+      在样式表之前把上次选的主题写到 <html> 上，避免浅色用户先看到一帧深色。
+      包 try/catch：隐私模式下 localStorage 会直接抛异常，而那没有理由让页面打不开。
+    -->
+    <script>
+      try {
+        if (localStorage.getItem('d2o.theme') === 'light') {
+          document.documentElement.dataset.theme = 'light'
+        }
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -308,15 +308,17 @@ async function onCopy(text: string): Promise<void> {
 </script>
 
 <template>
-  <div class="page-head">
-    <h1>设备信息</h1>
-    <span class="hint">
-      这一页全是只读的。要给 NVR 添加通道，看下面第一张卡片；要改这些值，去「ONVIF 设置」。
-    </span>
+  <section class="page-head">
+    <div>
+      <h1>设备信息</h1>
+      <p class="sub">
+        这一页全是只读的。要给 NVR 添加通道，看下面第一张卡片；要改这些值，去「ONVIF 设置」。
+      </p>
+    </div>
     <button :disabled="loading" @click="load">
       <Icon name="refresh" :size="14" />{{ loading ? '读取中…' : '重新读取' }}
     </button>
-  </div>
+  </section>
 
   <div v-if="loadError" class="banner is-warn">
     读取配置失败（{{ loadError }}）。下面带「—」或写着未知的行多半是因为这个 ——

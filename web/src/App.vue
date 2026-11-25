@@ -1,16 +1,19 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
+import BrandMark from './components/BrandMark.vue'
 import Icon from './components/Icon.vue'
 import TechBackground from './components/TechBackground.vue'
 import { useAuth } from './composables/useAuth'
 import { useStats } from './composables/useStats'
+import { useTheme } from './composables/useTheme'
 import type { IconName } from './icons'
 
 const route = useRoute()
 const router = useRouter()
 const { authenticated, authRequired, checked, user, logout } = useAuth()
 const { stats, state, startStats, stopStats } = useStats()
+const { isLight, toggleTheme } = useTheme()
 
 interface MenuItem {
   /** 菜单上显示的字 */
@@ -28,35 +31,20 @@ interface MenuGroup {
 /**
  * 菜单表 —— **唯一的一处定义**。
  *
- * 后面几个阶段（设备信息 `/info`、操作日志 `/logs`、水印 `#osd`、音视频
- * `#audio`、时间 `#time`、自适应 `#adaptive`）各自在这里**加一行**，而不是
- * 各改各的地方 —— 菜单散成几处之后，"哪一项点了没反应"就要靠人去试。
+ * 三条纪律：
  *
- * 两条纪律：
- *
- * 1. **只放已经存在的路由和段落。** 指向一个还不存在的锚点，用户看到的是
- *    "点了没反应"（URL 变了，页面纹丝不动）—— 那正是这个功能最不该有的样子。
- *    所以 `#adaptive` 还在等它自己的段落（Phase W），**段落和它的这一行是
- *    同一次改动里一起进来的**。（`#audio` 与 `#time` 两段已经落地，各自的
- *    菜单行就是按这条纪律跟它们一起进来的。）
- * 2. **不要预先放一个空的「设备」组。** 一个点不开的分组标题读起来像界面坏了，
- *    比没有这一组更糟。所以「设备」组是**跟着它的第一个条目一起**加进来的
- *    （Phase O 的设备信息），操作日志在 Phase V 加进来时也走同一条路 ——
- *    分组和它里面的东西一次到位，中间不留空窗。
- *
- * 图标尽量复用已有的（`icons.ts` 那 24 个是给这个界面挑的），只为"没有合适
- * 的"补新的：
- *   · `monitor` 图像设置、`sliders` 系统设置 —— 与它们在旧版横向导航里的用法一致；
- *   · `shield` 的注释本来就写着"ONVIF / 鉴权"，拿它当 ONVIF 设置比新造一个合适；
- *   · 水印那一项用 `image`（画中一块牌子），不复用 `monitor` —— 两个菜单项撞
- *     同一个图标时，收起侧栏之后就完全分不出谁是谁了。
+ * 1. **只放已经存在的路由。** 指向一个不存在的地址，用户看到的是"点了没反应"
+ *    （URL 变了，页面纹丝不动）—— 那正是导航最不该有的样子。
+ * 2. **不预先放空分组。** 一个点不开的分组标题读起来像界面坏了，比没有这一组
+ *    更糟。分组和它里面的第一项一起进来。
+ * 3. **图标尽量复用已有的**（`icons.ts` 那 24 个是给这个界面挑的），只为没有
+ *    合适的补新的；收起侧栏之后图标就是唯一的辨识物，两个菜单项不能撞同一个。
  */
 const MENU_GROUPS: MenuGroup[] = [
   {
     title: '监控',
     items: [
       { label: '实时预览', to: '/', icon: 'eye' },
-      // 「通道管理」是新的主入口：有哪几路、加一路、删一路、点进某一路。
       { label: '通道管理', to: '/channels', icon: 'camera' },
       { label: '运行状态', to: '/status', icon: 'activity' },
     ],
@@ -64,7 +52,6 @@ const MENU_GROUPS: MenuGroup[] = [
   {
     title: '设置',
     items: [
-      // 这四项各自是**独立页面**，不再挤在一条长页面里滚动。
       { label: '系统设置', to: '/settings/system', icon: 'sliders' },
       { label: 'ONVIF 设置', to: '/settings/onvif', icon: 'shield' },
       { label: '音频设置', to: '/settings/audio', icon: 'volume' },
@@ -82,19 +69,41 @@ const MENU_GROUPS: MenuGroup[] = [
 ]
 
 /**
- * 高亮哪一项。**前缀匹配而不是全等**：`/channels/2`（某一路的详情）应当让
- * 「通道管理」保持高亮 —— 全等匹配的话，点进详情之后整个侧栏一个亮的都没有，
- * 看起来像"当前页不属于任何一块"。
- *
- * 不比查询串：登录回跳会带一个 `?next=`，它不该影响高亮。
+ * 顶栏标题。**前缀匹配而不是全等**：`/channels/2` 应当让「通道管理」保持高亮，
+ * 而顶栏要显示"通道 2"这件更具体的事。
  */
 function isActive(item: MenuItem): boolean {
   if (item.to === '/') return route.path === '/'
   return route.path === item.to || route.path.startsWith(item.to + '/')
 }
 
-/** 收抽屉。重复点击当前项不需要任何额外动作（没有锚点要滚了）。 */
-function onMenuClick(_item: MenuItem) {
+/** 路由 → 顶栏标题与分类。登录页在壳外面，不在这里。 */
+const PAGE_META: Record<string, { title: string; eyebrow: string }> = {
+  preview: { title: '实时预览', eyebrow: '监控 · 画面墙' },
+  channels: { title: '通道管理', eyebrow: '监控 · 通道' },
+  status: { title: '运行状态', eyebrow: '监控 · 遥测' },
+  'settings-system': { title: '系统设置', eyebrow: '设置 · 服务' },
+  'settings-onvif': { title: 'ONVIF 设置', eyebrow: '设置 · 设备身份' },
+  'settings-audio': { title: '音频设置', eyebrow: '设置 · 音轨' },
+  'settings-time': { title: '时间设置', eyebrow: '设置 · 设备时间' },
+  logs: { title: '日志与告警', eyebrow: '运维 · 审计与排障' },
+  info: { title: '设备信息', eyebrow: '运维 · 只读' },
+}
+
+const pageMeta = computed(() => {
+  const name = typeof route.name === 'string' ? route.name : ''
+  if (name === 'channel-detail') {
+    const n = route.params.number
+    return {
+      title: `通道 ${Array.isArray(n) ? n[0] : (n ?? '')}`,
+      eyebrow: '监控 · 通道详情',
+    }
+  }
+  return PAGE_META[name] ?? { title: 'Desk2ONVIF', eyebrow: '本机控制台' }
+})
+
+/** 收抽屉。 */
+function onMenuClick() {
   drawerOpen.value = false
 }
 
@@ -102,11 +111,8 @@ function onMenuClick(_item: MenuItem) {
 const COLLAPSE_KEY = 'd2o.sidebar.collapsed'
 
 /**
- * localStorage 一律包 try/catch。
- *
- * 隐私模式、站点数据被禁用、存储配额被同一个域下的别的东西占满 —— 这三件事
- * 都会让 `getItem` / `setItem` **抛异常**，而它们中的每一件都没有理由让整个
- * 界面打不开。读不到就当"没折叠过"。
+ * localStorage 一律包 try/catch。隐私模式、站点数据被禁用、存储配额被占满
+ * 都会让 `getItem` / `setItem` 抛异常，而它们中的每一件都没有理由让界面打不开。
  */
 function readCollapsed(): boolean {
   try {
@@ -128,54 +134,42 @@ function toggleCollapsed() {
 }
 
 /**
- * 窄屏时那个覆盖式抽屉开着没有。
- *
- * **"当前视口多宽"只有 CSS 说了算**，这里只存"开着还是关着"。折叠状态在
- * ≤720px 下由 CSS 强制忽略（见 `styles.css` 里那条媒体查询）—— 不然就得在
- * JS 里再存一份视口宽度，而那份副本会在转屏、缩放、窗口分屏之后过期，
- * 于是抽屉出现"JS 认为该折叠、CSS 认为该展开"的一半一半的样子。
+ * 窄屏抽屉。**"当前视口多宽"只有 CSS 说了算**，这里只存"开着还是关着"；
+ * ≤860px 下折叠状态由 CSS 强制忽略，免得 JS 与 CSS 各持一份会过期的视口判断。
  */
 const drawerOpen = ref(false)
 
-// 换页就收抽屉。用 fullPath 而不是 path：配置页那三个子项的 path 完全相同，
-// 只有锚点不一样，掂 path 的话点菜单收不了抽屉。
+/** 用户菜单开着没有。换页时和点页面空白处都会收起来。 */
+const userMenuOpen = ref(false)
+
 watch(
   () => route.fullPath,
   () => {
     drawerOpen.value = false
+    userMenuOpen.value = false
   },
 )
 
 /**
  * 会话丢掉的那一刻，把人送回登录页。
  *
- * **放在这里而不是各个调用点**：丢会话有两条完全不同的来路 —— REST 拿到 401
- * （`api.ts` 的 handleUnauthorized）和 WebSocket 被 1008 关掉（`useStats` /
- * 预览页）。两处都去 `router.push` 的结果是漏掉一处就变成"页面还在，但每个
- * 请求都失败"的空白页。它们只需要改 `authenticated` 这一个状态，导航由这里
- * 统一负责。
+ * **放在这里而不是各个调用点**：丢会话有两条完全不同的来路 —— REST 401 和
+ * WebSocket 1008。两处都去 `router.push` 的结果是漏掉一处就变成"页面还在，
+ * 但每个请求都失败"的空白页。它们只改 `authenticated`，导航由这里统一负责。
  */
 watch(authenticated, (on) => {
   if (on) return
-  // 还没问过后端（初次加载）或者本来就允许匿名访问时，"未认证"是正常状态，
-  // 不是会话丢了。
   if (!checked.value || !authRequired.value) return
   if (route.name === 'login') return
   router.replace({ name: 'login', query: { next: route.fullPath } })
 })
 
-/**
- * 登录页**在壳外面**：它不该有导航栏（那上面的每一个链接都会把刚进来的用户
- * 弹回登录页），也不该有连接指示灯（那时还没连上任何东西）。
- */
+/** 登录页**在壳外面**：没有导航，也没有连接指示灯。 */
 const bare = computed(() => route.name === 'login')
 
 /**
- * 统计推送只在"确实进得来"的时候连。
- *
- * 不这么做的后果很具体：未登录时 `/ws/stats` 会被后端用 1008 关掉，而
- * `useStats` 的重连逻辑会照着退避表一路重试 —— 于是登录页会在后台不停地
- * 握手、被拒、再握手，日志里刷满拒绝记录，而用户只看到登录框。
+ * 统计推送只在"确实进得来"的时候连。未登录时 `/ws/stats` 会被 1008 关掉，
+ * 而重连逻辑会照着退避表一路重试 —— 登录页会在后台不停握手、被拒、再握手。
  */
 const shouldStream = computed(() => checked.value && (!authRequired.value || authenticated.value))
 
@@ -188,23 +182,80 @@ watch(
   { immediate: true },
 )
 
-onBeforeUnmount(stopStats)
-
 const connText = computed(() =>
   state.value === 'online' ? '实时' : state.value === 'connecting' ? '连接中' : '已断开',
 )
 
+const daemonText = computed(() =>
+  state.value === 'online'
+    ? '守护进程在线'
+    : state.value === 'connecting'
+      ? '正在连接守护进程'
+      : '守护进程未连接',
+)
+
+const daemonDotClass = computed(() =>
+  state.value === 'online' ? '' : state.value === 'connecting' ? 'status-dot--warn' : 'status-dot--bad',
+)
+
 /**
- * 侧栏底部的版本号。`emptyStats()` 里它是**空串**而不是 "0.0.0"，
- * 所以后端还没答话时这里什么都不显示 —— 编一个像模像样的版本号比留空更坏。
+ * 侧栏底部的版本行。`emptyStats()` 里 version 是**空串**而不是 "0.0.0"，
+ * 所以后端还没答话时显示"—" —— 编一个像模像样的版本号比留空更坏。
+ *
+ * libuvcpp 不在这份统计里（后端没有上报它的版本），这里只标出运行时，
+ * 不编一个库版本号。
  */
-const version = computed(() => stats.value.version)
+const versionLine = computed(() => `v${stats.value.version || '—'} · libuvcpp`)
+
+/* ------------------------------------------------------------------ 顶栏时钟 */
+
+const now = ref(new Date())
+let clockTimer = 0
+
+const pad2 = (n: number) => String(n).padStart(2, '0')
+const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+
+const clockText = computed(
+  () => `${pad2(now.value.getHours())}:${pad2(now.value.getMinutes())}:${pad2(now.value.getSeconds())}`,
+)
+const dateText = computed(
+  () =>
+    `${now.value.getFullYear()}-${pad2(now.value.getMonth() + 1)}-${pad2(now.value.getDate())} ${
+      WEEKDAYS[now.value.getDay()]
+    }`,
+)
+
+/* ------------------------------------------------------------------ 用户菜单 */
+
+const userMenuRef = ref<HTMLElement | null>(null)
+
+const userInitial = computed(() => (user.value || (authRequired.value ? '未' : '本')).slice(0, 1))
+
+function onDocumentClick(event: MouseEvent) {
+  if (userMenuOpen.value && userMenuRef.value && !userMenuRef.value.contains(event.target as Node)) {
+    userMenuOpen.value = false
+  }
+}
 
 async function onLogout() {
+  userMenuOpen.value = false
   await logout()
   // 登出之后必须回登录页 —— 不然当前页会立刻因为 401 而一片空白。
   await router.replace({ name: 'login' })
 }
+
+onMounted(() => {
+  clockTimer = window.setInterval(() => {
+    now.value = new Date()
+  }, 1000)
+  document.addEventListener('click', onDocumentClick)
+})
+
+onBeforeUnmount(() => {
+  stopStats()
+  if (clockTimer) window.clearInterval(clockTimer)
+  document.removeEventListener('click', onDocumentClick)
+})
 </script>
 
 <template>
@@ -214,14 +265,21 @@ async function onLogout() {
   <!-- 登录页：只有它自己，没有壳。 -->
   <RouterView v-if="bare" />
 
-  <div v-else class="app">
-    <!-- 抽屉拉开时压在内容上的一层遮罩。点它 = 收抽屉，比"再点一次汉堡"顺手。 -->
-    <div v-if="drawerOpen" class="side-scrim" @click="drawerOpen = false"></div>
+  <div v-else class="shell" :class="{ 'shell--collapsed': collapsed, 'shell--nav-open': drawerOpen }">
+    <!-- 抽屉拉开时压在内容上的一层遮罩。点它 = 收抽屉。 -->
+    <div v-if="drawerOpen" class="mobile-scrim" @click="drawerOpen = false"></div>
 
-    <aside class="sidebar" :class="{ 'is-collapsed': collapsed, 'is-open': drawerOpen }">
-      <div class="side-head">
+    <aside class="sidebar">
+      <div class="sidebar__brand">
+        <RouterLink to="/" class="brand-button" aria-label="回到实时预览" @click="onMenuClick">
+          <BrandMark :size="34" />
+          <span class="brand-copy">
+            <strong>Desk2ONVIF</strong>
+            <small>PROFILE S CONSOLE</small>
+          </span>
+        </RouterLink>
         <button
-          class="side-toggle"
+          class="icon-button sidebar__collapse"
           type="button"
           :title="collapsed ? '展开菜单' : '收起菜单'"
           :aria-label="collapsed ? '展开菜单' : '收起菜单'"
@@ -232,52 +290,63 @@ async function onLogout() {
         </button>
       </div>
 
-      <nav class="side-nav">
-        <div v-for="group in MENU_GROUPS" :key="group.title" class="side-group">
-          <div class="side-group-title">{{ group.title }}</div>
+      <nav class="sidebar__nav" aria-label="主导航">
+        <section v-for="group in MENU_GROUPS" :key="group.title" class="nav-section">
+          <div class="nav-section__label">{{ group.title }}</div>
 
           <RouterLink
             v-for="item in group.items"
             :key="item.to"
             :to="item.to"
-            class="side-link"
-            :class="{ 'is-active': isActive(item) }"
+            class="nav-item"
+            :class="{ 'nav-item--active': isActive(item) }"
             :title="collapsed ? item.label : undefined"
             :aria-label="collapsed ? item.label : undefined"
-            @click="onMenuClick(item)"
+            @click="onMenuClick"
           >
-            <Icon :name="item.icon" :size="17" />
-            <!-- 折叠时整块隐藏，而不是缩成一个点：留着的话那 56px 里会挤成
-                 一条竖着的残影。文字本身**不删**（读屏和浏览器内查找还要用它）。 -->
-            <span class="side-label">{{ item.label }}</span>
+            <span class="nav-item__icon"><Icon :name="item.icon" :size="18" /></span>
+            <!-- 折叠时整块隐藏，而不是缩成一个点；文字本身不删（读屏还要用）。 -->
+            <span class="nav-item__label">{{ item.label }}</span>
           </RouterLink>
-        </div>
+        </section>
       </nav>
 
-      <div v-if="version" class="side-foot" :title="`软件版本 ${version}`">v{{ version }}</div>
+      <!-- 底部状态块：一眼回答"后端在不在、跑的是哪个版本"。点它去运行状态页。 -->
+      <div class="sidebar__foot">
+        <RouterLink to="/status" class="daemon-chip" :title="`${daemonText} · ${versionLine}`" @click="onMenuClick">
+          <span class="status-dot" :class="daemonDotClass" />
+          <span class="daemon-chip__copy">
+            <strong>{{ daemonText }}</strong>
+            <small>{{ versionLine }}</small>
+          </span>
+        </RouterLink>
+      </div>
     </aside>
 
-    <main class="workspace">
+    <main class="main">
       <header class="topbar">
-        <!-- 只在 ≤720px 出现（CSS 控制），它取代的是原来那条横向导航。 -->
         <button
-          class="hamburger"
+          class="icon-button mobile-menu"
           type="button"
-          :aria-expanded="drawerOpen"
           aria-label="菜单"
           title="菜单"
+          :aria-expanded="drawerOpen"
           @click="drawerOpen = !drawerOpen"
         >
           <Icon name="menu" :size="19" />
         </button>
 
-        <span class="brand">
-          <Icon name="camera" :size="21" :stroke="1.7" class="brand-mark" />
-          Desk2ONVIF
-          <span class="brand-sub">Profile S</span>
-        </span>
+        <div class="topbar__title">
+          <span class="topbar__eyebrow">{{ pageMeta.eyebrow }}</span>
+          <h1>{{ pageMeta.title }}</h1>
+        </div>
 
-        <span class="spacer"></span>
+        <div class="topbar__spacer"></div>
+
+        <div class="topbar__clock" :title="`${dateText} ${clockText}`">
+          <strong class="num">{{ clockText }}</strong>
+          <small>{{ dateText }}</small>
+        </div>
 
         <!-- 状态色永远配文字标签：只靠颜色表意对色觉障碍不友好，也扛不住灰阶截图。 -->
         <span
@@ -290,21 +359,73 @@ async function onLogout() {
           }"
           :title="state === 'online' ? '统计推送正常' : '统计推送未连接，正在自动重连'"
         >
-          <Icon name="signal" :size="14" />统计推送：{{ connText }}
+          <i class="dot"></i>统计推送：{{ connText }}
         </span>
 
-        <template v-if="authRequired && authenticated">
-          <span class="pill" title="当前登录的账号">
-            <Icon name="user" :size="14" />{{ user || '已登录' }}
-          </span>
-          <button class="ghost" title="退出登录" @click="onLogout">
-            <Icon name="logout" :size="15" />退出
+        <button
+          class="icon-button topbar__theme"
+          type="button"
+          :title="isLight ? '切换到深色主题' : '切换到浅色主题'"
+          :aria-label="isLight ? '切换到深色主题' : '切换到浅色主题'"
+          @click="toggleTheme"
+        >
+          <Icon :name="isLight ? 'moon' : 'sun'" :size="18" />
+        </button>
+
+        <div ref="userMenuRef" class="user-menu">
+          <button
+            class="user-button"
+            type="button"
+            :aria-expanded="userMenuOpen"
+            :title="authRequired ? `当前登录：${user || '未知'}` : '本机访问（登录未启用）'"
+            @click.stop="userMenuOpen = !userMenuOpen"
+          >
+            <span class="avatar">{{ userInitial }}</span>
+            <span class="user-button__copy">
+              <strong>{{ user || (authRequired ? '未登录' : '本机访问') }}</strong>
+              <small>{{ authRequired ? '管理账号' : '登录未启用' }}</small>
+            </span>
+            <Icon name="chevron-down" :size="14" />
           </button>
-        </template>
+
+          <Transition name="menu">
+            <div v-if="userMenuOpen" class="dropdown">
+              <div class="dropdown__head">
+                <strong>{{ user || '本机访问' }}</strong>
+                <span>
+                  {{
+                    authRequired
+                      ? '会话由后端签发，退出后需要重新登录。'
+                      : '这台机器的控制台没有启用登录，同一局域网内都能打开。'
+                  }}
+                </span>
+              </div>
+              <RouterLink class="dropdown__item" to="/info" @click="userMenuOpen = false">
+                <Icon name="info" :size="16" />设备信息
+              </RouterLink>
+              <RouterLink
+                v-if="authRequired"
+                class="dropdown__item"
+                to="/settings/system"
+                @click="userMenuOpen = false"
+              >
+                <Icon name="sliders" :size="16" />系统设置
+              </RouterLink>
+              <template v-if="authRequired && authenticated">
+                <div class="dropdown__sep"></div>
+                <button class="dropdown__item dropdown__item--danger" type="button" @click="onLogout">
+                  <Icon name="logout" :size="16" />退出登录
+                </button>
+              </template>
+            </div>
+          </Transition>
+        </div>
       </header>
 
-      <div class="page">
-        <RouterView />
+      <div class="content">
+        <div class="page">
+          <RouterView />
+        </div>
       </div>
     </main>
   </div>
