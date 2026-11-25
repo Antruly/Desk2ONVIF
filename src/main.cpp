@@ -561,6 +561,7 @@ ParsedArgs parse_args(std::vector<std::string> const& argv) {
       "--verbose", "--quiet", "--debug",
       "--rtsp", "--http",
       "--onvif", "--no-rtsp", "--no-http", "--no-onvif", "--no-wsd",
+      "--no-rtsp-auth",
       "--sub", "--no-sub", "--save-config", "--no-http-auth",
       // 水印与自适应。**只有不带值的开关能进这张表** —— 它的作用是
       // "别把下一个参数当成我的值"。带值的选项（--osd-name / --max-height /
@@ -732,6 +733,9 @@ void print_usage() {
       "  --rtsp-port <N>        端口（默认 554，NVR 一般也用这个）\n"
       "  --rtsp-path <名>       地址里的路径（默认 live）\n"
       "  --rtsp-queue <N>       推流队列深度，按 NALU 计（默认 3 秒的量）\n"
+      "  --no-rtsp-auth         关掉 RTSP 的 Digest 鉴权（**只用于调试/回归**）。\n"
+      "                         默认是开的，凭据与 ONVIF 那一对相同；关了之后\n"
+      "                         局域网上任何人都能直接拉流\n"
       "  --sub                  开子码流（默认就是开的，见下）\n"
       "  --no-sub               关掉子码流\n"
       "  --sub-path <名>        子码流路径（默认 live_sub）\n"
@@ -2259,6 +2263,10 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
   // "关掉"。要让配置文件里的开关能被命令行关掉，得有 `--no-*`（下面那两条），
   // 而不是把"没写"当成"否" —— 后者会让配置文件永远无法生效。
   opt.rtsp.enabled = (args.has("--rtsp") || cfg.rtsp.enabled) && !args.has("--no-rtsp");
+  // RTSP 的 Digest 鉴权。**方向和 ONVIF/Web 那几个开关一致**：命令行能推翻
+  // 配置，而 `--no-rtsp-auth` 是唯一一个方向 —— 没有一个"强制打开"的开关，
+  // 因为默认就是开的，`rtsp.auth_enabled=true` 在配置文件里已经能表达。
+  opt.rtsp.auth_enabled = cfg.rtsp.auth_enabled && !args.has("--no-rtsp-auth");
   bool const http = (args.has("--http") || cfg.web.enabled) && !args.has("--no-http");
   if (opt.output_path.empty() && !opt.rtsp.enabled && !http) {
     // 长驻形态（`--console` / `--worker`）走到这里说明**配置文件里两个开关都是关的**，
@@ -2683,6 +2691,13 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
   // **共享的** RTSP 服务器：一台，服务全部通道，按路径区分。整趟运行就这一个
   // 对象，每一段重新 `start()` 一次（编码器和 SDP 里的尺寸绑死在创建时）。
   std::unique_ptr<d2o::RtspServer> rtsp_server;
+  // 保护 `rtsp_server` 这个**指针本身**。主线程会在分段循环里 stop()/reset()/新建
+  // 它，而网页线程会走 `apply_config` → `update_credentials()`。没有这把锁的话，
+  // 一次"正好在重开管线时保存口令"就是 use-after-free。
+  //
+  // 锁里只做"调一下 update / stop / reset"，不碰采集；`stop()` 会 join RTSP
+  // 线程，网页线程因此可能等几十毫秒 —— 这发生在用户点保存的那一刻，可以接受。
+  std::mutex rtsp_handle_mu;
 
   // 拆掉这一趟的通道 2 起：先让各路停下来，**再 join**，最后才轮到 RTSP 服务器
   // （那个顺序是 `rtsp_server.h` 的契约，反过来的话某条线程会在服务器已经拆掉
@@ -2710,6 +2725,7 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     // 上一句已经把线程 join 完了，没有人在取帧。
     preview_hub.drop_sessions();
     if (rtsp_server) {
+      std::lock_guard<std::mutex> lk(rtsp_handle_mu);
       rtsp_server->stop();
       rtsp_server.reset();
     }
@@ -3040,7 +3056,8 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
                        &config_path, &web, &derived_serial, &suggest_mu,
                        &suggest_quality, &cfg_mu,
                        &reload_cfg, &live_osd, &device_state,
-                       &channel_osd_for, &ntp_syncer](d2o::AppConfig next,
+                       &channel_osd_for, &ntp_syncer,
+                       &rtsp_server, &rtsp_handle_mu](d2o::AppConfig next,
                                                       d2o::ConfigApplyResult& out,
                                                       std::string& cerr) {
     std::vector<std::string> notes;
@@ -3108,6 +3125,23 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       // 是一对，字段集只有一个来源。
       std::lock_guard<std::mutex> lk(run_mu);
       d2o::identity_to_config(nid, running_cfg.onvif);
+    }
+
+    // **RTSP 的鉴权数据库跟着 ONVIF 那一对凭据走。** 它不走 WebServer（RTSP
+    // 服务器在 `cmd_run` 手里，不在 `web` 里），所以在这里直接推。
+    //
+    // 这一步和 `identity_live` 无关：ONVIF 关着（`--no-onvif`）时 RTSP 照样
+    // 可以用同一对凭据 —— 那正是"凭据只有一份"的意思。`update_credentials()`
+    // 自己会判断服务器在不在跑。
+    //
+    // **不是 `pending`**：下一次 RTSP 鉴权就用到新口令，不需要重启。这里也
+    // 不碰 `running_cfg.onvif` —— 那个字段的 pending 语义由上面 ONVIF 那段
+    // 决定（ONVIF 没开时它确实要重启才有 SOAP 上的新凭据）。
+    {
+      std::lock_guard<std::mutex> lk(rtsp_handle_mu);
+      if (rtsp_server) {
+        rtsp_server->update_credentials(next.onvif.user, next.onvif.password);
+      }
     }
 
     // Web 控制台的登录开关与凭据也是**当场生效**的。理由和 ONVIF 身份那条
@@ -3308,6 +3342,11 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
                wo.onvif.user.c_str());
     }
     wo.onvif.realm = "Desk2ONVIF";
+    // `GetStreamUri` 报出去的地址要不要带凭据。两个开关都从**生效值**来：
+    // 地址里嵌了口令而 RTSP 又不要求鉴权，会让客户端和排障的人以为这里有一
+    // 道根本不存在的门。
+    wo.onvif.rtsp_auth_enabled = opt.rtsp.auth_enabled;
+    wo.onvif.embed_stream_credentials = cfg.onvif.embed_stream_credentials;
 
     // --- 设备身份：**第一次启动固化一次，此后永远用配置文件里那份** --------
     //
@@ -4596,6 +4635,13 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
       server_rtsp.enabled = true;
       server_rtsp.port = seg.rtsp.port;
       server_rtsp.streams = seg.rtsp.streams;   // 通道 1
+      // Digest 凭据**只有一份**：`onvif.user` / `onvif.password`。命令行覆盖
+      // 已经折进 `snap`（`seg` 是它的采集侧投影，不含 onvif 段），所以这里
+      // 读 `snap` 而不是 `cfg` —— 后者在网页线程上会被整体赋值。
+      server_rtsp.auth_enabled = seg.rtsp.auth_enabled;
+      server_rtsp.user = snap.onvif.user;
+      server_rtsp.password = snap.onvif.password;
+      server_rtsp.realm = "Desk2ONVIF";
 
       // 音频这一路**必须在这里**交给服务器，理由和它从前挂在会话上时一样，
       // 只是方向反了：`ServerMediaSession`（音频 subsession 要挂上去的那个）
@@ -4678,12 +4724,19 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         ch->opt.rtsp_stream_slots = static_cast<unsigned>(wants.size());
       }
 
-      rtsp_server = std::make_unique<d2o::RtspServer>();
-      if (!rtsp_server->start(server_rtsp, err)) {
-        // 和从前一样，是**致命**的：配置里开着 RTSP 而端口被占。继续跑的话
-        // 每一路都推不出去，而录下来的文件完好无损 —— 这个故障会显得不严重。
-        std::fprintf(stderr, "\nRTSP 服务起不来：%s\n", err.c_str());
-        return 1;
+      {
+        // 从新建到 start() 成功之间，网页线程不可能拿到这个指针去做
+        // `update_credentials()` —— 它锁的是同一把锁，看到的要么是旧的
+        // （已 stop 的）那一个、要么是 nullptr，更新会在下一段用 `snap` 里
+        // 的值补上。start() 本身只 bind 一个端口，不会长时间占着锁。
+        std::lock_guard<std::mutex> lk(rtsp_handle_mu);
+        rtsp_server = std::make_unique<d2o::RtspServer>();
+        if (!rtsp_server->start(server_rtsp, err)) {
+          // 和从前一样，是**致命**的：配置里开着 RTSP 而端口被占。继续跑的话
+          // 每一路都推不出去，而录下来的文件完好无损 —— 这个故障会显得不严重。
+          std::fprintf(stderr, "\nRTSP 服务起不来：%s\n", err.c_str());
+          return 1;
+        }
       }
       // **指针只在 start() 成功之后发下去**：早发的话，起失败的那些通道手上
       // 会留着一个指向半初始化服务器的地址。
@@ -4742,6 +4795,11 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         wo2.onvif.user = cfg.onvif.user;
         wo2.onvif.password = cfg.onvif.password;
         wo2.onvif.realm = "Desk2ONVIF";
+        // 和通道 1 同一条规则：地址里嵌不嵌凭据由 `onvif.embed_stream_credentials`
+        // 决定，而 RTSP 不鉴权时不嵌。
+        wo2.onvif.rtsp_auth_enabled = seg.rtsp.auth_enabled;
+        wo2.onvif.embed_stream_credentials =
+            snap.onvif.embed_stream_credentials;
         wo2.onvif.uuid = wo2.device_uuid;
         // RTSP 没开的时候也报 554（和通道 1 同一条规矩）：NVR 会把
         // GetStreamUri 的地址存下来，报 0 毫无意义。

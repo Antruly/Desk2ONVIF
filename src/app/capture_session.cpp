@@ -563,6 +563,10 @@ void sync_options_to_config(SessionOptions const& o, AppConfig& c) {
   // 看起来像"音频开了但没生效"。
   c.audio = o.audio;
   c.rtsp.enabled = o.rtsp.enabled;
+  // 鉴权开关也是**生效值**的一部分：`--no-rtsp-auth` 之后 `GET /api/config`
+  // 必须显示 `false`，否则网页上那个开关会一直亮着，而命令行其实已经把它关了。
+  // 它和 `rtsp.enabled` 一样是命令行能覆盖配置的一项。
+  c.rtsp.auth_enabled = o.rtsp.auth_enabled;
 
   // 端口和路径**只在 RTSP 真开着的时候回写**。关着的时候 `o.rtsp` 里装的是
   // RtspOptions 的默认值（554 / 空 streams），回写就等于把用户配好但暂时关掉的
@@ -620,6 +624,13 @@ void apply_config_to_options(AppConfig const& c, SessionOptions& o) {
   // 也都是有意义的，因为用户就是在关着的状态下把它们配好的。
   o.audio = c.audio;
   o.rtsp.enabled = c.rtsp.enabled;
+  // RTSP 鉴权与凭据。**凭据只有一份来源**：`onvif.user` / `onvif.password`
+  // —— 这里不引入第二套字段。放在 `enabled` 的早退回之前：即使这一趟 RTSP
+  // 关着，下一次开起来时 `seg.rtsp` 里也已经是当前配置那一对。
+  o.rtsp.auth_enabled = c.rtsp.auth_enabled;
+  o.rtsp.user = c.onvif.user;
+  o.rtsp.password = c.onvif.password;
+  o.rtsp.realm = "Desk2ONVIF";
 
   if (!o.rtsp.enabled) {
     // **不碰 sub_* 和 streams**，理由和 sync 那侧的"关着不回写"完全对称：

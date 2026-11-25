@@ -768,6 +768,7 @@ std::string config_to_json(AppConfig const& c, bool redact_secrets) {
       {"enabled", c.rtsp.enabled},
       {"port", c.rtsp.port},
       {"path", c.rtsp.path},
+      {"auth_enabled", c.rtsp.auth_enabled},
       {"sub_enabled", c.rtsp.sub_enabled},
       {"sub_path", c.rtsp.sub_path},
       {"sub_height", c.rtsp.sub_height},
@@ -805,6 +806,7 @@ std::string config_to_json(AppConfig const& c, bool redact_secrets) {
       {"device_uuid", c.onvif.device_uuid},
       {"device_name", c.onvif.device_name},
       {"location", c.onvif.location},
+      {"embed_stream_credentials", c.onvif.embed_stream_credentials},
   };
   j["osd"] = osd_json_node(c.osd);
   j["adaptive"] = json{
@@ -890,6 +892,7 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
       take(s, "enabled", out.rtsp.enabled);
       take(s, "port", out.rtsp.port);
       take(s, "path", out.rtsp.path);
+      take(s, "auth_enabled", out.rtsp.auth_enabled);
       take(s, "sub_enabled", out.rtsp.sub_enabled);
       take(s, "sub_path", out.rtsp.sub_path);
       take(s, "sub_height", out.rtsp.sub_height);
@@ -933,6 +936,7 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
       take(s, "device_uuid", out.onvif.device_uuid);
       take(s, "device_name", out.onvif.device_name);
       take(s, "location", out.onvif.location);
+      take(s, "embed_stream_credentials", out.onvif.embed_stream_credentials);
 
       // 密码单独处理：收到哨兵就表示"这一项没改"，**必须**保持原值。
       // 少了这一条，Web UI 上"改个帧率顺手保存"会把口令覆写成

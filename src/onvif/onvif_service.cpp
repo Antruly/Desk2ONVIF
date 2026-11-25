@@ -71,6 +71,36 @@ std::string xml_escape(std::string const& s) {
 /// 忘了转义就是一个只在特定地址下才炸的 bug。
 std::string attr(std::string const& s) { return xml_escape(s); }
 
+/// RFC 3986 的 userinfo 百分号编码：**unreserved 之外全部编码**。
+///
+/// `GetStreamUri` 要把 `onvif.user` / `onvif.password` 嵌进
+/// `rtsp://user:pass@host:port/path`。口令里出现 `@ : / % # ? [ ]`、空格或
+/// 中文都很正常（用户自己设的），任何一个原样进去都会让 URL 在**第一个**
+/// 分隔符处被切开 —— NVR 拿到的是一段解析得"成功"、但主机/路径完全不对的
+/// 地址，症状是"添加成功、没有画面"。
+///
+/// 只放行 unreserved（`A-Z a-z 0-9 - . _ ~`）；其余按 UTF-8 字节逐个写成
+/// `%XX`（大写十六进制）。这是最保守的一档 —— 多编码几个字符不会错，少编码
+/// 一个就会错。
+std::string percent_encode_userinfo(std::string const& s) {
+  static char const kHex[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(s.size() + 16);
+  for (unsigned char const c : s) {
+    bool const unreserved = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                            c == '_' || c == '~';
+    if (unreserved) {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[c >> 4]);
+      out.push_back(kHex[c & 0x0f]);
+    }
+  }
+  return out;
+}
+
 int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 // --- 从请求体里抠标量 ------------------------------------------------------
@@ -1291,7 +1321,19 @@ struct OnvifService::Impl {
 
   std::string stream_uri(std::string const& peer,
                          OnvifStreamProfile const& p) const {
-    return url_for(peer, "rtsp", opt.rtsp_port, p.rtsp_path);
+    std::string uri = url_for(peer, "rtsp", opt.rtsp_port, p.rtsp_path);
+    // 嵌凭据是**默认行为**：多数 NVR 会把 GetStreamUri 的结果直接拿去拉流，
+    // 而它不一定把添加通道时保存的凭据顺手塞进这个 URL。`rtsp_auth_enabled`
+    // 为假时不嵌 —— 那是调试配置，地址里带口令只会误导人。
+    if (opt.embed_stream_credentials && opt.rtsp_auth_enabled) {
+      constexpr char kScheme[] = "rtsp://";
+      if (uri.compare(0, sizeof(kScheme) - 1, kScheme) == 0) {
+        uri.insert(sizeof(kScheme) - 1,
+                   percent_encode_userinfo(opt.user) + ":" +
+                       percent_encode_userinfo(opt.password) + "@");
+      }
+    }
+    return uri;
   }
 
   std::string snapshot_uri(std::string const& peer) const {

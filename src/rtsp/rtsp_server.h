@@ -49,6 +49,9 @@ namespace d2o {
 
 class NaluQueue;
 class H264LiveSource;
+/// 线程安全的 `UserAuthenticationDatabase` 子类，定义在 .cpp 里 —— 这个头
+/// 刻意不把 Live555 包含进来。
+class AuthDatabase;
 
 /// 一路码流的参数。
 ///
@@ -115,6 +118,20 @@ struct RtspOptions {
 
   /// 音频这一路。它**不在 `streams` 里**，理由见 `RtspAudioOptions` 上面那段。
   RtspAudioOptions audio;
+
+  /// RTSP 的 Digest 鉴权。**默认开，凭据与 ONVIF 是同一对**
+  /// （`onvif.user` / `onvif.password`）—— 这是本项目里唯一一份面向机器的
+  /// 摄像机上凭据，再设一套 RTSP 账号只会让 NVR 上填的那一对与拉流用的那一对
+  /// 悄悄分叉。
+  ///
+  /// 这里是"起服务器那一刻"的值；运行中换口令走
+  /// `RtspServer::update_credentials()`，不需要重建服务器。
+  bool auth_enabled = true;
+  std::string user = "admin";
+  std::string password;
+  /// Digest 挑战里的 realm。与 ONVIF SOAP 那侧用同一个字符串，NVR 的凭据
+  /// 缓存按 realm 归类，两边不一致时它可能把同一个口令当成两份凭据。
+  std::string realm = "Desk2ONVIF";
 };
 
 class RtspServer {
@@ -178,6 +195,25 @@ class RtspServer {
 
   /// 见文件头的停机顺序说明：调用前编码线程必须已经停了。
   void stop();
+
+  /// 运行中换 RTSP 的 Digest 凭据（`onvif.user` / `onvif.password` 改了之后）。
+  ///
+  /// **可以从任何线程调**（前提是这个 `RtspServer` 本身没在同时 `stop()` /
+  /// 析构 —— 那是所有对象共有的生命周期约束；`main.cpp` 用一把
+  /// `rtsp_handle_mu` 把两条路串起来）。`UserAuthenticationDatabase` 和
+  /// Live555 的其它对象一样是单线程的，在网页线程上直接对它调
+  /// `removeUserRecord` / `addUserRecord` 是数据竞争。我们的实现换了一个
+  /// 角度：`auth_db` 是一个自己带锁的子类，`lookupPassword()` 每次都从锁
+  /// 后面取**当前**用户名与口令 —— 于是这里只需要换掉两个字符串，
+  /// **下一次鉴权就生效**。
+  ///
+  /// **没有"旧口令仍然可用"的窗口**：不做异步投递（Live555 的
+  /// `TaskScheduler::triggerEvent()` 第二个参数是 `int`，传不了实例指针；
+  /// 绕一层全局注册表既有风险，又仍然是异步的）。锁一放，旧口令就不再匹配。
+  ///
+  /// 服务器没跑、或者 `auth_enabled=false` 时是空操作 —— 下一次 `start()`
+  /// 会用 `RtspOptions` 里那一份凭据。
+  void update_credentials(std::string const& user, std::string const& password);
 
   bool running() const { return running_.load(std::memory_order_relaxed); }
 
@@ -267,6 +303,12 @@ class RtspServer {
   TaskScheduler* scheduler_ = nullptr;
   UsageEnvironment* env_ = nullptr;
   RTSPServer* server_ = nullptr;
+
+  /// Live555 的鉴权数据库（本项目的线程安全子类，定义在 .cpp 里）。
+  /// **生命周期必须 ≥ `server_`** —— `RTSPServer` 只在处理请求时按指针读它，
+  /// 不持有所有权。`server_` 是裸指针、不由成员析构，所以 teardown() 里
+  /// 显式**先关服务器、再放它**。
+  std::unique_ptr<AuthDatabase> auth_db_;
 
   /// doEventLoop 的停止标志。类型必须和 Live555 的 EventLoopWatchVariable 一致，
   /// .cpp 里有 static_assert 盯着。

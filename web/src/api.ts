@@ -92,7 +92,10 @@ async function describeFailure(resp: Response): Promise<FailureDetail> {
       parsed = JSON.parse(text)
     } catch {
       // 不是 JSON —— 当纯文本用，没有结构化信息可带。
-      return { error: text.length > 400 ? `${text.slice(0, 400)}…` : text }
+      // `trim()` 是显示层的事：不少服务端的纯文本错误正文带一个尾随换行，
+      // 而错误条按原文换行渲染时，界面会出现"最后一句只剩下一个句号"的断行。
+      const plain = text.trim()
+      return { error: plain.length > 400 ? `${plain.slice(0, 400)}…` : plain }
     }
     const j = parsed as Record<string, unknown>
     const clipped = text.length > 400 ? `${text.slice(0, 400)}…` : text

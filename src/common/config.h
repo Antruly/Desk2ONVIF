@@ -72,6 +72,16 @@ struct RtspConfig {
   int port = 554;
   std::string path = "/live";
 
+  /// RTSP 要不要 Digest 鉴权。**默认 true，而且这是安全默认** —— 老配置文件
+  /// 里没有这个键时读出来也是 true（结构体默认值，`take()` 不会覆盖）。
+  ///
+  /// 凭据**只有一份**：`onvif.user` / `onvif.password`。不新增第二套 RTSP
+  /// 账号字段 —— NVR 添加通道时填的就是 ONVIF 那一对，分成两套只会让人在
+  /// "为什么同一个口令，NVR 能进、ffplay 不能进"上查半天。
+  ///
+  /// 关掉它是调试/回归用的（命令行 `--no-rtsp-auth`），不是推荐配置。
+  bool auth_enabled = true;
+
   /// 子码流：**第二路编码器**，不是"编一次再抽帧"（那要先解码，纯浪费）。
   ///
   /// 默认**开**。它存在的唯一理由是 NVR 的多画面网格 —— 而 NVR 默认拉的是
@@ -185,6 +195,17 @@ struct OnvifConfig {
   std::string device_name = "Desk2ONVIF";
   /// GetDeviceInformation 的 Location 字段，NVR 界面上会显示。
   std::string location = "Desktop";
+
+  /// `GetStreamUri` 报出去的 RTSP 地址要不要带上 `user:password@`。
+  ///
+  /// **默认 true。** 大多数 NVR 会把 `GetStreamUri` 的结果直接拿去拉流，
+  /// 有些实现不会把添加通道时填的凭据顺手塞进这个 URL —— 不带 userinfo 的话
+  /// 它拿到的是一个必然 401 的地址，而症状只是"添加成功、没有画面"。
+  ///
+  /// 代价是口令以明文出现在 SOAP 响应里（只发给通过 ONVIF Digest 鉴权的
+  /// 客户端）。不想让它出现就在配置里写 `false`，NVR 那侧靠它自己保存的
+  /// 凭据去拉。`rtsp.auth_enabled=false` 时不嵌 —— 那时嵌进去是误导。
+  bool embed_stream_credentials = true;
 };
 
 /// 一项烧进画面里的水印。

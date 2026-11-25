@@ -328,10 +328,12 @@ function streamLabel(i: number): string {
 </script>
 
 <template>
-  <div class="page-head">
-    <h1>运行状态</h1>
-    <span class="hint">后端每秒推送一次；最后更新 {{ lastSeen }}</span>
-  </div>
+  <section class="page-head">
+    <div>
+      <h1>运行状态</h1>
+      <p class="sub">后端每秒推送一次；最后更新 <span class="mono">{{ lastSeen }}</span>。这里的数字都是读数，只有性能横幅会要求你做一个决定。</p>
+    </div>
+  </section>
 
   <!-- WS 断开时后端仍在跑，只是这一页看不到数字。说清楚，别让人以为程序挂了。 -->
   <div v-if="state !== 'online'" class="banner is-warn">
