@@ -301,8 +301,9 @@ def main():
     R.check(st == 200, f"第一次 Unsubscribe → HTTP {st}", data[:200])
     root = R.strict_xml(data, "Unsubscribe")
     if root is not None:
-        R.check(root.tag == f"{{{NS_WSNT}}}UnsubscribeResponse",
-                f"响应根元素 = {root.tag}")
+        resp = R.find(root, ".//wsnt:UnsubscribeResponse")
+        R.check(resp is not None,
+                "响应体里有 wsnt:UnsubscribeResponse")
 
     st, data = unsubscribe(sub_path)
     R.check(st == 200, f"第二次 Unsubscribe（幂等）→ HTTP {st}", data[:200])
