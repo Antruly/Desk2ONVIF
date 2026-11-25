@@ -14,6 +14,7 @@
 #include <webapp/uvcpp_web_response.h>
 #include <webapp/uvcpp_web_static.h>
 #include <webapp/uvcpp_web_ws.h>
+#include <handle/uvcpp_timer.h>
 #include <uvcpp/uvcpp_threadpool.h>
 
 #include <atomic>
@@ -1888,16 +1889,58 @@ void WebServer::Impl::register_routes() {
     // `set_identity` 写。两个写入方各有明确的分工，这里再来一个的话，将来
     // 三处里漏掉一处就会表现为"某一条路上名字是旧的"。
     onvif.set_device_state(opt.device_state);
+    // Events 的 PullMessages 要能"等一会儿再回"，而 OnvifService 拿不到 loop。
+    // 把 loop 的两种投递能力给它：0 ms = 下一拍（`app->post`），>0 = 真定时器。
+    // 回调都跑在循环线程上，和 SOAP handler 同一条。
+    onvif.set_deferred_runner(
+        [this](int delay_ms, std::function<void()> fn) {
+          if (!app) return;
+          if (delay_ms <= 0) {
+            app->post(std::move(fn));
+            return;
+          }
+          auto* timer = new uvcpp::uvcpp_timer(app->loop());
+          if (timer->init() != 0) {
+            delete timer;
+            app->post(std::move(fn));
+            return;
+          }
+          // 定时器归这个闭包所有：触发后先跑响应，再 `close()`，关闭完成的
+          // 回调里 delete。**不能在回调里直接 delete** —— `close()` 是异步的，
+          // 句柄还在 libuv 的表里。
+          timer->start(
+              [timer, fn = std::move(fn)](uvcpp::uvcpp_timer*) mutable {
+                fn();
+                timer->close([timer](uvcpp::uvcpp_handle*) { delete timer; });
+              },
+              static_cast<std::uint64_t>(delay_ms), 0);
+        });
     a.post("/onvif/device_service",
-           [this](uvcpp_web_request& req, uvcpp_web_response& resp, uvcpp_web_next) {
-             onvif.handle(req, resp, false);
+           [this](uvcpp_web_request& req, uvcpp_web_response& resp, uvcpp_web_next next) {
+             onvif.handle(req, resp, OnvifRoute::kDevice, next);
            });
     a.post("/onvif/media_service",
-           [this](uvcpp_web_request& req, uvcpp_web_response& resp, uvcpp_web_next) {
-             onvif.handle(req, resp, true);
+           [this](uvcpp_web_request& req, uvcpp_web_response& resp, uvcpp_web_next next) {
+             onvif.handle(req, resp, OnvifRoute::kMedia, next);
            });
-    D2O_INFO("ONVIF 已启用：%s / %s",
-             "/onvif/device_service", "/onvif/media_service");
+    if (opt.onvif.media2_enabled) {
+      a.post("/onvif/media2_service",
+             [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                    uvcpp_web_next next) {
+               onvif.handle(req, resp, OnvifRoute::kMedia2, next);
+             });
+    }
+    if (opt.onvif.events_enabled) {
+      a.post("/onvif/events_service",
+             [this](uvcpp_web_request& req, uvcpp_web_response& resp,
+                    uvcpp_web_next next) {
+               onvif.handle(req, resp, OnvifRoute::kEvents, next);
+             });
+    }
+    D2O_INFO("ONVIF 已启用：%s / %s%s%s", "/onvif/device_service",
+             "/onvif/media_service",
+             opt.onvif.media2_enabled ? " / /onvif/media2_service" : "",
+             opt.onvif.events_enabled ? " / /onvif/events_service" : "");
   }
 
   // 静态资源挂最后。它注册的是 `/` 和 `/*path` 两条**兜底**路由，

@@ -3479,6 +3479,10 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
     // 道根本不存在的门。
     wo.onvif.rtsp_auth_enabled = opt.rtsp.auth_enabled;
     wo.onvif.embed_stream_credentials = cfg.onvif.embed_stream_credentials;
+    // Media2 / Events 端点的开关跟着配置走。关掉时 Web 层连路由都不注册，
+    // GetServices 里也不宣告（见 OnvifServiceOptions 的注释）。
+    wo.onvif.media2_enabled = cfg.onvif.media2_enabled;
+    wo.onvif.events_enabled = cfg.onvif.events_enabled;
 
     // --- 设备身份：**第一次启动固化一次，此后永远用配置文件里那份** --------
     //
@@ -5063,6 +5067,8 @@ int cmd_run(ParsedArgs const& args, RunForm form, std::wstring const& raw_cmdlin
         wo2.onvif.rtsp_auth_enabled = seg.rtsp.auth_enabled;
         wo2.onvif.embed_stream_credentials =
             snap.onvif.embed_stream_credentials;
+        wo2.onvif.media2_enabled = snap.onvif.media2_enabled;
+        wo2.onvif.events_enabled = snap.onvif.events_enabled;
         wo2.onvif.uuid = wo2.device_uuid;
         // RTSP 没开的时候也报 554（和通道 1 同一条规矩）：NVR 会把
         // GetStreamUri 的地址存下来，报 0 毫无意义。

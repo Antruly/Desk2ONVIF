@@ -6,6 +6,7 @@
 #include "onvif/net_identity.h"
 #include "onvif/wss.h"
 
+#include <webapp/uvcpp_web_handler.h>
 #include <webapp/uvcpp_web_request.h>
 #include <webapp/uvcpp_web_response.h>
 #include <wsdl/uvcpp_soap_message.h>
@@ -42,6 +43,29 @@ constexpr char kNsNetwork[] = "http://www.onvif.org/ver10/network/wsdl";
 // ONVIF 的**错误**命名空间（`ter`）。Fault 的子码就来自这里，
 // 例如 `ter:ActionNotSupported`、`ter:NoSuchService`。
 constexpr char kNsError[] = "http://www.onvif.org/ver10/error";
+
+// Media2 与 Events 用到的命名空间。**全部声明在 Envelope 上**（见
+// `soap_envelope`）：ONVIF 的响应本来就是跨命名空间的，逐个元素声明前缀
+// 只会让"声明管不到兄弟"那一类错重新长出来。
+constexpr char kNsMedia2[] = "http://www.onvif.org/ver20/media/wsdl";
+constexpr char kNsEvents[] = "http://www.onvif.org/ver10/events/wsdl";
+constexpr char kNsWsnt[] = "http://docs.oasis-open.org/wsn/b-2";
+constexpr char kNsWstop[] = "http://docs.oasis-open.org/wsn/t-1";
+constexpr char kNsWsa[] = "http://www.w3.org/2005/08/addressing";
+/// 我们自己定义的心跳事件命名空间。
+///
+/// **不用 `tns1:`。** `tns1` 是 ONVIF 标准 topic 的命名空间，而我们能发的
+/// 唯一事件是"设备还活着"——它不是标准 topic（尤其**不是**
+/// `tns1:VideoSource/MotionAlarm`）。挂到 tns1 下等于给 NVR 一个假的运动
+/// 报警源，而这类谎最难被发现：订阅成功、消息也来了，只是内容从来不对。
+constexpr char kNsD2oEvents[] = "urn:desk2onvif:events";
+
+/// Events 的 topic 表达式。（QName 形式，前缀在 Envelope 上声明。）
+constexpr char kEventHeartbeatTopic[] = "d2o:Device/Heartbeat";
+/// GetEventProperties 里报的 topic 树根 / 叶子名（`wstop:Topic/@name` 是
+/// NCName，不能带前缀）。
+constexpr char kEventTopicRoot[] = "Device";
+constexpr char kEventTopicLeaf[] = "Heartbeat";
 
 // 令牌。全都**不含空格和特殊字符**：有些 NVR 会把它直接拼进 URL 查询串。
 constexpr char kTokenVideoSource[] = "VideoSource";
@@ -461,6 +485,99 @@ bool parse_tz_minutes(std::string const& s, long& out) {
   return true;
 }
 
+/// 解析 `xsd:duration`，返回毫秒。只用于 Events 的两个地方：
+/// `PullMessages/Timeout` 和 `Renew/TerminationTime`。
+///
+/// 认 `P[nD][T[nH][nM][nS]]`（也接受小数秒），**不认**年月 —— 事件订阅的
+/// 生命周期是分钟/小时量级，年月那一段只会出现在一个明显发错的报文里。
+/// 负值按 0 处理（`-PT1S` 是"已经过期"，不是"往前等一秒"）。
+bool parse_xsd_duration_ms(std::string const& in, long long& out_ms) {
+  std::size_t a = in.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return false;
+  std::size_t z = in.find_last_not_of(" \t\r\n");
+  std::string const s = in.substr(a, z - a + 1);
+
+  std::size_t p = 0;
+  bool neg = false;
+  if (s[p] == '-') { neg = true; ++p; }
+  else if (s[p] == '+') { ++p; }
+  if (p >= s.size() || s[p] != 'P') return false;
+  ++p;
+
+  bool in_time = false;
+  bool any = false;
+  double total = 0.0;
+  while (p < s.size()) {
+    if (s[p] == 'T') {
+      if (in_time) return false;  // 两个 T 不是合法 duration
+      in_time = true;
+      ++p;
+      continue;
+    }
+    std::size_t const num_from = p;
+    while (p < s.size() &&
+           ((s[p] >= '0' && s[p] <= '9') || s[p] == '.')) {
+      ++p;
+    }
+    if (p == num_from || p >= s.size()) return false;
+    // `strtod` 只吃数字和小数点；上面已经把它们圈出来了。
+    double const v = std::strtod(s.substr(num_from, p - num_from).c_str(), nullptr);
+    char const unit = s[p++];
+    if (!in_time) {
+      if (unit != 'D') return false;
+      total += v * 86400.0;
+    } else if (unit == 'H') {
+      total += v * 3600.0;
+    } else if (unit == 'M') {
+      total += v * 60.0;
+    } else if (unit == 'S') {
+      total += v;
+    } else {
+      return false;
+    }
+    any = true;
+  }
+  if (!any) return false;
+  if (neg || total < 0.0) total = 0.0;
+  // 上限先在这里夹一下，免得 `P1000000D` 把 long long 撑爆。调用方会再按
+  // 自己的策略夹一次（比如 PullMessages 的上限）。
+  constexpr double kMax = 365.0 * 86400.0 * 1000.0;
+  if (total * 1000.0 > kMax) total = kMax / 1000.0;
+  out_ms = static_cast<long long>(total * 1000.0);
+  return true;
+}
+
+/// `xsd:dateTime` → `time_t`（UTC）。Renew 的 `TerminationTime` 规范上允许
+/// 绝对时刻，而多数客户端只发 duration —— 两条都得认，否则一个合法的
+/// Renew 会被我们当成畸形报文。
+///
+/// 只认 `YYYY-MM-DDThh:mm:ss[.sss]Z`（以及省略 `Z` 的形式，按 UTC 处理）。
+/// 带 `+08:00` 偏移的写法很少见；认不出来时由调用方回 Fault，而不是猜。
+std::time_t utc_fields_to_time_t(std::tm const& fields);  // 定义在本文件下方
+
+bool parse_xsd_datetime(std::string const& in, std::time_t& out) {
+  int y = 0, mo = 0, d = 0, h = 0, mi = 0;
+  double sec = 0.0;
+  if (std::sscanf(in.c_str(), "%d-%d-%dT%d:%d:%lf", &y, &mo, &d, &h, &mi,
+                  &sec) != 6) {
+    return false;
+  }
+  if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 ||
+      mi < 0 || mi > 59 || sec < 0.0 || sec >= 61.0) {
+    return false;
+  }
+  std::tm f{};
+  f.tm_year = y - 1900;
+  f.tm_mon = mo - 1;
+  f.tm_mday = d;
+  f.tm_hour = h;
+  f.tm_min = mi;
+  f.tm_sec = static_cast<int>(sec);
+  out = utc_fields_to_time_t(f);
+  return out != static_cast<std::time_t>(-1);
+}
+
+
 /// ONVIF 的时间字段是**分开的数字元素**，不是 ISO8601 字符串 ——
 /// 这一点和 WS-Discovery 那边（`AppSequence/@InstanceId`）不一样。
 std::string date_time_fields(std::tm const& t) {
@@ -488,6 +605,23 @@ void localtime_local(std::time_t t, std::tm& out) {
 #else
   ::localtime_r(&t, &out);
 #endif
+}
+
+/// `xsd:dateTime`（UTC，带 `Z`）。Events 的 CurrentTime / TerminationTime /
+/// UtcTime 都要这个格式 —— 它们是**字符串**，和 `GetSystemDateAndTime` 那套
+/// 分开的字段不是一回事。
+std::string xsd_datetime(std::time_t t) {
+  std::tm g{};
+  gmtime_utc(t, g);
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour,
+                g.tm_min, g.tm_sec);
+  return std::string(buf);
+}
+
+std::string xsd_datetime(std::chrono::system_clock::time_point tp) {
+  return xsd_datetime(std::chrono::system_clock::to_time_t(tp));
 }
 
 /// 把一串"钟面字段"当成 UTC 换算成 `time_t`。
@@ -584,6 +718,12 @@ std::string soap_envelope(uvcpp_soap_version v, std::string const& body_inner) {
   x += "\" xmlns:tt=\"";   x += kNsSchema;
   x += "\" xmlns:dn=\"";   x += kNsNetwork;
   x += "\" xmlns:ter=\"";  x += kNsError;
+  x += "\" xmlns:tr2=\"";  x += kNsMedia2;
+  x += "\" xmlns:tev=\"";  x += kNsEvents;
+  x += "\" xmlns:wsnt=\""; x += kNsWsnt;
+  x += "\" xmlns:wstop=\""; x += kNsWstop;
+  x += "\" xmlns:wsa=\"";  x += kNsWsa;
+  x += "\" xmlns:d2o=\"";  x += kNsD2oEvents;
   x += "\"><soap:Body>";
   x += body_inner;
   x += "</soap:Body></soap:Envelope>";
@@ -820,6 +960,94 @@ struct OnvifService::Impl {
   /// 审计去重闸门的状态（见 `note_audit`）。**只在循环线程上写**，所以不加锁。
   std::string audit_last_key;
   std::chrono::steady_clock::time_point audit_last_at{};
+
+  // --- Events: 拉取点订阅 ------------------------------------------------
+  //
+  // 全部只在循环线程上读写（SOAP 请求就在那条线程），所以不加锁。
+
+  struct EventSubscription {
+    std::string token;
+    /// 到点之后这个订阅自动失效。用 `system_clock` 而不是 `steady_clock`：
+    /// `TerminationTime` 要报给客户端的是**墙钟**。
+    std::chrono::system_clock::time_point termination;
+    /// 上次发心跳的时刻。订阅刚建时故意往回拨一个周期，于是第一次
+    /// PullMessages 就能拿到一条"设备在线"消息 —— 否则 NVR 的探测常常在
+    /// 第一个 Timeout 里什么都收不到，然后判定这个订阅没工作。
+    std::chrono::steady_clock::time_point last_heartbeat;
+    std::uint64_t heartbeat_seq = 0;
+  };
+  std::map<std::string, EventSubscription> event_subs;
+  std::uint64_t next_event_sub_id_ = 0;
+
+  static constexpr int kEventMaxSubs = 8;
+  static constexpr int kEventMaxPullPoints = kEventMaxSubs;
+  /// 心跳间隔。**只是"状态事件"**，不是运动报警；见 `kNsD2oEvents` 的注释。
+  static constexpr int kHeartbeatIntervalS = 30;
+  /// PullMessages 的 Timeout 上限（毫秒）。NVR 常发 PT20S；我们夹到 10 秒，
+  /// 免得一个挂住的拉取把连接和请求上下文占得太久。
+  static constexpr int kPullTimeoutCapMs = 10000;
+  static constexpr int kPullDefaultTimeoutMs = 5000;
+  static constexpr int kPullMaxMessages = 10;
+  static constexpr int kPullDefaultMessages = 5;
+  /// 订阅默认存活 1 小时；Renew 可以延长，最长 24 小时。
+  static constexpr int kSubDefaultTtlS = 3600;
+  static constexpr int kSubMaxTtlS = 86400;
+
+  /// 延迟执行（PullMessages 的长轮询）。空 = 不等，立即回空消息。
+  std::function<void(int, std::function<void()>)> deferred_runner;
+
+  /// 一次被推迟的 PullMessages。`events_op` 置位，`handle()` 消费：
+  /// - 有 runner 时，`pull_xml` 在定时器到点后由 `handle` 发出去；
+  /// - 没有 runner（或调用方没给 `next`）时，`handle` 当场发 `pull_xml`。
+  bool pull_deferred = false;
+  int pull_deferred_ms = 0;
+  std::string pull_deferred_xml;
+
+  /// 清掉已过期的订阅。每次 Events 操作前调一次 —— 惰性清理就够了，
+  /// 不需要一个后台定时器（那会让"事件服务"多一条必须被拆掉的生命周期）。
+  void sweep_event_subs() {
+    auto const now = std::chrono::system_clock::now();
+    for (auto it = event_subs.begin(); it != event_subs.end();) {
+      if (it->second.termination <= now) {
+        it = event_subs.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  EventSubscription* find_event_sub(std::string const& token) {
+    auto const it = event_subs.find(token);
+    return it == event_subs.end() ? nullptr : &it->second;
+  }
+
+  /// 客户端给的订阅标识可能出现在三个地方：URL 查询串（我们发出的
+  /// SubscriptionReference 的 Address 里就带着它）、SOAP Header 的
+  /// ReferenceParameters、或 body 里的 `SubscriptionID`。按这个顺序认。
+  std::string event_token_hint(std::string const& from_query,
+                               std::string const& header_xml,
+                               std::string const& body_xml) const {
+    if (!from_query.empty()) return from_query;
+    for (char const* tag : {"SubscriptionID", "SubscriptionId", "Identifier"}) {
+      std::string const t = xml_text(header_xml, tag);
+      if (!t.empty()) return t;
+    }
+    for (char const* tag : {"SubscriptionID", "SubscriptionId"}) {
+      std::string const t = xml_text(body_xml, tag);
+      if (!t.empty()) return t;
+    }
+    return {};
+  }
+
+  /// 解析出这次操作针对哪个订阅。空 token 且只有一个活订阅时用它 ——
+  /// 大量 NVR 只建一个拉取点，然后直接往同一个 URL 发 PullMessages，
+  /// 不带任何 token。有多个时**不猜**：猜错会把 A 的消息发给 B。
+  EventSubscription* resolve_event_sub(std::string const& hint) {
+    sweep_event_subs();
+    if (!hint.empty()) return find_event_sub(hint);
+    if (event_subs.size() == 1) return &event_subs.begin()->second;
+    return nullptr;
+  }
 
   /// 写一行操作日志（审计），**并去掉"一分钟之内一字不差的那一条"**。
   ///
@@ -1635,10 +1863,196 @@ struct OnvifService::Impl {
            audio_encoder_config_body(a) + "</trt:Configurations>";
   }
 
+  // --- Media2 -------------------------------------------------------------
+  //
+  // Media2 的形状和 Media1 **不一样**，不能把 Media1 的响应改个前缀发出去：
+  //
+  //   * Profile 里是 `<tr2:Name>` + `<tr2:Configurations>`，配置项叫
+  //     `VideoSource` / `VideoEncoder`（不是 Media1 的 `VideoSourceConfiguration`
+  //     / `VideoEncoderConfiguration`）。
+  //   * 编码器配置是 `tt:VideoEncoder2Configuration`：`GovLength` 和 `Profile`
+  //     是**属性**，`RateControl` 里没有 `EncodingInterval`。
+  //   * `GetStreamUri` / `GetSnapshotUri` 的响应只有 `<tr2:Uri>`，没有
+  //     `MediaUri` 包一层。
+  //
+  // 元素归属按 `onvif_wsdl/media.wsdl`（Media2）和 `onvif.xsd` 里各自的
+  // `xs:element` 所在文件定：`tr2:` 是 ver20 媒体 wsdl 本地声明，`tt:` 是
+  // onvif.xsd 的类型。
+
+  /// `tt:VideoEncoder2Configuration` 的子元素（不含外层 `tr2:VideoEncoder`）。
+  /// 属性 `GovLength` / `Profile` 由调用方写在 `tr2:VideoEncoder` 上。
+  std::string media2_encoder_body(OnvifStreamProfile const& p) const {
+    std::string x;
+    x += "<tt:Name>" + xml_escape(p.name) + "</tt:Name>";
+    x += "<tt:UseCount>1</tt:UseCount>";
+    x += "<tt:Encoding>" + xml_escape(p.encoding) + "</tt:Encoding>";
+    x += "<tt:Resolution><tt:Width>" + std::to_string(p.width) +
+         "</tt:Width><tt:Height>" + std::to_string(p.height) +
+         "</tt:Height></tt:Resolution>";
+    x += "<tt:RateControl><tt:FrameRateLimit>" + std::to_string(p.fps) +
+         "</tt:FrameRateLimit><tt:BitrateLimit>" +
+         std::to_string(p.bitrate_kbps) + "</tt:BitrateLimit></tt:RateControl>";
+    x += "<tt:Quality>" + std::to_string(p.quality) + "</tt:Quality>";
+    return x;
+  }
+
+  /// `tt:AudioEncoder2Configuration` 的子元素。Media2 的 `Encoding` 是
+  /// **MIME 子类型**（`xs:string`）：AAC 对应 `mpeg4-generic`。Media1 那边
+  /// 的 `AAC` 不是这个字段的词汇表，混用会让严格校验的实现认不出来。
+  static std::string media2_audio_encoder_body(OnvifAudioConfig const& a) {
+    std::string x;
+    x += "<tt:Name>AudioEncoderConfig</tt:Name>";
+    x += "<tt:UseCount>1</tt:UseCount>";
+    x += "<tt:Encoding>mpeg4-generic</tt:Encoding>";
+    x += "<tt:Bitrate>" + std::to_string(a.bitrate_kbps) + "</tt:Bitrate>";
+    x += "<tt:SampleRate>" + std::to_string(a.sample_rate_khz) +
+         "</tt:SampleRate>";
+    return x;
+  }
+
+  /// 一个 Media2 Profile。
+  std::string media2_profile_block(std::string const& ind,
+                                   OnvifStreamProfile const& p) const {
+    int const gov = clamp_int(p.gop_seconds * p.fps, 1, 100000);
+    OnvifAudioConfig const a = audio_cfg();
+    std::string x;
+    x += ind + "<tr2:Profiles token=\"" + attr(p.token) + "\" fixed=\"true\">";
+    x += "<tr2:Name>" + xml_escape(p.name) + "</tr2:Name>";
+    x += "<tr2:Configurations>";
+    x += "<tr2:VideoSource token=\"" + std::string(kTokenVsConfig) + "\">";
+    x += video_source_config("", p);
+    x += "</tr2:VideoSource>";
+    if (a.enabled) {
+      x += "<tr2:AudioSource token=\"" +
+           std::string(kTokenAudioSourceConfig) + "\">";
+      x += audio_source_config_body();
+      x += "</tr2:AudioSource>";
+    }
+    x += "<tr2:VideoEncoder token=\"VideoEncoderConfig_" + attr(p.token) +
+         "\" GovLength=\"" + std::to_string(gov) + "\" Profile=\"" +
+         attr(p.h264_profile) + "\">";
+    x += media2_encoder_body(p);
+    x += "</tr2:VideoEncoder>";
+    if (a.enabled) {
+      x += "<tr2:AudioEncoder token=\"" +
+           std::string(kTokenAudioEncoderConfig) + "\">";
+      x += media2_audio_encoder_body(a);
+      x += "</tr2:AudioEncoder>";
+    }
+    x += "</tr2:Configurations></tr2:Profiles>";
+    return x;
+  }
+
+  /// `GetVideoEncoderConfigurations` 的一项。外层元素名是 `Configurations`
+  /// （`tr2:`），里面是 `tt:VideoEncoder2Configuration` 的字段。
+  std::string media2_encoder_config_block(OnvifStreamProfile const& p) const {
+    int const gov = clamp_int(p.gop_seconds * p.fps, 1, 100000);
+    std::string x = "<tr2:Configurations token=\"VideoEncoderConfig_" +
+                    attr(p.token) + "\" GovLength=\"" + std::to_string(gov) +
+                    "\" Profile=\"" + attr(p.h264_profile) + "\">";
+    x += media2_encoder_body(p);
+    x += "</tr2:Configurations>";
+    return x;
+  }
+
+  /// 一份 `tt:VideoEncoder2ConfigurationOptions`。所有 profile 的分辨率并进
+  /// 同一个 Options（一个编码器、一组可选分辨率），比每个 profile 各发一份
+  /// 更接近设备实际能接受的范围。
+  std::string media2_encoder_options(std::vector<OnvifStreamProfile> const& ps) const {
+    int max_fps = 1;
+    int max_bitrate = 1;
+    int max_gov = 1;
+    std::string resolutions;
+    std::string profiles;
+    std::string frame_rates;
+    std::vector<int> rate_values;
+    for (OnvifStreamProfile const& p : ps) {
+      if (p.fps > max_fps) max_fps = p.fps;
+      if (p.bitrate_kbps > max_bitrate) max_bitrate = p.bitrate_kbps;
+      int const gov = clamp_int(p.gop_seconds * p.fps, 1, 100000);
+      if (gov > max_gov) max_gov = gov;
+      resolutions += "<tt:ResolutionsAvailable><tt:Width>" +
+                     std::to_string(p.width) + "</tt:Width><tt:Height>" +
+                     std::to_string(p.height) +
+                     "</tt:Height></tt:ResolutionsAvailable>";
+      if (profiles.find(p.h264_profile) == std::string::npos) {
+        if (!profiles.empty()) profiles += " ";
+        profiles += p.h264_profile;
+      }
+      bool seen = false;
+      for (int r : rate_values) {
+        if (r == p.fps) seen = true;
+      }
+      if (!seen) rate_values.push_back(p.fps);
+    }
+    // 规范要求帧率列表**从高到低**。
+    std::sort(rate_values.begin(), rate_values.end(),
+              [](int a, int b) { return a > b; });
+    for (int r : rate_values) {
+      if (!frame_rates.empty()) frame_rates += " ";
+      frame_rates += std::to_string(r);
+    }
+    std::string x = "<tr2:Options GovLengthRange=\"1 " + std::to_string(max_gov) +
+                    "\" FrameRatesSupported=\"" + frame_rates +
+                    "\" ProfilesSupported=\"" + xml_escape(profiles) + "\">";
+    x += "<tt:Encoding>H264</tt:Encoding>";
+    x += "<tt:QualityRange><tt:Min>1</tt:Min><tt:Max>6</tt:Max></tt:QualityRange>";
+    x += resolutions;
+    x += "<tt:BitrateRange><tt:Min>64</tt:Min><tt:Max>" +
+         std::to_string(max_bitrate) + "</tt:Max></tt:BitrateRange>";
+    x += "</tr2:Options>";
+    return x;
+  }
+
+  // --- Events -------------------------------------------------------------
+
+  /// 一次 `tns1`/`d2o` 事件通知。目前只有心跳，而且**明说是心跳** ——
+  /// 见 `kNsD2oEvents` 的注释。
+  static std::string heartbeat_notification(std::string const& utc_time,
+                                            std::uint64_t seq) {
+    std::string x = "<wsnt:NotificationMessage>";
+    x += "<wsnt:Topic Dialect=\"http://www.onvif.org/ver10/tev/"
+         "topicExpression/ConcreteSet\">" +
+         std::string(kEventHeartbeatTopic) + "</wsnt:Topic>";
+    x += "<wsnt:Message><tt:Message UtcTime=\"" + attr(utc_time) +
+         "\" PropertyOperation=\"Changed\">";
+    x += "<tt:Source><tt:SimpleItem Name=\"Device\" Value=\"" +
+         xml_escape("Desk2ONVIF") + "\"/></tt:Source>";
+    x += "<tt:Data><tt:SimpleItem Name=\"State\" Value=\"Online\"/>";
+    x += "<tt:SimpleItem Name=\"Sequence\" Value=\"" + std::to_string(seq) +
+         "\"/></tt:Data>";
+    x += "</tt:Message></wsnt:Message></wsnt:NotificationMessage>";
+    return x;
+  }
+
+  /// 一条 PullMessages 响应。`include_heartbeat` 为真时带上一条状态事件；
+  /// 否则就是"超时了、但结构良好"的空列表。
+  static std::string pull_messages_response(
+      uvcpp_soap_version v, std::string const& now,
+      std::string const& termination, bool include_heartbeat,
+      std::uint64_t seq) {
+    std::string inner;
+    inner += "<tev:CurrentTime>" + xml_escape(now) + "</tev:CurrentTime>";
+    inner += "<tev:TerminationTime>" + xml_escape(termination) +
+             "</tev:TerminationTime>";
+    if (include_heartbeat) {
+      inner += heartbeat_notification(now, seq);
+    }
+    return soap_response(v, kNsEvents, "PullMessagesResponse", inner);
+  }
+
+  std::string event_op(uvcpp_soap_version v, std::string const& op,
+                       std::string const& body_xml,
+                       std::string const& header_xml,
+                       std::string const& token_hint,
+                       std::string const& peer);
+
   std::string device_op(uvcpp_soap_version v, std::string const& op,
                         std::string const& body_xml, std::string const& peer);
   std::string media_op(uvcpp_soap_version v, std::string const& op,
                        std::string const& body_xml, std::string const& peer);
+  std::string media2_op(uvcpp_soap_version v, std::string const& op,
+                        std::string const& body_xml, std::string const& peer);
 };
 
 std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
@@ -1846,6 +2260,25 @@ std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
              xml_escape(url_for(peer, "http", o.http_port, "/onvif/media_service")) +
              "</tds:XAddr><tds:Version><tt:Major>2</tt:Major>"
              "<tt:Minor>6</tt:Minor></tds:Version></tds:Service>";
+    // Media2 / Events **只在真的开着时才宣告**。宣告了却把请求打到一条
+    // 不存在的路由上，客户端（尤其是海康的添加向导）会把整台设备判成
+    // "半残"，而日志里只有一串 404。
+    if (o.media2_enabled) {
+      inner += "<tds:Service><tds:Namespace>" + std::string(kNsMedia2) +
+               "</tds:Namespace><tds:XAddr>" +
+               xml_escape(url_for(peer, "http", o.http_port,
+                                  "/onvif/media2_service")) +
+               "</tds:XAddr><tds:Version><tt:Major>2</tt:Major>"
+               "<tt:Minor>6</tt:Minor></tds:Version></tds:Service>";
+    }
+    if (o.events_enabled) {
+      inner += "<tds:Service><tds:Namespace>" + std::string(kNsEvents) +
+               "</tds:Namespace><tds:XAddr>" +
+               xml_escape(url_for(peer, "http", o.http_port,
+                                  "/onvif/events_service")) +
+               "</tds:XAddr><tds:Version><tt:Major>2</tt:Major>"
+               "<tt:Minor>6</tt:Minor></tds:Version></tds:Service>";
+    }
     return soap_response(v, kNsDevice, "GetServicesResponse", inner);
   }
 
@@ -1884,6 +2317,23 @@ std::string OnvifService::Impl::device_op(uvcpp_soap_version v,
              "<tt:SAMLToken>false</tt:SAMLToken>"
              "<tt:KerberosToken>false</tt:KerberosToken>"
              "<tt:RELToken>false</tt:RELToken></tt:Security></tt:Device>";
+    // Events 是可选的 `tt:Events` 块。**只在真的实现了 PullPoint 时才报**：
+    // 报 `WSPullPointSupport=true` 而 CreatePullPointSubscription 回 Fault，
+    // 会让 NVR 的添加流程多一次必然失败的往返。
+    //
+    // Media2 不在这个老 schema 的 `tt:Capabilities` 里（它只有 Media），
+    // 所以只由 `GetServices` 宣告 —— 两个地方报同一件事才容易漂移。
+    if (o.events_enabled) {
+      inner += "<tt:Events><tt:XAddr>" +
+               xml_escape(url_for(peer, "http", o.http_port,
+                                  "/onvif/events_service")) +
+               "</tt:XAddr>"
+               "<tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>"
+               "<tt:WSPullPointSupport>true</tt:WSPullPointSupport>"
+               "<tt:WSPausableSubscriptionManagerInterfaceSupport>false"
+               "</tt:WSPausableSubscriptionManagerInterfaceSupport>"
+               "</tt:Events>";
+    }
     inner += "<tt:Media><tt:XAddr>" +
              xml_escape(url_for(peer, "http", o.http_port, "/onvif/media_service")) +
              "</tt:XAddr><tt:StreamingCapabilities>"
@@ -2792,6 +3242,346 @@ std::string OnvifService::Impl::media_op(uvcpp_soap_version v,
   return {};
 }
 
+// ---------------------------------------------------------------------------
+// Media2
+// ---------------------------------------------------------------------------
+
+std::string OnvifService::Impl::media2_op(uvcpp_soap_version v,
+                                          std::string const& op,
+                                          std::string const& body_xml,
+                                          std::string const& peer) {
+  std::vector<OnvifStreamProfile> const& ps = profiles();
+
+  if (op == "GetServiceCapabilities") {
+    OnvifAudioConfig const a = audio_cfg();
+    std::string configs = "VideoSource VideoEncoder";
+    if (a.enabled) configs += " AudioSource AudioEncoder";
+    std::string inner = "<tr2:Capabilities SnapshotUri=\"true\" "
+                        "Rotation=\"false\" VideoSourceMode=\"false\" "
+                        "OSD=\"false\" Mask=\"false\">";
+    inner += "<tr2:ProfileCapabilities MaximumNumberOfProfiles=\"" +
+             std::to_string(ps.size()) + "\" ConfigurationsSupported=\"" +
+             attr(configs) + "\"/>";
+    inner += "<tr2:StreamingCapabilities RTSPStreaming=\"true\" "
+             "RTPMulticast=\"false\" RTP_RTSP_TCP=\"true\" "
+             "NonAggregateControl=\"false\" "
+             "AutoStartMulticast=\"false\"/>";
+    inner += "</tr2:Capabilities>";
+    return soap_response(v, kNsMedia2, "GetServiceCapabilitiesResponse", inner);
+  }
+
+  if (op == "GetProfiles") {
+    // Media2 的 `GetProfiles` 可以带 `Token` 只取一个。带了就只回那一个；
+    // 认不出来时回空列表（规范允许，且比 Fault 更接近"没有这个 profile"）。
+    std::string const one = xml_text(body_xml, "Token");
+    std::string inner;
+    if (!one.empty()) {
+      if (OnvifStreamProfile const* p = find_profile(one)) {
+        inner += media2_profile_block("", *p);
+      }
+    } else {
+      for (OnvifStreamProfile const& p : ps) {
+        inner += media2_profile_block("", p);
+      }
+    }
+    return soap_response(v, kNsMedia2, "GetProfilesResponse", inner);
+  }
+
+  // Media2 的 schema 里没有单数的 `GetProfile`；但有些客户端/脚本沿用
+  // Media1 的写法。认下来没有坏处，响应形状按 Media2 的 `Profiles`。
+  if (op == "GetProfile") {
+    std::string token = xml_text(body_xml, "ProfileToken");
+    if (token.empty()) token = xml_text(body_xml, "Token");
+    OnvifStreamProfile const* p = find_profile(token);
+    if (p == nullptr) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", "NoConfig",
+                   "Media2 GetProfile: unknown profile token"});
+    }
+    return soap_response(v, kNsMedia2, "GetProfileResponse",
+                         media2_profile_block("", *p));
+  }
+
+  if (op == "GetStreamUri") {
+    OnvifStreamProfile const* p = find_profile(profile_token_from_body(body_xml));
+    if (p == nullptr) p = &ps.front();
+    // `Protocol` 我们只接受能落到 RTSP 上的那几种。组播要真的推组播流，而
+    // 我们没有 —— 报一个 rtsp:// 地址让它去连，只会得到"添加成功、无画面"。
+    std::string const proto = xml_text(body_xml, "Protocol");
+    if (proto == "RtspMulticast" || proto == "RtspsMulticast") {
+      return fail({FaultKind::kNotSupported, "ActionNotSupported", {},
+                   "Media2 GetStreamUri: multicast streaming is not supported"});
+    }
+    std::string inner = "<tr2:Uri>" + xml_escape(stream_uri(peer, *p)) +
+                        "</tr2:Uri>";
+    return soap_response(v, kNsMedia2, "GetStreamUriResponse", inner);
+  }
+
+  if (op == "GetSnapshotUri") {
+    OnvifStreamProfile const* p = find_profile(profile_token_from_body(body_xml));
+    if (p == nullptr) p = &ps.front();
+    std::string inner = "<tr2:Uri>" + xml_escape(snapshot_uri(peer, *p)) +
+                        "</tr2:Uri>";
+    return soap_response(v, kNsMedia2, "GetSnapshotUriResponse", inner);
+  }
+
+  if (op == "GetVideoEncoderConfigurations") {
+    OnvifStreamProfile const* only = nullptr;
+    std::string const config_token = xml_text(body_xml, "ConfigurationToken");
+    std::string const profile_token = xml_text(body_xml, "ProfileToken");
+    if (!config_token.empty()) {
+      only = resolve_config_target(config_token);
+    } else if (!profile_token.empty()) {
+      only = find_profile(profile_token);
+    }
+    std::string inner;
+    if (only != nullptr) {
+      inner = media2_encoder_config_block(*only);
+    } else if (config_token.empty() && profile_token.empty()) {
+      for (OnvifStreamProfile const& p : ps) {
+        inner += media2_encoder_config_block(p);
+      }
+    }
+    return soap_response(v, kNsMedia2,
+                         "GetVideoEncoderConfigurationsResponse", inner);
+  }
+
+  if (op == "GetVideoEncoderConfigurationOptions") {
+    std::string inner = media2_encoder_options(ps);
+    return soap_response(v, kNsMedia2,
+                         "GetVideoEncoderConfigurationOptionsResponse", inner);
+  }
+
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+std::string OnvifService::Impl::event_op(uvcpp_soap_version v,
+                                         std::string const& op,
+                                         std::string const& body_xml,
+                                         std::string const& header_xml,
+                                         std::string const& token_hint,
+                                         std::string const& peer) {
+  if (op == "GetServiceCapabilities") {
+    std::string inner =
+        "<tev:Capabilities WSSubscriptionPolicySupport=\"false\" "
+        "WSPausableSubscriptionManagerInterfaceSupport=\"false\" "
+        "MaxNotificationProducers=\"0\" MaxPullPoints=\"" +
+        std::to_string(kEventMaxPullPoints) + "\" "
+        "PersistentNotificationStorage=\"false\"/>";
+    return soap_response(v, kNsEvents, "GetServiceCapabilitiesResponse", inner);
+  }
+
+  if (op == "GetEventProperties") {
+    // TopicSet 用 `wstop:TopicSet`（事件 schema 里就是 ref 它），里面的
+    // `tt:Topic` 落在 `##other` 的 lax any 里 —— **不要写成 wstop:Topic**：
+    // `TopicSetType` 的 any 明确排除了它自己的 targetNamespace。
+    std::string inner;
+    inner += "<tev:TopicNamespaceLocation>http://www.onvif.org/ver10/topics/"
+             "topicns.xml</tev:TopicNamespaceLocation>";
+    inner += "<wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>";
+    inner += "<wstop:TopicSet><tt:Topic name=\"" +
+             std::string(kEventTopicRoot) + "\"><tt:Topic name=\"" +
+             std::string(kEventTopicLeaf) + "\" final=\"true\"/></tt:Topic>"
+             "</wstop:TopicSet>";
+    inner += "<wsnt:TopicExpressionDialect>http://docs.oasis-open.org/wsn/"
+             "t-1/TopicExpression/Concrete</wsnt:TopicExpressionDialect>";
+    inner += "<wsnt:TopicExpressionDialect>http://www.onvif.org/ver10/tev/"
+             "topicExpression/ConcreteSet</wsnt:TopicExpressionDialect>";
+    // 空 URI = 不支持消息内容过滤（规范原话如此，不是偷懒）。
+    inner += "<tev:MessageContentFilterDialect></tev:MessageContentFilterDialect>";
+    inner += "<tev:MessageContentSchemaLocation>http://www.onvif.org/ver10/"
+             "schema/onvif.xsd</tev:MessageContentSchemaLocation>";
+    return soap_response(v, kNsEvents, "GetEventPropertiesResponse", inner);
+  }
+
+  if (op == "CreatePullPointSubscription") {
+    sweep_event_subs();
+    if (static_cast<int>(event_subs.size()) >= kEventMaxSubs) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                   "CreatePullPointSubscription: too many pull points"});
+    }
+    auto const now = std::chrono::system_clock::now();
+    long long ttl_ms = static_cast<long long>(kSubDefaultTtlS) * 1000;
+    std::string const initial = xml_text(body_xml, "InitialTerminationTime");
+    if (!initial.empty()) {
+      long long ms = 0;
+      if (parse_xsd_duration_ms(initial, ms)) {
+        ttl_ms = ms;
+      } else {
+        std::time_t at = 0;
+        if (!parse_xsd_datetime(initial, at)) {
+          return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                       "CreatePullPointSubscription: bad InitialTerminationTime"});
+        }
+        ttl_ms = static_cast<long long>(
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::from_time_t(at) - now)
+                         .count());
+      }
+    }
+    long long const min_ms = 1000;
+    long long const max_ms = static_cast<long long>(kSubMaxTtlS) * 1000;
+    if (ttl_ms < min_ms) ttl_ms = min_ms;
+    if (ttl_ms > max_ms) ttl_ms = max_ms;
+
+    EventSubscription sub;
+    sub.token = "Sub_" + std::to_string(++next_event_sub_id_);
+    sub.termination = now + std::chrono::milliseconds(ttl_ms);
+    // 第一次 PullMessages 就给一条心跳：NVR 的探测通常只等一个 Timeout，
+    // 第一条就空着会让它以为订阅没工作。
+    sub.last_heartbeat =
+        std::chrono::steady_clock::now() -
+        std::chrono::seconds(kHeartbeatIntervalS);
+    sub.heartbeat_seq = 0;
+    std::string const token = sub.token;
+    event_subs[token] = sub;
+
+    std::string const address =
+        url_for(peer, "http", opt.http_port, "/onvif/events_service") +
+        "?SubscriptionID=" + token;
+    std::string inner;
+    inner += "<tev:SubscriptionReference><wsa:Address>" +
+             xml_escape(address) + "</wsa:Address>";
+    // ReferenceParameters 里再放一份：有些客户端只搬 ReferenceParameters，
+    // 不搬 Address 上的查询串。两份都指向同一个 token。
+    inner += "<wsa:ReferenceParameters><d2o:SubscriptionID>" + token +
+             "</d2o:SubscriptionID></wsa:ReferenceParameters>";
+    inner += "</tev:SubscriptionReference>";
+    inner += "<wsnt:CurrentTime>" +
+             xml_escape(xsd_datetime(std::chrono::system_clock::now())) +
+             "</wsnt:CurrentTime>";
+    inner += "<wsnt:TerminationTime>" +
+             xml_escape(xsd_datetime(sub.termination)) +
+             "</wsnt:TerminationTime>";
+    return soap_response(v, kNsEvents, "CreatePullPointSubscriptionResponse",
+                         inner);
+  }
+
+  if (op == "PullMessages") {
+    std::string hint = token_hint;
+    if (hint.empty()) hint = event_token_hint({}, header_xml, body_xml);
+    EventSubscription* sub = resolve_event_sub(hint);
+    if (sub == nullptr) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", "NoConfig",
+                   "PullMessages: unknown or missing subscription"});
+    }
+
+    long long timeout_ms = kPullDefaultTimeoutMs;
+    std::string const timeout_text = xml_text(body_xml, "Timeout");
+    if (!timeout_text.empty()) {
+      if (!parse_xsd_duration_ms(timeout_text, timeout_ms)) {
+        return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                     "PullMessages: Timeout is not an xsd:duration"});
+      }
+    }
+    if (timeout_ms < 0) timeout_ms = 0;
+    if (timeout_ms > kPullTimeoutCapMs) timeout_ms = kPullTimeoutCapMs;
+
+    int limit = kPullDefaultMessages;
+    int parsed_limit = 0;
+    if (xml_int(body_xml, "MessageLimit", 0, 1000, parsed_limit)) {
+      limit = parsed_limit;
+    } else if (!xml_text(body_xml, "MessageLimit").empty()) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                   "PullMessages: invalid MessageLimit"});
+    }
+    if (limit > kPullMaxMessages) limit = kPullMaxMessages;
+
+    bool heartbeat = false;
+    std::uint64_t seq = 0;
+    if (limit > 0) {
+      auto const steady_now = std::chrono::steady_clock::now();
+      if (steady_now - sub->last_heartbeat >=
+          std::chrono::seconds(kHeartbeatIntervalS)) {
+        heartbeat = true;
+        sub->last_heartbeat = steady_now;
+        seq = ++sub->heartbeat_seq;
+      }
+    }
+
+    std::string const now_text =
+        xsd_datetime(std::chrono::system_clock::now());
+    std::string const term_text = xsd_datetime(sub->termination);
+    std::string const xml = pull_messages_response(
+        v, now_text, term_text, heartbeat, seq);
+    if (heartbeat || timeout_ms <= 0 || !deferred_runner) {
+      return xml;
+    }
+
+    // 没有消息 —— **不 sleep 在 handler 里**。把响应留给定时器，事件循环
+    // 这一拍就回去了。`handle()` 在定时器到点后发 `pull_deferred_xml`。
+    pull_deferred = true;
+    pull_deferred_ms = static_cast<int>(timeout_ms);
+    pull_deferred_xml = xml;
+    return {};
+  }
+
+  if (op == "Renew") {
+    std::string hint = token_hint;
+    if (hint.empty()) hint = event_token_hint({}, header_xml, body_xml);
+    EventSubscription* sub = resolve_event_sub(hint);
+    if (sub == nullptr) {
+      return fail({FaultKind::kBadRequest, "InvalidArgVal", "NoConfig",
+                   "Renew: unknown or missing subscription"});
+    }
+    auto const now = std::chrono::system_clock::now();
+    long long ttl_ms = static_cast<long long>(kSubDefaultTtlS) * 1000;
+    std::string const requested = xml_text(body_xml, "TerminationTime");
+    if (!requested.empty()) {
+      long long ms = 0;
+      if (parse_xsd_duration_ms(requested, ms)) {
+        ttl_ms = ms;
+      } else {
+        std::time_t at = 0;
+        if (!parse_xsd_datetime(requested, at)) {
+          return fail({FaultKind::kBadRequest, "InvalidArgVal", {},
+                       "Renew: TerminationTime must be a duration or dateTime"});
+        }
+        ttl_ms = static_cast<long long>(
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::from_time_t(at) - now)
+                         .count());
+      }
+    }
+    long long const min_ms = 1000;
+    long long const max_ms = static_cast<long long>(kSubMaxTtlS) * 1000;
+    if (ttl_ms < min_ms) ttl_ms = min_ms;
+    if (ttl_ms > max_ms) ttl_ms = max_ms;
+    sub->termination = now + std::chrono::milliseconds(ttl_ms);
+
+    std::string inner;
+    inner += "<wsnt:TerminationTime>" +
+             xml_escape(xsd_datetime(sub->termination)) +
+             "</wsnt:TerminationTime>";
+    inner += "<wsnt:CurrentTime>" +
+             xml_escape(xsd_datetime(std::chrono::system_clock::now())) +
+             "</wsnt:CurrentTime>";
+    return soap_response(v, kNsWsnt, "RenewResponse", inner);
+  }
+
+  if (op == "Unsubscribe") {
+    std::string hint = token_hint;
+    if (hint.empty()) hint = event_token_hint({}, header_xml, body_xml);
+    sweep_event_subs();
+    if (!hint.empty()) {
+      event_subs.erase(hint);
+    } else if (event_subs.size() == 1) {
+      // 没带 token、只有一个订阅：删它。**重复 Unsubscribe 也走这里**，
+      // 第二次时表已经空了 —— 于是回成功而不是 Fault（幂等，见 README）。
+      event_subs.clear();
+    }
+    // 认不出来的 token 一律回成功：WS-BaseNotification 标准里是
+    // ResourceUnknownFault，但 NVR 重连时常常把同一条 Unsubscribe 发两遍，
+    // 第二遍回 Fault 只会让它把"已经删掉"当成错误。
+    return soap_response(v, kNsWsnt, "UnsubscribeResponse", "");
+  }
+
+  return {};
+}
+
 OnvifService::OnvifService() : impl_(std::make_unique<Impl>()) {}
 OnvifService::~OnvifService() = default;
 
@@ -2838,6 +3628,11 @@ void OnvifService::set_options(OnvifServiceOptions o) {
   // 凭据可能变了，重建校验器。顺带把先前发出去的 nonce 全部作废 —— 换口令
   // 之后旧的 nonce 不该还能用。
   impl_->auth.reset();
+}
+
+void OnvifService::set_deferred_runner(
+    std::function<void(int, std::function<void()>)> runner) {
+  impl_->deferred_runner = std::move(runner);
 }
 
 void OnvifService::set_identity(OnvifIdentity const& id) {
@@ -2934,7 +3729,12 @@ std::string OnvifService::last_unsupported() const {
 }
 
 bool OnvifService::handle(uvcpp_web_request& req, uvcpp_web_response& resp,
-                          bool media_service) {
+                          OnvifRoute route) {
+  return handle(req, resp, route, uvcpp::uvcpp_web_next());
+}
+
+bool OnvifService::handle(uvcpp_web_request& req, uvcpp_web_response& resp,
+                          OnvifRoute route, uvcpp::uvcpp_web_next next) {
   Impl& d = *impl_;
   d.requests.fetch_add(1, std::memory_order_relaxed);
 
@@ -3023,7 +3823,8 @@ bool OnvifService::handle(uvcpp_web_request& req, uvcpp_web_response& resp,
   // `GetSystemDateAndTime` 是唯一的匿名入口：客户端要靠它拿到设备时间来纠正
   // 自己时钟的偏移，而 Digest 的摘要正是拿时间算的 —— 要求它鉴权是先有鸡
   // 还是先有蛋。
-  bool const is_date_time = (!media_service && op == "GetSystemDateAndTime");
+  bool const is_date_time =
+      (route == OnvifRoute::kDevice && op == "GetSystemDateAndTime");
   if (!(is_date_time && d.anonymous_dt_)) {
     // 注意是 `d.authenticator()`（进程内唯一），不是就地新建一个。
     DigestAuth& auth = d.authenticator();
@@ -3071,9 +3872,57 @@ bool OnvifService::handle(uvcpp_web_request& req, uvcpp_web_response& resp,
   // Profile 表**每个请求只刷新一次**：`profiles()` 在 handler 里被多处调用，
   // 每次重赋值 provider 的 vector 都会让先前拿到的元素指针失效（见
   // `provider_profiles_` 的注释）。放在鉴权之后：未鉴权的请求不碰板子。
-  d.refresh_provider_profiles();
-  std::string const xml = media_service ? d.media_op(v, op, msg.body_xml, peer)
-                                        : d.device_op(v, op, msg.body_xml, peer);
+  // Events 不读 profile 表，不去打扰板子。
+  if (route != OnvifRoute::kEvents) d.refresh_provider_profiles();
+
+  std::string xml;
+  if (route == OnvifRoute::kEvents) {
+    // 订阅 token 的常见落点是 Address 上的查询串（我们自己发的就是），
+    // 其次是 SOAP Header 的 ReferenceParameters。两个入口都在
+    // `event_token_hint` / `event_op` 里。
+    std::string hint;
+    for (char const* name : {"SubscriptionID", "SubscriptionId", "sub"}) {
+      std::string const* q = req.query(name);
+      if (q != nullptr && !q->empty()) {
+        hint = *q;
+        break;
+      }
+    }
+    xml = d.event_op(v, op, msg.body_xml, msg.header_xml, hint, peer);
+  } else if (route == OnvifRoute::kMedia2) {
+    xml = d.media2_op(v, op, msg.body_xml, peer);
+  } else if (route == OnvifRoute::kMedia) {
+    xml = d.media_op(v, op, msg.body_xml, peer);
+  } else {
+    xml = d.device_op(v, op, msg.body_xml, peer);
+  }
+
+  // Events 的长轮询：`event_op` 已经拼好了"超时后要发的那份空消息"。
+  // 这里只负责把它交给定时器 —— **绝不在 handler 里 sleep**。
+  if (d.pull_deferred) {
+    d.pull_deferred = false;
+    int const delay_ms = d.pull_deferred_ms;
+    std::string deferred_xml = std::move(d.pull_deferred_xml);
+    if (!next || !d.deferred_runner) {
+      // 没有调度器（单元测试、或 Web 层没注入）时退回"立即回空消息"。
+      // 结构仍然是对的，只是没有等那个 Timeout。
+      xml = std::move(deferred_xml);
+    } else {
+      uvcpp_web_response* rp = &resp;
+      uvcpp::uvcpp_web_next resume = next;
+      std::string const deferred_ct = ct;
+      d.deferred_runner(delay_ms, [rp, resume, deferred_xml = std::move(deferred_xml),
+                                   deferred_ct]() mutable {
+        rp->status(200);
+        rp->set_content_type(deferred_ct);
+        rp->body(deferred_xml);
+        rp->end();
+        // 响应写完之后才放行中间件链。不调它，框架会一直挂着这个上下文。
+        resume();
+      });
+      return true;
+    }
+  }
 
   if (xml.empty()) {
     if (d.fault_pending) {
@@ -3084,8 +3933,13 @@ bool OnvifService::handle(uvcpp_web_request& req, uvcpp_web_response& resp,
     // 两种情况会走到这里：不认识的接口，或者 ProfileToken 查不到。
     // 对客户端来说"你问的这个我没有"是同一件事，所以共用一条 Fault。
     d.last_unsupported = op;
+    char const* const route_name =
+        route == OnvifRoute::kEvents ? "事件"
+        : route == OnvifRoute::kMedia2 ? "媒体2"
+        : route == OnvifRoute::kMedia ? "媒体"
+                                      : "设备";
     D2O_INFO("ONVIF 不支持的请求：%s（%s服务）",
-             op.empty() ? "(空操作名)" : op.c_str(), media_service ? "媒体" : "设备");
+             op.empty() ? "(空操作名)" : op.c_str(), route_name);
     FaultInfo f;
     f.kind = FaultKind::kNotSupported;
     f.subcode = "ActionNotSupported";

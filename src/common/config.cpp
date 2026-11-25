@@ -818,6 +818,8 @@ std::string config_to_json(AppConfig const& c, bool redact_secrets) {
       {"device_name", c.onvif.device_name},
       {"location", c.onvif.location},
       {"embed_stream_credentials", c.onvif.embed_stream_credentials},
+      {"media2_enabled", c.onvif.media2_enabled},
+      {"events_enabled", c.onvif.events_enabled},
   };
   j["osd"] = osd_json_node(c.osd);
   j["adaptive"] = json{
@@ -950,6 +952,8 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
       take(s, "device_name", out.onvif.device_name);
       take(s, "location", out.onvif.location);
       take(s, "embed_stream_credentials", out.onvif.embed_stream_credentials);
+      take(s, "media2_enabled", out.onvif.media2_enabled);
+      take(s, "events_enabled", out.onvif.events_enabled);
 
       // 密码单独处理：收到哨兵就表示"这一项没改"，**必须**保持原值。
       // 少了这一条，Web UI 上"改个帧率顺手保存"会把口令覆写成

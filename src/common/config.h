@@ -222,6 +222,14 @@ struct OnvifConfig {
   /// 客户端）。不想让它出现就在配置里写 `false`，NVR 那侧靠它自己保存的
   /// 凭据去拉。`rtsp.auth_enabled=false` 时不嵌 —— 那时嵌进去是误导。
   bool embed_stream_credentials = true;
+
+  /// Media2 / Events 两个新端点是否对外宣告。
+  ///
+  /// 关掉时 `GetServices` / `GetCapabilities` 里也不出现它们 —— 见
+  /// `OnvifServiceOptions::media2_enabled` 那段。默认都开：这两条正是这一轮
+  /// 为了"新 NVR 能接"补上的能力，默认关掉等于没有。
+  bool media2_enabled = true;
+  bool events_enabled = true;
 };
 
 /// 一项烧进画面里的水印。
