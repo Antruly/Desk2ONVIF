@@ -177,6 +177,18 @@ Start-Sleep -Seconds 3   # 让编码器把首帧和参数集吐出来
 $rtspAuth = $LASTEXITCODE
 Check ($rtspAuth -eq 0) "rtsp_auth_probe.py 退出码 $rtspAuth"
 
+# --- 0b. WS-UsernameToken：第二条鉴权通路 --------------------------------
+#
+# 和 RTSP Digest 分开验：一个是流，一个是 SOAP。它必须证明"Digest 仍然可用、
+# WSSE 也能进、匿名 GetSystemDateAndTime 没被碰坏"，所以放在 [2] 的
+# onvif_soap.py 之前跑，端口已经起来了。
+"`n[0b] WS-UsernameToken"
+& python -I -X utf8 (Join-Path $root 'tests\onvif_wsse.py') `
+    --host 127.0.0.1 --port $HttpPort `
+    --user $HttpUser --password $HttpPassword
+$wsseAuth = $LASTEXITCODE
+Check ($wsseAuth -eq 0) "onvif_wsse.py 退出码 $wsseAuth"
+
 # --- 1. 两路都能拉能解 ----------------------------------------------------
 "`n[1] 两路 RTSP"
 
