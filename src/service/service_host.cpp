@@ -39,7 +39,15 @@ using std::wstring;
 // 位置选 `%ProgramData%`：LocalSystem 一定写得进去，而 exe 所在的
 // `Program Files` 虽然在管理员上下文里可写，但那是个不该放可变数据的地方
 // （卸载会删目录，漫游/备份策略也不认它）。
+//
+// **打开失败必须回退并说出来。** 真实现场遇到过一次：服务是 RUNNING、
+// `%ProgramData%\Desk2ONVIF\service.log` 只有一个 3 字节的 BOM，一行日志都
+// 没有 —— 事后完全无法判断它是"没拉起 worker"还是"拉起了但 worker 自己死了"。
+// 所以这里依次尝试 `%ProgramData%` → exe 目录 → `%TEMP%`，并把最终落点写进
+// 日志；三个都打不开时至少从控制台喊一句（`--service run` 手工跑的情形）。
 // ---------------------------------------------------------------------------
+
+wstring exe_dir();   ///< 定义在下面；日志回退要用。
 
 class ServiceLog {
  public:
@@ -67,16 +75,53 @@ class ServiceLog {
 
  private:
   ServiceLog() {
+    // 1. `%ProgramData%\Desk2ONVIF\service.log`（正常路径）。
+    wstring primary;
     wchar_t buf[MAX_PATH] = {0};
     DWORD const n = ::GetEnvironmentVariableW(L"ProgramData", buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return;
-    wstring dir(buf);
-    dir += L"\\Desk2ONVIF";
-    ::CreateDirectoryW(dir.c_str(), nullptr);  // 已存在就失败，无所谓
-    wstring const path = dir + L"\\service.log";
+    if (n != 0 && n < MAX_PATH) {
+      wstring dir(buf);
+      dir += L"\\Desk2ONVIF";
+      ::CreateDirectoryW(dir.c_str(), nullptr);  // 已存在就失败，无所谓
+      primary = dir + L"\\service.log";
+      if (open_append(primary)) return;
+    }
 
-    // 简单封顶：超过 2 MB 就轮转一份 .old。不转的话，一个反复重拉的服务
-    // 能在几天里把这个文件写到几百 MB —— 而它是在系统盘上。
+    // 2. exe 目录。`Program Files` 下 LocalSystem 通常写得进去；绿色版解压
+    //    到用户目录时更是必然可写。这是最接近"和程序放在一起"的落点。
+    wstring const dir = exe_dir();
+    if (!dir.empty()) {
+      wstring const path = dir + L"\\service.log";
+      if (open_append(path)) {
+        note_fallback(primary, path);
+        return;
+      }
+    }
+
+    // 3. `%TEMP%`。前两处都被策略/权限挡住时的最后一处可写位置。
+    wchar_t tmp[MAX_PATH] = {0};
+    DWORD const tn = ::GetTempPathW(MAX_PATH, tmp);
+    if (tn != 0 && tn < MAX_PATH) {
+      wstring path(tmp);
+      if (!path.empty() && path.back() != L'\\' && path.back() != L'/') {
+        path += L'\\';
+      }
+      path += L"Desk2ONVIF-service.log";
+      if (open_append(path)) {
+        note_fallback(primary, path);
+        return;
+      }
+    }
+
+    // 三处都打不开：没有文件可写，但 `write` 仍会在有控制台时输出。
+    // 这句话本身也要走 `write`，所以必须先让 f_ 保持空、且不能持锁调用。
+    write("ERROR",
+          "打不开服务日志（已尝试 %ProgramData%\\Desk2ONVIF、exe 目录、%TEMP%）："
+          "worker 起不来时不会有任何文件痕迹。");
+  }
+
+  /// 以追加方式打开，并按 2 MB 轮转一份 `.old`。成功返回 true。
+  bool open_append(wstring const& path) {
     WIN32_FILE_ATTRIBUTE_DATA fad{};
     if (::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad) &&
         fad.nFileSizeHigh == 0 && fad.nFileSizeLow > 2u * 1024u * 1024u) {
@@ -85,6 +130,20 @@ class ServiceLog {
       ::MoveFileW(path.c_str(), old.c_str());
     }
     f_ = _wfopen(path.c_str(), L"a, ccs=UTF-8");
+    return f_ != nullptr;
+  }
+
+  /// 主日志没打开、改用了回退路径 —— **把回退路径写进日志本身**。
+  /// 没有这一行的话，排障的人按 `%ProgramData%` 去找只会看到一个 BOM。
+  void note_fallback(wstring const& primary, wstring const& used) {
+    string msg;
+    if (primary.empty()) {
+      msg = "拿不到 %ProgramData%（或它不可用）";
+    } else {
+      msg = "打不开 " + to_utf8(primary.c_str(), -1);
+    }
+    msg += "，服务日志改写到 " + to_utf8(used.c_str(), -1) + "。";
+    write("WARN", msg);
   }
 
   std::mutex mu_;
@@ -306,7 +365,11 @@ HANDLE spawn_worker(DWORD session, string const& config_path) {
   ::CloseHandle(primary);
 
   if (created == 0) {
-    log_err("拉起 worker 失败：" + sys_error(::GetLastError()));
+    // **把配置路径也带上**：worker 起不来时，第一件要确认的事就是"它本来
+    // 该读哪一份配置"。口令/Authorization/nonce 绝不出现在这条日志里。
+    log_err("CreateProcessAsUser 拉起 worker 失败（会话 " +
+            std::to_string(session) + "，配置 " + config_path + "）：" +
+            sys_error(::GetLastError()));
     return nullptr;
   }
   ::CloseHandle(pi.hThread);
@@ -318,21 +381,49 @@ HANDLE spawn_worker(DWORD session, string const& config_path) {
 /// 服务进程的主循环。返回进程退出码。
 int watchdog_loop(string const& config_path) {
   DWORD backoff_idx = 0;
+  // "没有交互会话"是正常状态，但**不能静默空转**：现场看到的正是这种情形
+  // （服务 RUNNING、日志只有 BOM、没有 worker、没有端口）。第一次进入和之后
+  // 每 60 秒各说一句 —— 不刷屏，但排障的人能看出"它一直在等什么"。
+  bool no_session_logged = false;
+  ULONGLONG last_no_session_log = 0;
+  constexpr ULONGLONG kNoSessionRepeatMs = 60 * 1000;
 
+  log_info("服务启动：worker 将读取配置 " + config_path + "。");
   while (!g_state.stopping.load()) {
     DWORD const session = active_session();
     if (session == 0xFFFFFFFF) {
-      // 没有交互会话（锁屏/无人登录）。**这不是错误** —— 等就是了。
+      // 没有交互会话（无人登录 / 只有 SSH / 还在启动中）。**这不是错误** ——
+      // 等就是了。但必须说出来：服务状态是 RUNNING，端口一个都没开，从外面
+      // 看和"卡死"没有区别。
+      ULONGLONG const now = ::GetTickCount64();
+      if (!no_session_logged) {
+        log_warn("当前没有交互控制台会话（WTSGetActiveConsoleSessionId 返回 "
+                 "0xFFFFFFFF）：worker 无法拉起，服务空转等待。无人登录、"
+                 "只有 SSH 会话或服务刚启动时都会这样。");
+        no_session_logged = true;
+        last_no_session_log = now;
+      } else if (now - last_no_session_log >= kNoSessionRepeatMs) {
+        log_warn("仍然没有交互控制台会话：继续等待 worker 的启动条件"
+                 "（每隔 " + std::to_string(kNoSessionRepeatMs / 1000) +
+                 " 秒提示一次）。");
+        last_no_session_log = now;
+      }
       // 每秒醒一次看停止位，避免"服务停不下来，要等 2 秒"。
       if (::WaitForSingleObject(g_state.stop_event, 1000) == WAIT_OBJECT_0) break;
       continue;
+    }
+    if (no_session_logged) {
+      log_info("检测到交互控制台会话 " + std::to_string(session) +
+               "，开始拉起 worker。");
+      no_session_logged = false;
     }
 
     ULONGLONG const started = ::GetTickCount64();
     HANDLE worker = spawn_worker(session, config_path);
     if (worker == nullptr) {
       DWORD const wait = kBackoffMs[backoff_idx];
-      log_warn("等 " + std::to_string(wait) + " ms 再试（退避第 " +
+      log_warn("拉起 worker 失败（配置 " + config_path + "），等 " +
+               std::to_string(wait) + " ms 再试（退避第 " +
                std::to_string(backoff_idx + 1) + "/" +
                std::to_string(kBackoffCount) + " 档）");
       if (backoff_idx + 1 < kBackoffCount) ++backoff_idx;
@@ -614,6 +705,8 @@ int service_install(string const& config_path, bool start_now) {
     }
   }
   std::printf("\n日志在 %%ProgramData%%\\Desk2ONVIF\\service.log。\n");
+  std::printf("  （这个位置打不开时会退到 **exe 同目录** 或 %%TEMP%% 下的 service.log；\n"
+              "   回退路径会写进日志本身，不会只剩一个 BOM。）\n");
   std::printf("worker 进程会出现在**交互用户的会话**里（Session 1），不在 Session 0 ——\n"
               "服务跑在 Session 0 而 DXGI 在那里抓不到桌面，所以采集必须由 worker 做。\n");
   ::CloseServiceHandle(svc);
@@ -748,6 +841,8 @@ int service_status() {
     }
   }
   std::printf("  日志        : %%ProgramData%%\\Desk2ONVIF\\service.log\n");
+  std::printf("                （打不开时退到 exe 同目录或 %%TEMP%% 下的 service.log；\n"
+              "                 实际落点写在日志里）\n");
 
   ::CloseServiceHandle(svc);
   ::CloseServiceHandle(scm);

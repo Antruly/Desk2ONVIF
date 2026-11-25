@@ -327,6 +327,15 @@ bool validate_config(AppConfig& c, std::vector<std::string>& notes) {
   clamp("capture.threads", c.capture.threads, 0, 128);
   // 0 是**有意义**的值（= 不缩放），不是"没设置"，所以下界是 0 而不是 240。
   clamp("capture.max_height", c.capture.max_height, 0, 4320);
+  // 通道 1 的来源。字符串枚举也要**校验**，理由和 `capture.quality` 一样：
+  // 写错了要当场说，否则桌面/摄像头会安静地按默认值跑，而配置里写的是别的。
+  // 老配置没有这个键 → 结构体默认 `display`，一个 note 都不会产生。
+  if (c.capture.source != "display" && c.capture.source != "webcam") {
+    notes.push_back("capture.source 不认识「" + c.capture.source +
+                    "」，已改成 display（可选：display / webcam）");
+    c.capture.source = "display";
+    changed = true;
+  }
   clamp("adaptive.min_fps", c.adaptive.min_fps, 1, 60);
   clamp("osd.plate_alpha", c.osd.plate_alpha, 0, 255);
   clamp("rtsp.port", c.rtsp.port, 1, 65535);
@@ -753,6 +762,8 @@ std::string config_to_json(AppConfig const& c, bool redact_secrets) {
   json j;
   j["capture"] = json{
       {"display_index", c.capture.display_index},
+      {"source", c.capture.source},
+      {"camera", c.capture.camera},
       {"fps", c.capture.fps},
       {"bitrate_kbps", c.capture.bitrate_kbps},
       {"gop_seconds", c.capture.gop_seconds},
@@ -876,6 +887,8 @@ bool config_from_json(std::string const& text, AppConfig& out, std::string& err)
     if (auto const it = j.find("capture"); it != j.end() && it->is_object()) {
       auto const& s = *it;
       take(s, "display_index", out.capture.display_index);
+      take(s, "source", out.capture.source);
+      take(s, "camera", out.capture.camera);
       take(s, "fps", out.capture.fps);
       take(s, "bitrate_kbps", out.capture.bitrate_kbps);
       take(s, "gop_seconds", out.capture.gop_seconds);

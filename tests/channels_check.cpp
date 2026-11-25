@@ -265,6 +265,87 @@ void test_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// [2b] 通道 1 的来源：capture.source / capture.camera（服务形态的入口）
+//
+// worker 的命令行只有 `--worker --parent-pid --config`，没有 `--camera` ——
+// 所以"服务里通道 1 用摄像头"这件事完全取决于这两个键能不能落盘、读回。
+// 这一段只验配置层；真实采集要 Windows + 摄像头，见报告里的未验证项。
+// ---------------------------------------------------------------------------
+void test_capture_source() {
+  std::printf("\n[2b] 通道 1 的 capture.source / capture.camera\n");
+
+  // (1) 老配置：两个键都没有 → `display`，行为与引入前一致。
+  {
+    AppConfig c;
+    std::string err;
+    check(config_from_json("{\"capture\":{\"fps\":25}}", c, err) &&
+              c.capture.source == "display" && c.capture.camera.empty(),
+          "缺 capture.source / capture.camera 时默认 display、camera 为空",
+          "报错：" + err);
+  }
+
+  // (2) webcam + 符号链接：validate → 落盘 → 读回，值必须原样回来。
+  {
+    std::string const link = "\\\\?\\usb#vid_1bcf&pid_2c99#7&1a2b3c4d&0&0000";
+    AppConfig c;
+    c.capture.source = "webcam";
+    c.capture.camera = link;
+    Once o = cycle(c);
+    check(o.parsed, "capture.source=webcam + camera 能落盘并读回", "报错：" + o.err);
+    if (o.parsed) {
+      check(o.cfg.capture.source == "webcam",
+            "读回来 source 仍是 webcam（实际 " + o.cfg.capture.source + "）");
+      check(o.cfg.capture.camera == link,
+            "读回来 camera 仍是那条符号链接（实际 " + o.cfg.capture.camera + "）");
+      // 文本层面再钉一次：两个键真的被写进去了，而不是"两边一样地少"。
+      // 链接里的反斜杠会被 JSON 转义，所以只认不带反斜杠的那一段。
+      check(o.text.find("\"source\": \"webcam\"") != std::string::npos &&
+                o.text.find("usb#vid_1bcf&pid_2c99") != std::string::npos,
+            "落盘文本里带着 source=webcam 与 camera 的符号链接");
+      check(o.text_again == o.text, "往返幂等：读回来再落盘，文本逐字节相同");
+    }
+  }
+
+  // (3) 空 camera = 第一台（摄像头拔插后符号链接会变，这是想要的默认）。
+  {
+    AppConfig c;
+    c.capture.source = "webcam";
+    c.capture.camera.clear();
+    Once o = cycle(c);
+    check(o.parsed && o.cfg.capture.source == "webcam" &&
+              o.cfg.capture.camera.empty(),
+          "camera 留空也能往返（空 = 第一台）",
+          "报错：" + o.err);
+  }
+
+  // (4) 打错字的来源要**说出来**并退回 display，而不是安静地按桌面跑。
+  {
+    AppConfig c;
+    std::string err;
+    check(config_from_json("{\"capture\":{\"source\":\"hdmi\"}}", c, err),
+          "不认识的 source 先读进结构体（校验在下一步）", "报错：" + err);
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    check(c.capture.source == "display",
+          "不认识的 source 被改成 display（实际 " + c.capture.source + "）");
+    check(says(notes, "capture.source"),
+          "而且有一条 note 点名 capture.source", "冒出来的 note：" + join(notes));
+  }
+
+  // (5) 默认构造的落盘文本里就带着两个键 —— 否则 `config_to_json` 与
+  // `config_from_json` 的字段表会漂成两份（一个写、一个不读）。
+  {
+    AppConfig c;
+    std::vector<std::string> notes;
+    validate_config(c, notes);
+    std::string const text = config_to_json(c, false);
+    check(text.find("\"source\"") != std::string::npos &&
+              text.find("\"camera\"") != std::string::npos,
+          "默认配置的落盘文本里也有 capture.source / capture.camera");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // [3] 档位展开 —— 值必须变，话也必须说
 // ---------------------------------------------------------------------------
 void test_tier_expand() {
@@ -856,6 +937,7 @@ int main() {
   test_instrument();
   test_absent_when_empty();
   test_roundtrip();
+  test_capture_source();
   test_tier_expand();
   test_defaults();
   test_dedup();

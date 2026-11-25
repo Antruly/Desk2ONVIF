@@ -20,6 +20,22 @@ namespace d2o {
 
 struct CaptureConfig {
   unsigned display_index = 0;   ///< --list-displays 的序号
+
+  /// **通道 1 的画面来源**：`display` = 抓本机桌面（默认），`webcam` = 抓本机摄像头。
+  ///
+  /// 这个字段是**服务形态**能选摄像头的关键：服务拉起的 worker 只有
+  /// `--worker --parent-pid --config`，命令行里没有 `--camera`，所以来源只能
+  /// 从配置读。命令行 `--camera` 仍然覆盖它（最高优先级）。
+  ///
+  /// 缺这个键的老配置读出来是 `display` —— 与引入它之前的行为逐字节相同。
+  std::string source = "display";
+
+  /// `source == "webcam"` 时的设备（`--list-cameras` 给的符号链接，或友好名）。
+  /// **空 = 第一台**：摄像头拔插之后符号链接会变，写死就变成"设备不存在"，
+  /// 而"第一台"跟着系统走正是想要的。`source == "display"` 时这一项留着不用
+  /// （切回摄像头时不用重填），`--display` 也照旧只认 `display_index`。
+  std::string camera;
+
   int fps = 25;
   int bitrate_kbps = 2048;
   int gop_seconds = 2;

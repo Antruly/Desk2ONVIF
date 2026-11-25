@@ -538,11 +538,24 @@ void fill_audio_stats(SessionStats& s, AudioTrack const& audio,
 // 好在开机的"生效值回写"已经把命令行折算进 cfg 了，所以重载只读 cfg 就是对的。
 
 void sync_options_to_config(SessionOptions const& o, AppConfig& c) {
-  // 只回写**桌面**那一种来源的下标。摄像头通道的 `--camera` 不回写：
-  // `channels.items[].camera` 才是它的权威，而这个函数管的是通道 1 的
-  // `capture.*` —— 把摄像头选择塞进 `capture.display_index` 会让
-  // `GET /api/config` 报出一个"显示器序号"，而用户明明用的是摄像头。
-  if (o.source.kind == "display") {
+  // 来源本身也是**生效值**，但**只在两种情况下回写**：
+  //   1. `--camera` 显式覆盖了它（这次进程的生效值优先于文件）；
+  //   2. 运行侧和文件本来就一致（开机读的就是文件，回写只是规范化）。
+  // 如果用户在网页上把 `capture.source` 改成 webcam、还没重启，运行侧仍是
+  // display；这时**不能**回写，否则用户刚存的值会在内存里被抹回 display。
+  // 空 kind 按 display 处理，与 `SourceSpec` 的默认一致。
+  std::string const effective_source =
+      o.source.kind.empty() ? "display" : o.source.kind;
+  if (o.source_from_cli || effective_source == c.capture.source) {
+    c.capture.source = effective_source;
+    // 摄像头选择整串回写（空 = 第一台）。**`--camera` 是命令行覆盖，不是要
+    // 存进配置文件** —— 这里回写的是"这一次进程的生效值"，`--save-config`
+    // 会把它连同命令行其他覆盖一起落盘；正常的长驻跑法不会存。
+    c.capture.camera = o.source.camera;
+  }
+  // 显示器序号只在桌面来源下回写：摄像头来源下它没有意义，写回去只会让
+  // `GET /api/config` 多出一个"用户没在用的显示器序号"。
+  if (c.capture.source == "display") {
     c.capture.display_index = static_cast<int>(o.source.display_index);
   }
   c.capture.fps = o.fps;
@@ -600,10 +613,15 @@ std::string strip_leading_slash(std::string s) {
 
 void apply_config_to_options(AppConfig const& c, SessionOptions& o) {
   // `kind` **原样留着**，不在这里重算：它是由"这一路是怎么来的"决定的
-  // （命令行 `--camera`、或者 `channels.items[].source`），而那两个地方都在
-  // 这个函数的外面。在这里猜一个回去的话，一次重载就会把用户选的摄像头
-  // 悄悄换回桌面 —— 而 `sync_options_to_config` 那侧只看 display 分支，
-  // 于是下一次"生效值回写"也不会纠正它。
+  // （命令行 `--camera`、配置里的 `capture.source`、或者
+  // `channels.items[].source`），而那几个地方都在这个函数的外面。在这里猜一个
+  // 回去的话，一次重载就会把用户选的摄像头悄悄换回桌面 —— 而
+  // `sync_options_to_config` 那侧只看 display 分支，于是下一次"生效值回写"
+  // 也不会纠正它。
+  //
+  // 因此**改配置里的 `capture.source/camera` 要重启进程**：`cmd_run` 只在
+  // 开机时读它们一次，重载不会改 `kind`。`pending` 会如实把这两项列成
+  // "需要重启"，而不是让界面显示"已生效"而画面来源根本没换。
   // 直接赋值就好：`capture.display_index` 本来就是 `unsigned`，那条
   // "< 0 就取 0" 的夹取写在这里是**恒假**的（编译器的 -Wtype-limits 会当场
   // 指出来），而它读起来像在防一个负数 —— 那种"看起来在防一个不存在的
