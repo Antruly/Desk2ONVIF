@@ -73,6 +73,21 @@ struct OnvifStreamProfile {
   std::string h264_profile = "Baseline";
   /// RTSP 的路径部分（如 `/live`）。主机和端口由 OnvifServiceOptions 提供。
   std::string rtsp_path = "/live";
+
+  /// 这个 profile 属于哪一路通道。1 = 主设备（通道 1 的端点）；N≥2 = 扩展
+  /// 通道。主端点的 `GetProfiles` 把全部通道的表拼在一起，NVR 据此在**一台
+  /// 设备**下看到多路画面。
+  unsigned channel = 1;
+
+  /// `GetSnapshotUri` 报出去的快照路径。空 = 退回
+  /// `OnvifServiceOptions::snapshot_path`。
+  ///
+  /// 主端点聚合时每一条 profile 指向 `/snapshot.jpg?channel=<channel>`
+  /// —— 那张图必须和这一路 profile 的 RTSP 一致，否则 NVR 里点开通道 2
+  /// 看到的是通道 1 的画面，而且不会有任何报错。走 `/snapshot.jpg` 而不是
+  /// `/api/channels/<n>/snapshot.jpg`：后者只认 Web 会话，NVR 的 ONVIF Digest
+  /// 进不来。
+  std::string snapshot_path = "/snapshot.jpg";
 };
 
 /// ONVIF 的 `Set*` 这一次想改的那几项。
@@ -123,6 +138,24 @@ struct OnvifServiceOptions {
   /// （多网卡机器上写死一个地址，NVR 拿到的就是连不上的那个）。
   int rtsp_port = 554;
   std::vector<OnvifStreamProfile> profiles;
+
+  /// 运行期的**整张** profile 表。非空时优先于 `profiles`。
+  ///
+  /// ## 为什么是回调，而不是一份可写的表
+  ///
+  /// 主端点（通道 1 的 `web.port`）要回答**全部已启用通道**的 profile，而通道
+  /// 2 起是运行中可增删的 —— 静态的 `profiles` 只在 `set_options` 时灌一次，
+  /// 新加的通道不重启就永远看不见。提供者每次被调用时读一份当前快照，于是
+  /// `GetProfiles` 下一拍就跟上。
+  ///
+  /// ## 线程与返回类型
+  ///
+  /// **在循环线程上被调用**（SOAP 处理器就在那条线程）。实现里只能读一份
+  /// 用锁保护好的快照，**必须返回值拷贝** —— 返回引用/指针的话，板子那边
+  /// 下一秒就可能重建整张表，而这里的调用点会拿着一个悬垂的 vector。
+  ///
+  /// 空 = 退回 `profiles`（每通道自己的兼容端口就是这样）。
+  std::function<std::vector<OnvifStreamProfile>()> profiles_provider;
 
   /// `GetStreamUri` 报出去的地址要不要带 `user:password@`（来自下面那两个
   /// Digest 凭据）。默认 **true** —— 见 `OnvifConfig::embed_stream_credentials`。
