@@ -532,7 +532,9 @@ try {
     ) -Port $RtspPort -LogBase 'c'
     Start-Sleep -Seconds 2   # 让编码器把首帧和音频头吐出来
 
-    $url = "rtsp://127.0.0.1:$RtspPort/live"
+    # RTSP 默认要求 Digest（凭据 = ONVIF 那一对）。这个脚本的配置不带 onvif
+    # 段，所以是出厂默认 admin/admin。
+    $url = "rtsp://admin:admin@127.0.0.1:$RtspPort/live"
     $p3 = Probe-Streams -Argv @('-v', 'error', '-rtsp_transport', 'tcp',
                                '-show_entries', 'stream=index,codec_type,codec_name',
                                '-of', 'json', '-i', $url)

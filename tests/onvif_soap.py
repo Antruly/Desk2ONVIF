@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from urllib.parse import unquote, urlsplit
 
 NS = {
     "soap": "http://www.w3.org/2003/05/soap-envelope",
@@ -803,10 +804,29 @@ def main():
             u = u.text if u is not None else None
             uris[tok] = u
             R.check(bool(u and u.startswith("rtsp://")), f"[{tok}] Uri = {u}")
-            # 多网卡机器上写死地址会让 NVR 去连一个它够不着的网段，
-            # 而症状只是"添加失败"。这里至少确认回的不是 127.0.0.1。
+            # 地址里必须带**当前这一对**凭据（默认 `onvif.embed_stream_credentials
+            # = true`）。NVR 常常直接拿 GetStreamUri 的结果去拉流，而它不一定
+            # 会把添加通道时保存的口令塞进这个 URL —— 不带 userinfo 的话，它
+            # 拿到的是一个必然 401 的地址，症状是"添加成功、没有画面"。
+            #
+            # 用 urlsplit 而不是 `split("//")[1].split(":")[0]`：后者会把
+            # userinfo 里的用户名当成主机名，于是下面那条"不是环回"在
+            # `admin:...@10.0.0.5` 上会读到 `admin`，看起来通过了、实际
+            # 什么都没验。
             if u:
-                host = u.split("//", 1)[1].split(":")[0]
+                sp = urlsplit(u)
+                R.check(sp.scheme == "rtsp" and bool(sp.hostname),
+                        f"[{tok}] URL 能解析出 rtsp:// 主机（{u}）")
+                R.check(sp.username is not None,
+                        f"[{tok}] Uri 带 userinfo（实际 {u}）")
+                R.check(unquote(sp.username or "") == a.user and
+                        unquote(sp.password or "") == a.password,
+                        f"[{tok}] userinfo 解码后等于 ONVIF 凭据 "
+                        f"（{unquote(sp.username or '')!r}/"
+                        f"{unquote(sp.password or '')!r}）")
+                # 多网卡机器上写死地址会让 NVR 去连一个它够不着的网段，
+                # 而症状只是"添加失败"。这里至少确认回的不是 127.0.0.1。
+                host = sp.hostname or ""
                 R.check(not host.startswith("127."), f"[{tok}] 主机 {host} 不是环回")
         if tok == token:
             uri = uris.get(tok)

@@ -63,7 +63,8 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 
 - H.264（libx264），**主码流 + 子码流两路独立编码器** —— 同一张 BGRA 进去、
   各自缩放到自己的目标尺寸，不是「编一次再抽帧」也不是「编一次再解码」
-- RTSP 推流（Live555），默认 `rtsp://<本机IP>:554/live`，子码流 `/live_sub`
+- RTSP 推流（Live555），默认 `rtsp://<本机IP>:554/live`（**Digest 鉴权默认开**，
+  凭据 = ONVIF 那一对），子码流 `/live_sub`
 - **音频**：WASAPI 采集本机声音，AAC 编码，与视频同一路 RTSP 输出
 - 浏览器预览：**fMP4 over WebSocket**（MSE 直接播）
 - 快照：MJPEG，`GET /snapshot.jpg`
@@ -120,9 +121,16 @@ NVR 一份，互相独立），细节见[工程实录](docs/ENGINEERING.md#安�
 ### 直接拉流看
 
 ```powershell
-# 用 ffplay 验证（VLC 也可以）
-ffplay -rtsp_transport tcp rtsp://127.0.0.1:554/live
+# RTSP **默认要求 Digest 鉴权**，凭据就是 ONVIF 那一对（默认 admin/admin，
+# 在网页「系统设置 → ONVIF」里改）。用户名口令都要写进 URL 的 userinfo：
+ffplay -rtsp_transport tcp rtsp://admin:admin@127.0.0.1:554/live
+ffplay -rtsp_transport tcp rtsp://admin:admin@127.0.0.1:554/live_sub   # 子码流
 ```
+
+> **NVR 那边填的「摄像机用户名 / 密码」也是这一对** —— 没有第二套 RTSP 账号。
+> 口令里如果有 `@ : / % # ?`、空格或中文，要按 URL 百分号编码；`GetStreamUri`
+> 报给 NVR 的地址已经替它编好了（`onvif.embed_stream_credentials`，默认开）。
+> 未带凭据或凭据错误一律 401；只有在调试时才用 `--no-rtsp-auth` 关掉鉴权。
 
 ## ONVIF 协议支持
 

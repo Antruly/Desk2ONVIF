@@ -124,6 +124,14 @@ struct OnvifServiceOptions {
   int rtsp_port = 554;
   std::vector<OnvifStreamProfile> profiles;
 
+  /// `GetStreamUri` 报出去的地址要不要带 `user:password@`（来自下面那两个
+  /// Digest 凭据）。默认 **true** —— 见 `OnvifConfig::embed_stream_credentials`。
+  bool embed_stream_credentials = true;
+  /// RTSP 那一侧是否真的要求鉴权。false（`rtsp.auth_enabled=false` /
+  /// `--no-rtsp-auth`）时**不嵌** userinfo —— 一个不需要口令的地址里塞
+  /// 口令只会误导客户端和排障的人。
+  bool rtsp_auth_enabled = true;
+
   /// Digest 凭据。`GetSystemDateAndTime` 之外的操作都要过这一关。
   std::string user = "admin";
   std::string password;

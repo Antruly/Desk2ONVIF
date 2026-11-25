@@ -8,6 +8,22 @@
 > 所以不在这里编造条目。需要考古的话，`docs/ENGINEERING.md` 里按「轮次」
 > 记了那几轮各做了什么。
 
+## [Unreleased]
+
+**RTSP 鉴权**
+
+- RTSP 默认开启 **Digest 鉴权**，凭据与 ONVIF 共用 `onvif.user` /
+  `onvif.password`；未带凭据或凭据错误一律 `401 Unauthorized` +
+  `WWW-Authenticate: Digest`，不做匿名降级。
+- 新增 `rtsp.auth_enabled`（默认 `true`；老配置缺这个键时也按 `true`）。
+  命令行 `--no-rtsp-auth` 可临时关掉（调试/回归用，启动会 WARN）。
+- `GetStreamUri` 默认返回**带凭据**的完整地址
+  （新配置 `onvif.embed_stream_credentials`，默认 `true`）。userinfo 按
+  RFC 3986 做百分号编码，`@ : / % # ? [ ]`、空格、中文都不会把 URL 切坏。
+- 网页上改 ONVIF 口令后，RTSP 鉴权库**当场生效**，不需要重启或重开管线。
+- 新增 `tests/rtsp_auth_probe.py`（纯标准库），并接进 `rtsp_sub_e2e.ps1`：
+  匿名 401、错口令 401、对口令 200 + `m=video`，主/子两路都验。
+
 ## [0.2.0] — 2026-11-19
 
 **通道**

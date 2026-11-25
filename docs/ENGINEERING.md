@@ -67,9 +67,9 @@ libuvcpp（HTTP / WebSocket / ONVIF SOAP / WS-Discovery UDP 3702）
 # 录 10 秒
 .\build\bin\desk2onvif.exe --record out.mp4 --seconds 10
 
-# 推 RTSP（默认 rtsp://<本机IP>:554/live），拉流看
+# 推 RTSP（默认 rtsp://<本机IP>:554/live，Digest 凭据 = ONVIF 那一对），拉流看
 .\build\bin\desk2onvif.exe --rtsp --seconds 60
-ffplay -rtsp_transport tcp rtsp://127.0.0.1:554/live
+ffplay -rtsp_transport tcp rtsp://admin:admin@127.0.0.1:554/live
 
 # 依赖自检
 .\build\bin\desk2onvif.exe --selfcheck
@@ -191,7 +191,8 @@ SDP 里的 `sprop-parameter-sets` 全都在创建时就把宽高写死了，中�
 - **ONVIF 的身份与凭据**（`manufacturer` / `model` / `firmware_version` /
   `hardware_id` / `serial_number` / `device_name` / `location` / `user` /
   `password`）—— 它们每次响应现读，改完下一次 `GetDeviceInformation` /
-  Digest 挑战就是新值，**不用重启、不用重连**。
+  Digest 挑战就是新值，**不用重启、不用重连**。同一对 `user` / `password`
+  也是 RTSP 的 Digest 凭据，跟着当场换掉（见下面「RTSP 鉴权」一节）。
 - **Web 控制台的登录开关与凭据**（`web.auth_enabled` / `web.user` /
   `web.password`）—— 改完下一次登录就用新的。有一点要知道：**它不会把已经
   登录的人踢下线**（令牌签的是每进程一份的随机密钥，不是口令），所以"改了口令
@@ -744,6 +745,41 @@ ONVIF 侧它是**第二个 profile**：`GetProfiles` 返回 `main` 和 `sub` 两
 > 子码流的默认值是**开**，这一点值得留意：它意味着默认情况下 CPU 占用比
 > 「只编一路」高。不给 `--rtsp` 时它不产生任何开销（没有消费者就不编）。
 
+## RTSP 鉴权（Digest）
+
+**默认开，凭据只有一份：`onvif.user` / `onvif.password`。** NVR 添加通道时
+填的「摄像机用户名 / 密码」就是它；ffplay / VLC 也用同一对。刻意不新增
+`rtsp.user` / `rtsp.password` —— 两套凭据只会让"网页上改了 ONVIF 口令、NVR
+能进、ffplay 不能进"变成一种没有线索的故障。
+
+- 未带 `Authorization`、或者摘要算错 → **401 + `WWW-Authenticate: Digest`**
+  （realm `Desk2ONVIF`）。**没有匿名降级**。
+- `rtsp.auth_enabled` 默认 **true**。老的 `config.json` 里没有这个键时读出来
+  也是 true（安全默认）；显式写 `false` 或命令行 `--no-rtsp-auth` 才会关掉，
+  那是调试/回归用的，启动日志会 WARN。
+- `GetStreamUri` 默认返回**带 userinfo 的完整地址**：
+  `rtsp://user:pass@<本机IP>:<port>/live`。用户名和口令按 RFC 3986 的
+  unreserved 之外全部百分号编码（`@ : / % # ? [ ]`、空格、中文都覆盖）。
+  两个开关决定这件事：`onvif.embed_stream_credentials`（默认 true）和
+  `rtsp.auth_enabled`；后者为 false 时不嵌（否则地址里带着一个根本不验的口令，
+  只会误导人）。
+- **口令热更新**：网页保存 `onvif.password` 之后，RTSP 的鉴权库在下一次
+  `lookupPassword()` 就用新口令，**不需要重启、不需要重建服务器、也没有
+  "旧口令仍然有效"的窗口**。实现上不是对 Live555 的 `UserAuthenticationDatabase`
+  直接增删记录（那在网页线程上是数据竞争），而是用一个带互斥锁的子类接管
+  `lookupPassword()`：读凭据和换凭据在同一把锁后面。已经建立的 RTSP 会话
+  不会因此被踢掉 —— Digest 是按请求校验的，旧会话本来就不再出示口令。
+- **审计边界**：`lookupPassword()` 拿不到 peer/path，也区分不了"用户名对/
+  口令错"（Live555 拿到明文口令后自己算摘要比对），所以 RTSP 鉴权失败**没有
+  写操作日志**，只在 `--debug` 下记一行"鉴权查询：用户=…（已配置/不存在）"。
+  口令、nonce、response 一个字节都不进日志。这条是 Live555 公开接口的边界，
+  不是省略。
+
+```powershell
+# 调试时临时关掉（会打 WARN；不要留在生产配置里）
+.\build\bin\desk2onvif.exe --rtsp --no-rtsp-auth
+```
+
 ## 多通道：一块屏一路，摄像头也能加进来
 
 **默认行为就是多路。** 启动时枚举显示输出，每一块**能抓**的屏自动成为一路；
@@ -1064,15 +1100,19 @@ node probe.mjs                   # 预览能不能播；自己起后端（8123/8
 g++ -std=c++17 -Isrc tests/cursor_check.cpp src/capture/cursor_overlay.cpp -o build/cursor_check.exe
 ```
 
-`rtsp_sub_e2e.ps1` 一次起采集，把七件事一起验了（分开跑的话每件都要重新起一次
+`rtsp_sub_e2e.ps1` 一次起采集，把八件事一起验了（分开跑的话每件都要重新起一次
 进程，反而更容易漏）：
 
 ```
+[0]   RTSP 鉴权     匿名 DESCRIBE → 401 + Digest 挑战；错口令 → 401；
+                     对口令 → 200 + m=video。主/子两路各验一遍
+                     （rtsp_auth_probe.py，纯标准库、不依赖 ffmpeg）
 [1]   两路 RTSP      main 2880x1920 / sub 540x360，两个尺寸**必须不同**；
                      帧率不是写死的，是**从跑着的服务读出来**再跟配置对（25/1）
 [1b]  并发与重连     三个客户端同时拉（两主一子），外加中途杀掉一个再连回来
                      —— 全部零报错。这一段是照着 NVR 的形状写的
-[2]   ONVIF          GetProfiles 恰好 {main, sub}，GetStreamUri 两个不同的地址；
+[2]   ONVIF          GetProfiles 恰好 {main, sub}，GetStreamUri 两个不同的地址
+                     且带当前凭据（userinfo 百分号编码正确）；
                      改身份 + 换口令后**不重启**直接重新鉴权、重新取设备信息
 [3]   Web 契约       静态产物逐个全 200 且 MIME 正确；/api/config 往返；
                      applied/pending 逐字段语义；逐路字段对账；

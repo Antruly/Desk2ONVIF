@@ -505,7 +505,8 @@ if (-not $aliveAfter) {
     Note '（程序已经退出，没有服务可拉 —— 这一段跳过）'
 } else {
     Wait-Until ($lastAt + $afterTriggerWait)
-    $url = "rtsp://127.0.0.1:$RtspPort/live"
+    # RTSP 默认要求 Digest（凭据 = ONVIF 那一对）；这个脚本的配置是出厂默认。
+    $url = "rtsp://admin:admin@127.0.0.1:$RtspPort/live"
     $probe = Invoke-WithTimeout $ffprobe @(
         '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',
         '-show_entries', 'stream=codec_name,width,height',

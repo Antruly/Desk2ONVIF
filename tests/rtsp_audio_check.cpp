@@ -148,6 +148,11 @@ int main(int argc, char** argv) {
   RtspOptions opt;
   opt.enabled = true;
   opt.port = static_cast<std::uint16_t>(port);
+  // **这个 harness 故意不鉴权。** 它验的是"音频 subsession 的 SDP/RTP 对不对"，
+  // 它的 ps1 用 ffprobe/ffmpeg 直接拉 `rtsp.url(0)`；真实程序默认是带 Digest 的
+  // （见 `RtspOptions::auth_enabled`），而那件事由 `rtsp_auth_probe.py` 验。
+  // 在这里打开鉴权只会让本 harness 的每一趟都要改 URL，却不增加任何覆盖面。
+  opt.auth_enabled = false;
   RtspStreamOptions s0;
   s0.path = "live";
   s0.fps = kFps;
