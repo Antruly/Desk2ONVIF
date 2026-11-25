@@ -72,8 +72,11 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 
 **这是台「真摄像机」**
 
-- **ONVIF Profile S**：SOAP + WS-Discovery（UDP 3702）+ Digest 鉴权，
-  每个通道一个独立的 ONVIF 端口
+- **ONVIF Profile S**：SOAP + WS-Discovery（UDP 3702）+ Digest 鉴权。
+  通道 1 的端口是**唯一的主设备端点**：`GetProfiles` / `GetStreamUri` /
+  `GetSnapshotUri` 聚合全部已启用通道（`main`/`sub`、`ch2_main`/`ch2_sub`…），
+  NVR 看到的是一台多通道摄像机。通道 N 另保留 `web.port + N` 作为直连调试
+  和旧配置的兼容端口，但不再广播
 - **配置热生效**：通道参数在网页上**改完即生效**（重开管线）；水印下一帧就变；
   只有端口/口令这一类系统设置需要点保存，需要重启的**逐字段告诉你**
 - **设备身份**（厂商 / 型号 / 硬件码 / 序列号 / UUID）在界面上锁死，
@@ -175,6 +178,10 @@ ffplay -rtsp_transport tcp rtsp://admin:admin@127.0.0.1:554/live_sub   # 子码�
 发现走 **WS-Discovery**（UDP 3702 组播），鉴权走 **HTTP Digest**
 （ONVIF 要求的 WS-UsernameToken 也在）。NVR 那边看到的就是一台普通的
 Profile S 摄像机。
+
+多通道下媒体入口聚合在**通道 1 的端口**：一台设备、一个 UUID、一个 XAddrs，
+`GetProfiles` 报全部已启用通道。**每通道的视频源 / 编码器 / OSD 配置仍走
+各自的兼容端口**（`web.port + N`），聚合它们是下一步（issue #10）。
 
 ## Web 控制台
 

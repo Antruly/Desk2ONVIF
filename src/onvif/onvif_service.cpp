@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -647,6 +648,19 @@ std::string patch_detail(OnvifDevicePatch const& p) {
   return s;
 }
 
+/// 这条 profile 是不是子码流。
+///
+/// **按 token 判，不按下标判。** 单通道时 `sub` 恰好是下标 1，但聚合之后下标
+/// 2 才是通道 2 的主码流 —— 拿"不是第一条"当子码流会把它的码率写进
+/// `rtsp.sub_bitrate_kbps`，也就是改通道 1 的子码流。
+bool profile_is_sub(OnvifStreamProfile const& p) {
+  if (p.token == "sub") return true;
+  constexpr char kSuffix[] = "_sub";
+  constexpr std::size_t kLen = sizeof(kSuffix) - 1;
+  return p.token.size() >= kLen &&
+         p.token.compare(p.token.size() - kLen, kLen, kSuffix) == 0;
+}
+
 }  // namespace
 
 struct OnvifService::Impl {
@@ -676,6 +690,31 @@ struct OnvifService::Impl {
   std::atomic<std::uint64_t> faults{0};
   /// 只在循环线程上写，所以不加锁。
   std::string last_unsupported;
+
+  /// `profiles_provider` 返回值的缓存。
+  ///
+  /// `profiles()` 的签名是返回 `const&`（`find_profile` 还要返回指向其中一条的
+  /// 指针），而 provider 按契约返回值拷贝。缓存放这里：**每个 SOAP 请求开始时
+  /// 刷新一次**（`handle()` 里调 `refresh_provider_profiles()`），请求处理过程中
+  /// `profiles()` 只读缓存。
+  ///
+  /// **不能每次 `profiles()` 都去调 provider**：一次 `Set*` 里 `find_profile`、
+  /// `patch_from_body`、`profiles()` 会各调一次，每次重新赋值这个 vector 都可能
+  /// 让上一次拿到的 `OnvifStreamProfile const*` 变成悬垂指针 —— 典型的症状是
+  /// 改名时读到一个已经释放的 `token`。整条 SOAP 路径都在循环线程上串行执行，
+  /// 所以缓存本身不需要锁。
+  mutable std::vector<OnvifStreamProfile> provider_profiles_;
+  /// provider 这一趟是否生效。**空表也算生效**：主端点在所有通道都关掉时应该
+  /// 报 0 条，而不是退回 `opt.profiles` 里那份启动时的旧表。
+  bool provider_active_ = false;
+
+  /// NVR 改名（`SetVideoEncoderConfiguration` 的 `Name`）落在 token 上的覆盖。
+  ///
+  /// 有 provider 时 profile 表属于板子，服务这边写不进去；而"改完名下一份
+  /// `GetProfiles` 就报新名字"是 NVR 判定改名成功的唯一证据（见那段注释）。
+  /// 所以覆盖叠在 provider 结果之上，进程内有效 —— 与"NVR 改名重启后回退"
+  /// 的既有语义一致。
+  std::map<std::string, std::string> profile_name_overrides_;
 
   /// NVR 要求按 NTP 对时（`SetSystemDateAndTime` 的 `DateTimeType=NTP`）。
   ///
@@ -738,10 +777,36 @@ struct OnvifService::Impl {
     return *auth;
   }
 
-  /// 一路都没配时也得能回答 —— `profiles.front()` 在空 vector 上是崩，
-  /// 而崩在一条来自网络的 SOAP 请求里是最糟的失败方式。
+  /// 每个 SOAP 请求开始时刷新一次 provider 快照。**必须在 `media_op` /
+  /// `device_op` 之前调**：请求处理过程中 `profiles()` 只读缓存，指针才稳定。
+  void refresh_provider_profiles() {
+    if (!opt.profiles_provider) {
+      provider_active_ = false;
+      return;
+    }
+    provider_profiles_ = opt.profiles_provider();
+    provider_active_ = true;
+    // 改名覆盖叠在 provider 的快照之上。匹配 token 而不是下标：表是运行期
+    // 重建的，下标在通道增删之后会搬家。
+    for (OnvifStreamProfile& p : provider_profiles_) {
+      auto const it = profile_name_overrides_.find(p.token);
+      if (it != profile_name_overrides_.end()) p.name = it->second;
+    }
+  }
+
+  /// 当前生效的 profile 表。
+  ///
+  /// 一路都没配时也得能回答 —— `profiles.front()` 在空 vector 上是崩，而崩在
+  /// 一条来自网络的 SOAP 请求里是最糟的失败方式。
+  ///
+  /// **provider 优先**：主端点的表要跟着运行中的通道增删走，静态的
+  /// `opt.profiles` 只在启动时灌一次。provider 的结果由
+  /// `refresh_provider_profiles()` 在每个请求开头刷新一次，这里只读缓存。
   std::vector<OnvifStreamProfile> const& profiles() const {
     static std::vector<OnvifStreamProfile> const kFallback(1);
+    if (provider_active_) {
+      return provider_profiles_.empty() ? kFallback : provider_profiles_;
+    }
     return opt.profiles.empty() ? kFallback : opt.profiles;
   }
 
@@ -1336,8 +1401,16 @@ struct OnvifService::Impl {
     return uri;
   }
 
-  std::string snapshot_uri(std::string const& peer) const {
-    return url_for(peer, "http", opt.http_port, opt.snapshot_path);
+  /// 快照地址。**按 profile** 取路径：聚合之后同一个端点上的 `main` 和
+  /// `ch2_main` 必须是两张不同的图，否则 NVR 里点开通道 2 看到的是主屏。
+  ///
+  /// 主机/端口仍用**主端点**的 `http_port` —— 那条路由只挂在通道 1 的
+  /// WebServer 上（`/snapshot.jpg?channel=<n>`，认 ONVIF Digest）。
+  std::string snapshot_uri(std::string const& peer,
+                           OnvifStreamProfile const& p) const {
+    std::string const& path =
+        p.snapshot_path.empty() ? opt.snapshot_path : p.snapshot_path;
+    return url_for(peer, "http", opt.http_port, path);
   }
 
   std::string device_op(uvcpp_soap_version v, std::string const& op,
@@ -1687,8 +1760,13 @@ std::string OnvifService::Impl::media_op(uvcpp_soap_version v,
   }
 
   if (op == "GetSnapshotUri") {
+    // 请求体里通常带 `ProfileToken`（规范里是可选）。认不出来就退回第一条：
+    // 老客户端和只加了通道 1 的 NVR 都是这么发的，为它回 Fault 会让它们
+    // 连设备信息页都打不开。
+    OnvifStreamProfile const* p = find_profile(profile_token_from_body(body_xml));
+    if (p == nullptr) p = &ps.front();
     std::string inner = "<trt:MediaUri>";
-    inner += "<tt:Uri>" + xml_escape(snapshot_uri(peer)) + "</tt:Uri>";
+    inner += "<tt:Uri>" + xml_escape(snapshot_uri(peer, *p)) + "</tt:Uri>";
     inner += "<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>";
     inner += "<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>";
     inner += "<tt:Timeout>PT0S</tt:Timeout>";
@@ -1696,6 +1774,12 @@ std::string OnvifService::Impl::media_op(uvcpp_soap_version v,
     return soap_response(v, kNsMedia, "GetSnapshotUriResponse", inner);
   }
 
+  // ⚠️ **源/OSD 配置这一块仍只描述通道 1。** 主端点聚合的是媒体入口
+  // （Profiles / StreamUri / SnapshotUri）；每通道的视频源、编码器、水印
+  // 配置仍走各自的兼容端口（`web.port + N`），下一步 #10 再聚合。
+  // 这里保持 `ps.front()` 的行为，是为了让通道 1 的直连端点与主端点答出
+  // 同一份源配置 —— 把 `front()` 换成"按 token 查"会引入一个只对通道 1
+  // 成立、对其它通道半真半假的答案。
   if (op == "GetVideoSources") {
     OnvifStreamProfile const& p = ps.front();
     std::string inner =
@@ -1787,7 +1871,10 @@ std::string OnvifService::Impl::media_op(uvcpp_soap_version v,
                op.c_str(), token.c_str());
     }
     OnvifStreamProfile const& tgt = (found != nullptr) ? *found : ps.front();
-    bool const sub_target = (tgt.token != ps.front().token);
+    // **按 token 判子码流，不按"是不是第一条"。** 聚合之后通道 2 的主码流
+    // 是 `ch2_main`，拿"不是第一条"当子码流会把它的码率写进通道 1 的
+    // `rtsp.sub_bitrate_kbps`。见 `profile_is_sub`。
+    bool const sub_target = profile_is_sub(tgt);
     bool const allow_rename = (op == "SetVideoEncoderConfiguration");
 
     OnvifDevicePatch const patch =
@@ -1814,9 +1901,34 @@ std::string OnvifService::Impl::media_op(uvcpp_soap_version v,
     // 拿那个下标去写空的 `opt.profiles` 是越界写。兜底表是编译期常量，它本来
     // 就没有"改名"这回事，这里跳过是唯一的正确做法（跳过的后果只是那一路
     // 报的仍是占位名字，而那个配置下根本没有码流可加）。
-    if (patch.name && !opt.profiles.empty()) {
-      std::size_t const idx = static_cast<std::size_t>(&tgt - ps.data());
-      opt.profiles[idx].name = *patch.name;
+    if (patch.name) {
+      if (opt.profiles_provider) {
+        // 表归 provider（板子）所有，这里写不进去；叠一层 token 覆盖，
+        // 下一份 `GetProfiles` 由 `profiles()` 合并进去。
+        profile_name_overrides_[tgt.token] = *patch.name;
+      } else if (!opt.profiles.empty()) {
+        std::size_t const idx = static_cast<std::size_t>(&tgt - ps.data());
+        if (idx < opt.profiles.size()) opt.profiles[idx].name = *patch.name;
+      }
+    }
+
+    // 通道 N（N≥2）的 `Set*`：**只认改名，不碰配置**。
+    //
+    // 主端点虽然报出了 `ch2_main`，但这一层的 `on_patch` 只有一个落点（通道 1
+    // 的 `AppConfig`）。把通道 2 的码率/分辨率/OSD 写进通道 1 的配置是静默的
+    // 串台；而回 Fault 会让 NVR 的添加向导当场失败。取舍是：改名照常反映到
+    // 协议层（它是 NVR 判定"改成功了"的唯一证据），其余字段接受但不应用，
+    // 并说清楚真正的落点在各自的兼容端口。
+    if (found != nullptr && opt.profiles_provider && tgt.channel != 1) {
+      if (!patch.empty()) {
+        D2O_INFO("通道 %u 的 %s 走的是聚合端点；只应用了名称。码流/源配置请"
+                 "走它的兼容端口（web.port + %u）。",
+                 tgt.channel, op.c_str(), tgt.channel);
+      }
+      if (!patch.empty() && patch.name) {
+        note_audit(peer, "onvif." + op, patch_detail(patch));
+      }
+      return soap_response(v, kNsMedia, op + "Response", "");
     }
 
     if (patch.empty()) {
@@ -2150,6 +2262,12 @@ void OnvifService::set_video_size(std::size_t index, int w, int h) {
   // 越界静默返回而不是崩：这条路每秒走一次，而它唯一可能的错误是调用方把
   // 码流下标搞错了 —— 那种错该在启动时被发现，不该在一条来自网络的 SOAP
   // 请求路径上炸掉。profiles() 的空兜底也在这里生效。
+  //
+  // **有 `profiles_provider` 时这里写的是退回用的 `opt.profiles`**，不改变
+  // `GetProfiles` 报出来的聚合表 —— 那份的真值由 main.cpp 在统计钩子里直接
+  // 写进板子（provider 的快照）。下标仍按"通道 1 主/子在前"对齐，所以这条
+  // 既有路径不会错位；写在这里是为了不带 provider 的调用方（通道 N 自己的
+  // 兼容端点、测试 harness）行为不变。
   std::vector<OnvifStreamProfile>& ps = impl_->opt.profiles;
   if (index >= ps.size()) return;
   ps[index].width = w;
@@ -2281,6 +2399,10 @@ bool OnvifService::handle(uvcpp_web_request& req, uvcpp_web_response& resp,
   }
 
   std::string const peer = req.peer_ip();
+  // Profile 表**每个请求只刷新一次**：`profiles()` 在 handler 里被多处调用，
+  // 每次重赋值 provider 的 vector 都会让先前拿到的元素指针失效（见
+  // `provider_profiles_` 的注释）。放在鉴权之后：未鉴权的请求不碰板子。
+  d.refresh_provider_profiles();
   std::string const xml = media_service ? d.media_op(v, op, msg.body_xml, peer)
                                         : d.device_op(v, op, msg.body_xml, peer);
 

@@ -24,11 +24,10 @@
 #
 # ## 三幕各自回答什么
 #
-#   第一幕 `--camera`：通道 1 = 摄像头，**通道 2 由自动发现建出来**（显示器
-#        #0）。这一幕是全套里**唯一**会真的走到自动发现那条路的场景 ——
-#        在一台只有一块屏的机器上它本来一次都不发生。验：两路各有各的 ONVIF
-#        端口/设备/序列号/RTSP 路径、一次 Probe 只回一份 ProbeMatch、能同时拉、
-#        各录各的。
+#   第一幕 `--camera`：通道 1 = 摄像头，通道 2 显式配置成显示器 #0。验：
+#        主端点的 GetProfiles 聚合了全部通道（issue #9）、每路的 RTSP 路径/
+#        快照地址各归各的、组播里只有一个 XAddrs、能同时拉、各录各的。
+#        通道 2 自己的兼容端口仍然答（直连调试/旧配置），只是不再广播。
 #   第二幕 坏摄像头：通道 2 指到一台不存在的摄像头。验"坏一路不拖垮别人"。
 #   第三幕 撞屏：通道 2 显式写通道 1 正在采的那块屏 → 规划期就挡住它。
 #        验：**服务照样起来**（这是修掉的那个致命后果）、通道 1 毫发无损、
@@ -411,11 +410,20 @@ try {
   }
 
   # =========================================================================
-  # 第一幕：两路都好（通道 1 = 摄像头，通道 2 = 自动发现的显示器 #0）
+  # 第一幕：两路都好（通道 1 = 摄像头，通道 2 = 显式配置的显示器 #0）
   # =========================================================================
-  "`n[*] 第一幕：--camera 把通道 1 给摄像头，通道 2 由自动发现建出来"
+  "`n[*] 第一幕：--camera 把通道 1 给摄像头，通道 2 显式配置成显示器 #0"
   $cfgA = Join-Path $out 'cfg-a.json'
-  Write-Cfg $cfgA '[]'
+  # **显式写通道 2**：通道模型改版之后取消了显示器自动发现，默认只有通道 1。
+  # 这一幕要验的是"同一台机器上两路独立通道"，所以第二路必须落进配置。
+  # 名字显式给成「显示器 #0」——下面是这条测试一直以来的断言（也是用户在通道
+  # 管理里看到的那一行），默认名会是「通道 2」。
+  Write-Cfg $cfgA @"
+[
+  { "source": "display", "display_index": 0, "name": "显示器 #0",
+    "rtsp_path": "/ch2", "rtsp_sub_path": "/ch2_sub" }
+]
+"@
   foreach ($f in 'a1.mp4', 'a1-ch2.mp4') {
       Remove-Item (Join-Path $out $f) -ErrorAction SilentlyContinue
   }
@@ -517,7 +525,7 @@ try {
       # 写测试的人，不是产品。
       Check ($u2 -like "*:$RtspPort/*") `
             "通道 2 的 GetStreamUri 走的是共用的 RTSP 端口 $RtspPort（实际 $u2）"
-      # 子码流的尺寸必须是**那一路自己的**。自动建出来的通道如果漏了子码流
+      # 子码流的尺寸必须是**那一路自己的**。配置出来的通道如果漏了子码流
       # 的尺寸推导，两个通道的子码流会一模一样。
       #
       # ⚠️ 比的是**尺寸对**，不是高度：两路主码流的比例不同（1920x1080 是 16:9，
@@ -529,16 +537,58 @@ try {
             "两路的子码流尺寸不同（$($s1.width)x$($s1.height) vs $($s2.width)x$($s2.height)）"
   }
 
-  # --- [3] WS-Discovery：一次 Probe → **一份** ProbeMatch，里面两台设备 -------
+  # --- [2b] 主端点是**一台设备**：GetProfiles 聚合全部通道 ------------------
   #
-  # 形状是刻意的（见 wsd.h）：只有一个 responder 挂在通道 1 上，一次回答里
-  # 打包全部通道。**每个通道各起一个 responder 是错的** —— 那样 N 个通道回
-  # N 份 ProbeMatch，每份里还都带全部通道，NVR 那边看到的是同一台设备被重复
-  # 收录。
+  # issue #9 的核心：NVR 不该再把一台机器识别成 N 台。主端点的一张表里要同时
+  # 有 `main`/`sub`（通道 1，token 保持不变）和 `ch2_main`/`ch2_sub`。
+  "`n[2b] 主端点聚合全部通道的 Profile"
+  if ($j1 -and -not $j1.err) {
+      $mainTokens = @($j1.profiles | ForEach-Object { $_.token })
+      Check ($mainTokens.Count -ge 4) `
+            "主端点 GetProfiles 至少 4 条（实际 $($mainTokens.Count)：$($mainTokens -join ',')）" `
+            "少一条都说明某一路通道没进聚合表"
+      foreach ($t in 'main', 'sub', 'ch2_main', 'ch2_sub') {
+          Check ($mainTokens -contains $t) "主端点有 profile $t"
+      }
+      # 通道 1 的 token **必须**仍是 main/sub。换成 ch1_main 的话，所有已经
+      # 加过这台设备的 NVR 会认为 profile 消失，通道当场掉线。
+      Check ($mainTokens -notcontains 'ch1_main') `
+            "通道 1 没有改名成 ch1_main（老 NVR 配置不破）"
+
+      $m1 = @($j1.profiles | Where-Object { $_.token -eq 'main' }) | Select-Object -First 1
+      $m2 = @($j1.profiles | Where-Object { $_.token -eq 'ch2_main' }) | Select-Object -First 1
+      if ($m1) {
+          Check ("$($m1.snapshot)" -like '*/snapshot.jpg') `
+                "main 的 GetSnapshotUri 指向 /snapshot.jpg（实际 $($m1.snapshot)）"
+      }
+      if ($m2) {
+          # GetStreamUri 的**路径**必须属于这一路。聚合之后如果还把通道 1 的
+          # RTSP 路径发给 ch2_main，NVR 拉通道 2 会看到主屏 —— 而两路都"正常"。
+          $su = [Uri]"$($m2.uri)"
+          Check ($su.AbsolutePath -eq '/ch2') `
+                "ch2_main 的 GetStreamUri 指向 /ch2（实际 $($m2.uri)）" `
+                "聚合表里把通道 1 的路径抄给了通道 2"
+          Check ($su.Host -ne '127.0.0.1') `
+                "ch2_main 的主机按请求来源反推，不是环回（实际 $($su.Host)）"
+          Check ("$($m2.snapshot)" -like '*/snapshot.jpg?channel=2') `
+                "ch2_main 的 GetSnapshotUri 指向 /snapshot.jpg?channel=2（实际 $($m2.snapshot)）" `
+                "指向通道 1 的话，NVR 里点开通道 2 看到的是主屏"
+      } else {
+          Check $false "主端点里有 ch2_main" "主端点没有聚合出通道 2 的 profile"
+      }
+  } else {
+      Check $false "主端点的 GetProfiles 可读" "设备信息探针没答出来（见 [2]）"
+  }
+
+  # --- [3] WS-Discovery：一次 Probe → **一份** ProbeMatch、**一条** XAddrs ----
+  #
+  # shape 是刻意的（见 wsd.h）：媒体入口聚合在通道 1 之后，组播里也只该有
+  # 一个 UUID、一个 XAddrs。上一版把通道 2 也塞进 extra，于是 NVR 把一台机器
+  # 识别成两台 —— 那正是 issue #9 要修的现象。
   "`n[3] WS-Discovery（从临时端口发 Probe，真实客户端的形状）"
   # **`--dump` 不能省。** 不带它的时候探针只把**它认出的第一个** XAddrs 打进
-  # 人读的那几行，而"通道 2 在不在里面"这个问题只有看整段原始报文才答得出来
-  # —— 第一次跑就是这么假红了一条。
+  # 人读的那几行，而"有几个 XAddrs / 通道 2 还在不在里面"这个问题只有看整段
+  # 原始报文才答得出来 —— 第一次跑就是这么假红了一条。
   $w = Invoke-WithTimeout 'python' @('-I','-X','utf8',
           (Join-Path $root 'tests\wsd_probe.py'), '--mode', 'client',
           '--seconds', '8', '--dump') 30000
@@ -550,18 +600,21 @@ try {
   Check ($wAll -match '共收到 1 个应答') `
         "一次 Probe 只回**一个报文**" `
         (($wAll -split "`r?`n" | Where-Object { $_ -match '共收到|来自' }) -join ' / ')
-  # 而那一个报文里要有**两条** ProbeMatch（通道 1 一条、通道 2 一条）。这才是
-  # 多通道在组播里的形状：一个报文、N 条记录，一次单播里齐活，丢包不会只丢
-  # 其中一路。
+  # 聚合之后：一个报文里**一条** ProbeMatch、**一条** XAddrs（主端点）。
+  # 两条 = 又把通道 2 广播成第二台设备了。
   $pmCount = ([regex]::Matches($wAll, [regex]::Escape('<d:ProbeMatch>'))).Count
-  Check ($pmCount -eq 2) `
-        "那一个报文里有两条 ProbeMatch（实际 $pmCount 条）" `
-        "只有一条 = 通道 2 没进宣告表，NVR 自动扫描只能扫到通道 1"
+  Check ($pmCount -eq 1) `
+        "那一个报文里只有一条 ProbeMatch（实际 $pmCount 条）" `
+        "两条 = 一台机器又被识别成两台设备（issue #9 回归）"
+  $xaCount = ([regex]::Matches($wAll, [regex]::Escape('<d:XAddrs>'))).Count
+  Check ($xaCount -eq 1) `
+        "宣告里只有一条 XAddrs（实际 $xaCount 条）" `
+        "多出来的那条会让 NVR 把同一台机器的另一个端口也当成一台设备"
   Check ($wAll -like "*:$HttpPort/onvif/device_service*") `
-        "宣告表里有通道 1 的地址（端口 $HttpPort）"
-  Check ($wAll -like "*:$($Ch2Port)/onvif/device_service*") `
-        "宣告表里也有通道 2 的地址（端口 $($Ch2Port)）" `
-        "自动建出来的通道如果没进 XAddrs，NVR 就只能手工填 URL 添加它"
+        "宣告表里有主端点的地址（端口 $HttpPort）"
+  Check ($wAll -notlike "*:$($Ch2Port)/onvif/device_service*") `
+        "通道 2 的兼容端口**不再**出现在 XAddrs 里（端口 $($Ch2Port)）" `
+        "它仍然监听（直连调试/旧配置），只是不广播"
 
   # --- [4] 两路 RTSP 同时拉 -------------------------------------------------
   "`n[4] 两路 RTSP 同时拉"

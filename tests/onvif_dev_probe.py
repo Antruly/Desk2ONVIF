@@ -14,6 +14,7 @@
     GetDeviceInformation  → Manufacturer / Model / SerialNumber / HardwareId
     GetProfiles           → 每一路 profile 的 token 和分辨率
     GetStreamUri(profile) → 那个 profile 报出来的 RTSP 地址
+    GetSnapshotUri(profile) → 那个 profile 报出来的快照地址
 
 判据（在本脚本里一眼能对上的两件）：
 
@@ -209,7 +210,21 @@ def main():
                     uri = u.text if u is not None and u.text else ""
                 elif not out["err"]:
                     out["err"] = f"GetStreamUri({token})：{err2}"
-                profs.append({"token": token, "width": w, "height": h, "uri": uri})
+                # 快照地址也按 profile 问一次：聚合端点上 `ch2_main` 必须给
+                # `/snapshot.jpg?channel=2`，而通道 1 是 `/snapshot.jpg`
+                # —— 拿错的话 NVR 里点开通道 2 看到的是主屏，且不报错。
+                body = ENVELOPE.format(body=op(
+                    "GetSnapshotUri", NS["trt"],
+                    f"<trt:ProfileToken>{token}</trt:ProfileToken>"))
+                r3, err3 = call(c, MED_PATH, body, a.user, a.password)
+                snapshot = ""
+                if r3 is not None:
+                    u = r3.find(".//tt:Uri", NS)
+                    snapshot = u.text if u is not None and u.text else ""
+                elif not out["err"]:
+                    out["err"] = f"GetSnapshotUri({token})：{err3}"
+                profs.append({"token": token, "width": w, "height": h, "uri": uri,
+                              "snapshot": snapshot})
             out["profiles"] = profs
             if not profs and not out["err"]:
                 out["err"] = "GetProfiles 回了一个 profile 都没有"
