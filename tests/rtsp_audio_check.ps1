@@ -147,6 +147,9 @@ function Probe-Streams {
 "`n[1] 一次会话里两条轨（音频开）"
 $job = Start-Harness -Port $RtspPort -Secs $Seconds -Mode 'on'
 Start-Sleep -Seconds 2
+# 这个 harness 自己把 RTSP 鉴权关掉了（见 `rtsp_audio_check.cpp` 里
+# `opt.auth_enabled = false`）：它验的是音频 SDP/RTP，不是鉴权，所以 URL 里
+# 没有凭据。真实程序默认是带 Digest 的，那条路由 `rtsp_auth_probe.py` 验。
 $url = "rtsp://127.0.0.1:$RtspPort/live"
 
 $streams = Probe-Streams $url

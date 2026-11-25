@@ -15,6 +15,9 @@
 #include "OnDemandServerMediaSubsession.hh"
 #include "RTSPServer.hh"
 #include "ServerMediaSession.hh"
+// `UserAuthenticationDatabase` 定义在 `GenericMediaServer.hh` 里，Live555 没有
+// 单独的 `UserAuthenticationDatabase.hh` —— 写那个名字会在包含阶段直接失败。
+// `RTSPServer.hh` 已经把它带进来，这里不再重复包含。
 
 #include "liveMedia_version.hh"
 
@@ -73,6 +76,73 @@ constexpr unsigned kFragmentBufferBytes = 2u * 1024u * 1024u;
 constexpr int kParamWaitMs = 3000;
 
 }  // namespace
+
+/// RTSP 的 Digest 鉴权数据库。
+///
+/// ## 为什么不直接用 `UserAuthenticationDatabase`
+///
+/// 它是为**单线程**使用写的（Live555 的对象都只在调度线程上被碰），而本项目
+/// 的凭据会在**网页线程**上变：用户在网页上改了 `onvif.password`，RTSP 这边
+/// 不能等重启，也不能让"旧口令一直有效"。
+///
+/// 在网页线程上对基类调 `removeUserRecord` / `addUserRecord` 是数据竞争；
+/// 用 `TaskScheduler::triggerEvent()` 投到 RTSP 线程上又有一个硬伤 ——
+/// 那个接口的 `clientData` 是 `int`，装不下 `RtspServer*`（Win64 上会截断），
+/// 绕全局注册表只会把问题藏起来，而且仍然是异步的（旧口令会多活一个 tick）。
+///
+/// 所以换一个角度：**把"读凭据"变成线程安全的那一步**。Live555 每次鉴权都会
+/// 调 `lookupPassword()`（只在 RTSP 线程上），我们从锁后面取**当前**那一对
+/// 用户名/口令；网页线程换凭据也只是在同一把锁后面换两个字符串。于是：
+///
+///   - 不需要在 RTSP 线程上做任何"重放"；
+///   - 锁一放，旧口令就不再匹配 —— **没有窗口**；
+///   - 用明文口令（构造时 `passwordsAreMD5=False`），Digest 的 MD5 由 Live555
+///     自己按挑战里的 nonce 算。
+///
+/// `lookup_password_` 是给 `lookupPassword()` 返回值用的暂存：Live555 会在
+/// 同一个调用里把它拷走/哈希掉，而它只会被 RTSP 线程写，所以不需要锁。
+class AuthDatabase final : public UserAuthenticationDatabase {
+ public:
+  AuthDatabase(char const* realm, std::string user, std::string password)
+      : UserAuthenticationDatabase(realm, False /* passwordsAreMD5 */),
+        user_(std::move(user)),
+        password_(std::move(password)) {}
+
+  /// 网页线程调。下一次 `lookupPassword()` 看到的就是新的一对。
+  void set(std::string user, std::string password) {
+    std::lock_guard<std::mutex> lk(mu_);
+    user_ = std::move(user);
+    password_ = std::move(password);
+  }
+
+  char const* lookupPassword(char const* username) override {
+    std::string const who = username != nullptr ? username : "";
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      // **用户不存在时必须返回 nullptr，不能返回空口令。** Live555 拿这个
+      // 返回值去算期望摘要；返回空串等于告诉它"这个用户的口令是空的"，
+      // 于是任何人只要用 `username=<随便一个名字>`、口令留空、再照
+      // MD5(user:realm:) 算一遍，就能通过 Digest 校验 —— 而 RTSP 这边只配了
+      // 一个用户，这个"不存在的用户"路径本来就不该存在。
+      //
+      // 基类同样是"找不到返回 nullptr"的语义，这里保持一致。
+      if (who != user_) {
+        D2O_DEBUG("RTSP 鉴权查询：用户=%s（不存在）", who.c_str());
+        return nullptr;
+      }
+      lookup_password_ = password_;
+    }
+    D2O_DEBUG("RTSP 鉴权查询：用户=%s（已配置）", who.c_str());
+    return lookup_password_.c_str();
+  }
+
+ private:
+  std::mutex mu_;
+  std::string user_;
+  std::string password_;
+  /// 只在 RTSP 线程上用，见类注释。
+  std::string lookup_password_;
+};
 
 /// 一路码流的参数集槽位。
 ///
@@ -578,7 +648,23 @@ bool RtspServer::start(RtspOptions const& opt, std::string& err) {
     return false;
   }
 
-  server_ = RTSPServer::createNew(*env_, Port(opt_.port));
+  // 鉴权数据库**必须在服务器之前建**：`RTSPServer::createNew()` 的那个参数
+  // 只是把指针存下来，服务器不持有所有权，所以这里用成员持有它，保证生命周期
+  // 覆盖整个服务器（析构顺序见 teardown()）。
+  if (opt_.auth_enabled) {
+    auth_db_ = std::make_unique<AuthDatabase>(opt_.realm.c_str(), opt_.user,
+                                              opt_.password);
+    D2O_INFO(
+        "RTSP Digest 鉴权已开启（realm=%s，用户=%s）；未带凭据或凭据错误一律 "
+        "401，不做匿名降级。",
+        opt_.realm.c_str(), opt_.user.c_str());
+  } else {
+    D2O_WARN(
+        "RTSP 鉴权**已关闭**（--no-rtsp-auth 或 rtsp.auth_enabled=false）："
+        "局域网里任何人都能拉流。这只应用于调试/回归。");
+  }
+
+  server_ = RTSPServer::createNew(*env_, Port(opt_.port), auth_db_.get());
   if (!server_) {
     err = fmt("创建 RTSP 服务器失败：端口 %u 可能已被占用，或者被防火墙拦了。"
               "换个端口试试（--rtsp-port）。",
@@ -647,6 +733,17 @@ void RtspServer::stop() {
   teardown();
 }
 
+void RtspServer::update_credentials(std::string const& user,
+                                    std::string const& password) {
+  // 没在跑、或者这一趟本来就不鉴权：什么都不用做。下一次 start() 会从
+  // RtspOptions 里拿当时那一份（调用方在每一段都按最新配置重算）。
+  if (!running_.load(std::memory_order_relaxed) || !auth_db_) return;
+  auth_db_->set(user, password);
+  // 口令本身**不进日志**：这一行的价值是"换过了"，不是"换成了什么"。
+  D2O_DEBUG("RTSP 鉴权凭据已更新（用户=%s）；下一次鉴权即生效。",
+            user.c_str());
+}
+
 void RtspServer::teardown() {
   // 走到这里时调度线程必须已经停了（见头文件的停机顺序说明）。
   //
@@ -678,6 +775,10 @@ void RtspServer::teardown() {
     Medium::close(server_);
     server_ = nullptr;
   }
+  // **服务器关掉之后**才放鉴权库：`RTSPServer` 只持有它的裸指针，先删库就等于
+  // 给一个还要处理请求的服务器留了一个悬空指针。成员声明顺序保证 unique_ptr
+  // 的自动析构会晚于 server_ 的手动关闭，但这里显式写出来，读的人不用推。
+  auth_db_.reset();
   if (env_) {
     if (!env_->reclaim()) {
       // 返回 False 说明还有 source/sink 持有库状态。多半是某条析构路径没走完，

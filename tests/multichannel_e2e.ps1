@@ -567,8 +567,8 @@ try {
   "`n[4] 两路 RTSP 同时拉"
   # **同时**拉才验得了"一台共享的 RtspServer、全部通道挂在上面靠路径区分"
   # 这件事 —— 串行拉只证明两条路径各自是对的。
-  $pull1 = Start-Pull "rtsp://127.0.0.1:$RtspPort/live" 8
-  $pull2 = Start-Pull "rtsp://127.0.0.1:$RtspPort/ch2" 8
+  $pull1 = Start-Pull "rtsp://admin:admin@127.0.0.1:$RtspPort/live" 8
+  $pull2 = Start-Pull "rtsp://admin:admin@127.0.0.1:$RtspPort/ch2" 8
   $r1 = Finish-Cmd $pull1 40000
   $r2 = Finish-Cmd $pull2 40000
   $v1 = Split-PullErr $r1.Err
@@ -583,8 +583,8 @@ try {
         (($v2.Fatal | Select-Object -First 3) -join ' / ')
   foreach ($n in (@($v1.Notes) + @($v2.Notes) | Select-Object -First 2)) { "         [记账] $n" }
 
-  $p1 = Probe "rtsp://127.0.0.1:$RtspPort/live"
-  $p2 = Probe "rtsp://127.0.0.1:$RtspPort/ch2"
+  $p1 = Probe "rtsp://admin:admin@127.0.0.1:$RtspPort/live"
+  $p2 = Probe "rtsp://admin:admin@127.0.0.1:$RtspPort/ch2"
   Check (-not $p1._timedout -and $p1.codec_name -eq 'h264') `
         "通道 1 /live 是 h264（实际 $($p1.codec_name)）" $p1._err
   Check (-not $p2._timedout -and $p2.codec_name -eq 'h264') `
@@ -676,7 +676,7 @@ try {
             "而且带着原因，不是光一个「失败」（实际「$($bB[2].state)」）"
       Check ([double]$bB[2].fps -eq 0) "通道 2 的 fps 是 0（没在出帧）"
 
-      $pb1 = Probe "rtsp://127.0.0.1:$RtspPort/live"
+      $pb1 = Probe "rtsp://admin:admin@127.0.0.1:$RtspPort/live"
       Check (-not $pb1._timedout -and $pb1.codec_name -eq 'h264') `
             "通道 1 的 RTSP 照常能拉（实际 $($pb1.codec_name)）" $pb1._err
 
@@ -753,7 +753,7 @@ try {
       # 连不上的设备（和"关掉的通道不宣告"是同一条理由，见 main.cpp 那句）。
       Check (Wait-PortFree @($Ch2Port) 8) `
             "被挡的那一路连端口都没占（$Ch2Port 是空的）"
-      $pc1 = Probe "rtsp://127.0.0.1:$RtspPort/live"
+      $pc1 = Probe "rtsp://admin:admin@127.0.0.1:$RtspPort/live"
       Check (-not $pc1._timedout -and $pc1.codec_name -eq 'h264') `
             "通道 1 的 RTSP 照常能拉（实际 $($pc1.codec_name)）" $pc1._err
   }

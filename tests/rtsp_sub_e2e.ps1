@@ -1,4 +1,5 @@
 ﻿# 子码流端到端：起一次采集（两路 RTSP + HTTP/ONVIF），
+#   0) 先用纯标准库探针验 RTSP Digest：匿名 401、错口令 401、对口令 200 + SDP
 #   1) ffprobe/ffmpeg 分别拉主、子两路，确认能解出画面且零报错
 #   2) 跑 onvif_soap.py，确认 GetProfiles 报出两个各自独立的 profile
 #   3) 打印收尾统计里的逐路数字
@@ -156,6 +157,26 @@ foreach ($port in @($RtspPort, $HttpPort)) {
 }
 Start-Sleep -Seconds 3   # 让编码器把首帧和参数集吐出来
 
+# --- 0. RTSP 鉴权：匿名必须被拒，正确凭据必须能拿到 SDP --------------------
+#
+# **放在最前面**，理由有两条：
+#   * 它只依赖"RTSP 端口起来了"，不需要画面解出来 —— 而 [1] 那两段 ffprobe
+#     会把预算用掉一大截；
+#   * 它绝对不能落在 `--seconds` 到点退出之后（那时 RTSP 已经停了，报出来
+#     的是"连不上"，看起来像鉴权坏了）。此刻进程刚起 3 秒，离 70 秒的预算
+#     还早。
+#
+# 凭据就是配置文件里的默认值 admin/admin（本脚本每次删 cfg.json，所以服务
+# 端一定是这一对）。路径同时验主码流与子码流：它们挂在**同一个**服务器上，
+# 但走的是两次独立的 DESCRIBE —— 只验主码流的话，"子码流被匿名放行"这种
+# 按路径分叉的 bug 照样能全绿。
+"`n[0] RTSP Digest 鉴权"
+& python -I -X utf8 (Join-Path $root 'tests\rtsp_auth_probe.py') `
+    --host 127.0.0.1 --port $RtspPort --path /live --path /live_sub `
+    --user admin --pass admin
+$rtspAuth = $LASTEXITCODE
+Check ($rtspAuth -eq 0) "rtsp_auth_probe.py 退出码 $rtspAuth"
+
 # --- 1. 两路都能拉能解 ----------------------------------------------------
 "`n[1] 两路 RTSP"
 
@@ -229,7 +250,10 @@ function Get-StatusDuty {
 $probed = @{}
 foreach ($pair in @(@('main', 'live'), @('sub', 'live_sub'))) {
     $tok = $pair[0]; $path = $pair[1]
-    $url = "rtsp://127.0.0.1:$RtspPort/$path"
+    # RTSP 默认要求 Digest 鉴权，凭据是 ONVIF 那一对。本脚本每次删 cfg.json，
+    # 所以这里一定是出厂默认的 admin/admin（不是 `$HttpUser` —— 那个参数只
+    # 改 Web 登录，改不动 ONVIF/RTSP 这一对）。
+    $url = "rtsp://admin:admin@127.0.0.1:$RtspPort/$path"
     # duty 的两次读数把 ffprobe 那次测量夹在中间，**只为了让下面的读数有个上下文**
     # （为什么不当判据用，见下面那一段）。
     $dutyBefore = Get-StatusDuty
@@ -352,8 +376,9 @@ function Start-Pull {
     }
 }
 
-$mainUrl = "rtsp://127.0.0.1:$RtspPort/live"
-$subUrl  = "rtsp://127.0.0.1:$RtspPort/live_sub"
+# 凭据同上：本脚本的配置每次从零开始，ONVIF/RTSP 一定是 admin/admin。
+$mainUrl = "rtsp://admin:admin@127.0.0.1:$RtspPort/live"
+$subUrl  = "rtsp://admin:admin@127.0.0.1:$RtspPort/live_sub"
 
 # 三条同时开（两主一子）。同一条路径上的两个客户端走的是**同一个 source**
 # （reuseFirstSource=True），所以这一条同时在验"多客户端共享一个编码器"
