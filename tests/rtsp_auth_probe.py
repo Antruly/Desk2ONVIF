@@ -123,7 +123,7 @@ def describe(host, port, path, auth=None, timeout=_TIMEOUT):
         "Accept: application/sdp",
     ]
     if auth:
-        lines.append(f"Authorization: {auth}")
+        lines.append("Authorization: " + str(auth))
     req = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
     with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
@@ -186,6 +186,18 @@ def probe_path(host, port, path, user, password, r):
         r.check(False, f"{base} 错误口令收到响应", e)
 
     # 3) 正确口令 → 200 + m=video
+    #
+    # **先重新要一份挑战。** 第 2 步刚用同一个 nonce 发过一次错口令；服务端
+    # 如果按 nonce 做了失败计数/一次性 nonce（Live555 的不同版本行为不完全
+    # 一致），继续拿旧 nonce 算正确摘要会被拒，而那条 FAIL 看起来像"口令不对"。
+    # 真实的播放器每轮都会重新走一次 401 挑战，探针必须和它一样。
+    try:
+        st, hd, _ = describe(host, port, path)
+        www = header(hd, "www-authenticate")
+        challenge = parse_challenge(www)
+    except Exception as e:  # noqa: BLE001
+        r.check(False, f"{base} 重新获取 Digest 挑战", e)
+        return
     good = digest_header(user, password, "DESCRIBE",
                          f"rtsp://{host}:{port}{path}", challenge)
     try:
