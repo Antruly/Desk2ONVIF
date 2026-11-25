@@ -113,22 +113,45 @@ def digest_header(user, password, method, uri, challenge, cnonce=None):
     )
 
 
-def describe(host, port, path, auth=None, timeout=_TIMEOUT):
-    """发一条 DESCRIBE，返回 (status, headers, body)。每次新开连接。"""
+def _describe_on(sock, host, port, path, auth=None, cseq=1):
     url = f"rtsp://{host}:{port}{path}"
     lines = [
         f"DESCRIBE {url} RTSP/1.0",
-        "CSeq: 1",
+        f"CSeq: {cseq}",
         "User-Agent: d2o-rtsp-auth-probe",
         "Accept: application/sdp",
     ]
     if auth:
         lines.append("Authorization: " + str(auth))
     req = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    sock.sendall(req)
+    return read_response(sock)
+
+
+def describe(host, port, path, auth=None, timeout=_TIMEOUT):
+    """发一条 DESCRIBE，返回 (status, headers, body)。每次新开连接。"""
     with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
-        sock.sendall(req)
-        return read_response(sock)
+        return _describe_on(sock, host, port, path, auth)
+
+
+def describe_with_digest(host, port, path, user, password, timeout=_TIMEOUT):
+    """在**同一条 TCP 连接**上先拿 401 挑战，再用正确摘要重发。
+
+    这不是为了"像 ffprobe"而模仿：Live555 的 nonce 是**按连接**校验的
+    （实测：新连接拿到的 nonce 拿到另一条连接上算正确摘要仍然 401），
+    真实播放器也是在同一连接上完成挑战/应答。探针如果每条请求都新开连接，
+    "正确口令"会假红。
+    """
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        st, hd, body = _describe_on(sock, host, port, path, cseq=1)
+        if st != 401:
+            return st, hd, body
+        challenge = parse_challenge(header(hd, "www-authenticate"))
+        good = digest_header(user, password, "DESCRIBE",
+                             f"rtsp://{host}:{port}{path}", challenge)
+        return _describe_on(sock, host, port, path, auth=good, cseq=2)
 
 
 class Report:
@@ -187,21 +210,10 @@ def probe_path(host, port, path, user, password, r):
 
     # 3) 正确口令 → 200 + m=video
     #
-    # **先重新要一份挑战。** 第 2 步刚用同一个 nonce 发过一次错口令；服务端
-    # 如果按 nonce 做了失败计数/一次性 nonce（Live555 的不同版本行为不完全
-    # 一致），继续拿旧 nonce 算正确摘要会被拒，而那条 FAIL 看起来像"口令不对"。
-    # 真实的播放器每轮都会重新走一次 401 挑战，探针必须和它一样。
+    # **必须在同一条 TCP 连接上完成"401 挑战 → 正确摘要"**：Live555 的 nonce
+    # 按连接校验，新连接拿旧 nonce 算正确摘要也会 401。ffprobe 就是这么做的。
     try:
-        st, hd, _ = describe(host, port, path)
-        www = header(hd, "www-authenticate")
-        challenge = parse_challenge(www)
-    except Exception as e:  # noqa: BLE001
-        r.check(False, f"{base} 重新获取 Digest 挑战", e)
-        return
-    good = digest_header(user, password, "DESCRIBE",
-                         f"rtsp://{host}:{port}{path}", challenge)
-    try:
-        st, hd, body = describe(host, port, path, auth=good)
+        st, hd, body = describe_with_digest(host, port, path, user, password)
     except Exception as e:  # noqa: BLE001
         r.check(False, f"{base} 正确口令收到响应", e)
         return
