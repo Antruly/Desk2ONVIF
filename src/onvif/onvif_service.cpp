@@ -4,6 +4,7 @@
 #include "common/log.h"
 #include "onvif/digest.h"
 #include "onvif/net_identity.h"
+#include "onvif/wss.h"
 
 #include <webapp/uvcpp_web_request.h>
 #include <webapp/uvcpp_web_response.h>
@@ -775,6 +776,19 @@ struct OnvifService::Impl {
   DigestAuth& authenticator() {
     if (!auth) auth = std::make_unique<DigestAuth>(opt.realm, opt.user, opt.password);
     return *auth;
+  }
+
+  /// WS-UsernameToken 校验器，**同样整个进程只建一次** —— 它身上挂着 nonce
+  /// 重放缓存，按请求新建等于把重放保护清零（症状是"同一个 token 能反复用"，
+  /// 而每一次单独看都完全合规）。
+  ///
+  /// 凭据不存进去：每次 `verify()` 现传 `opt.user` / `opt.password`，所以
+  /// 热改口令之后不存在"校验器里还是旧口令"这第二份状态。
+  std::unique_ptr<WsseVerifier> wsse;
+
+  WsseVerifier& wsse_verifier() {
+    if (!wsse) wsse = std::make_unique<WsseVerifier>();
+    return *wsse;
   }
 
   /// 每个 SOAP 请求开始时刷新一次 provider 快照。**必须在 `media_op` /
@@ -2382,17 +2396,40 @@ bool OnvifService::handle(uvcpp_web_request& req, uvcpp_web_response& resp,
     // 注意是 `d.authenticator()`（进程内唯一），不是就地新建一个。
     DigestAuth& auth = d.authenticator();
     char const* const m = req.method_name();
-    bool const ok =
+    bool const digest_ok =
         auth.verify(m != nullptr ? m : "POST", req.path(),
                     req.raw_url().empty() ? req.path() : req.raw_url(), hdr, auth_stale);
-    if (!ok) {
-      // 只记"有没有发凭据"和来源，**不记摘要头本身** —— 它对排查没有帮助，
-      // 却是一份可重放的凭据。这两条信息正好区分开两种最常见的现场：
-      // 客户端压根没发 Authorization（口令没配），还是发了但算错了（口令不对）。
-      D2O_WARN("ONVIF 鉴权失败：来自 %s 的 %s %s，%s。",
-               req.peer_ip().c_str(), m != nullptr ? m : "POST", req.path().c_str(),
-               hdr.empty() ? "请求里没有 Authorization 头"
-                           : "发来了 Authorization 但摘要对不上（口令或算法不符）");
+
+    // **两种凭据并存，任一通过即放行。**
+    //
+    // 先看 `Authorization`（NVR 的主流走法）；Digest 缺失或不对时，再看
+    // SOAP Header 里有没有 UsernameToken。两条都没有 / 都不对，仍然是
+    // 401 + Digest 挑战 —— **不能把 WSSE 的失败改成 500**：还在等挑战的
+    // 客户端（curl --digest、多数 NVR 的第一发）会把 500 当成"服务端坏了"
+    // 而放弃，永远走不到自己算摘要那一步。
+    bool wsse_ok = false;
+    WsseCheck wsse;
+    if (!digest_ok) {
+      wsse = d.wsse_verifier().verify(msg.header_xml, d.opt.user, d.opt.password);
+      wsse_ok = (wsse.status == WsseStatus::kOk);
+    }
+    if (!digest_ok && !wsse_ok) {
+      // 只记"有没有发凭据"、来源，以及 WSSE 里的用户名和一句短原因。
+      // **nonce / Created / 摘要 / 口令永远不进日志** —— 它们是可重放的
+      // 凭据材料，而排查只需要知道"是谁、从哪来、错在哪一类"。
+      if (wsse.status == WsseStatus::kRejected) {
+        D2O_WARN("ONVIF WSSE 鉴权失败：来自 %s 的 %s %s，用户 \"%s\"，%s。",
+                 req.peer_ip().c_str(), m != nullptr ? m : "POST",
+                 req.path().c_str(), wsse.username.c_str(), wsse.reason.c_str());
+      } else {
+        D2O_WARN("ONVIF 鉴权失败：来自 %s 的 %s %s，%s。",
+                 req.peer_ip().c_str(), m != nullptr ? m : "POST",
+                 req.path().c_str(),
+                 hdr.empty()
+                     ? "请求里没有 Authorization 头，也没有 UsernameToken"
+                     : "发来了 Authorization 但摘要对不上（口令或算法不符），"
+                       "也没有可用的 UsernameToken");
+      }
       challenge_401();
       return true;
     }

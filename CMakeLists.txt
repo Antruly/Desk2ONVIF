@@ -196,6 +196,7 @@ add_library(desk2onvif_core STATIC
   src/rtsp/aac_live_source.cpp
   src/rtsp/rtsp_server.cpp
   src/onvif/digest.cpp
+  src/onvif/wss.cpp
   src/onvif/net_identity.cpp
   src/onvif/wsd.cpp
   src/onvif/onvif_service.cpp
