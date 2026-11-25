@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import BrandMark from '../components/BrandMark.vue'
 import Icon from '../components/Icon.vue'
 import { useAuth } from '../composables/useAuth'
+import { useTheme } from '../composables/useTheme'
 import { clearLifecycleNote, peekLifecycleNote } from '../lifecycle'
 
 /**
@@ -19,11 +21,17 @@ import { clearLifecycleNote, peekLifecycleNote } from '../lifecycle'
  * 后端连续 5 次失败后把来源 IP 冷却 60 秒，之后**连正确的口令也拒**。这里必须
  * 把这两种分开显示，否则用户会在"我明明打对了"和"它说不对"之间反复试，
  * 而每试一次冷却都是重新算的 —— 越试越进不去。
+ *
+ * ## 版式
+ *
+ * 左边是产品说明，右边是表单。左边那块**不参与任何鉴权判断** —— 它只是一组
+ * 静态文案；把"后端连不上"之类的状态也画在左边，会让两种失败看起来像装饰。
  */
 
 const route = useRoute()
 const router = useRouter()
 const { authRequired, sessionError, ensureSession, login } = useAuth()
+const { isLight, toggleTheme } = useTheme()
 
 const name = ref('admin')
 const password = ref('')
@@ -106,8 +114,7 @@ async function onSubmit() {
     // 登录前想去哪就回哪；没带 next 就回首页（首页是预览）。
     const raw = route.query.next
     const next = Array.isArray(raw) ? raw[0] : raw
-    // `replace` 而不是 `push`：登录页不该留在后退栈里，否则用户在首页按一下
-    // 后退就被送回登录页，再被守卫弹回首页 —— 一个看起来像"后退键坏了"的循环。
+    // `replace` 而不是 `push`：登录页不该留在后退栈里。
     await router.replace(typeof next === 'string' && next.startsWith('/') ? next : '/')
     return
   }
@@ -136,99 +143,188 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="login-wrap">
-    <div class="login-card">
-      <div class="login-head">
-        <Icon name="camera" :size="46" :stroke="1.4" class="login-logo" />
-        <h1>Desk2ONVIF</h1>
-        <div class="sub">Web Console</div>
+  <div class="auth-page">
+    <div class="auth-page__noise"></div>
+
+    <!-- 左栏：产品说明。纯静态，不参与登录状态判断。 -->
+    <section class="auth-art">
+      <div class="auth-art__top">
+        <BrandMark :size="40" />
+        <span class="auth-wordmark">Desk2ONVIF</span>
+        <span class="chip chip--accent">Profile S</span>
       </div>
 
-      <!--
-        为什么会被送到这里。**故意是独立的一块，不参与下面的 v-if/v-else-if 链**
-        —— "服务刚重启过"和"后端连不上"是两件互不相干的事，串进同一条链会让其中
-        一件盖掉另一件，而那时最需要的恰恰是同时看到两条。
-        这里没有失败可言：被重启踢出来是设计的一部分，不是错误。
-      -->
-      <div v-if="lifecycleBanner" class="banner is-warn">
-        <strong>{{ lifecycleBanner.reason === 'reset' ? '服务已恢复出厂并重启。' : '服务已重启。' }}</strong>
-        {{ lifecycleBanner.text }}
+      <div class="auth-art__copy">
+        <p class="eyebrow">本机桌面 · ONVIF 设备模拟</p>
+        <h1>
+          把桌面<br />
+          <span class="text-gradient">变成一路摄像机。</span>
+        </h1>
+        <p class="auth-art__lead">
+          采集本机桌面或 USB 摄像头，编码成 H.264，同时向 NVR 提供 ONVIF 与
+          RTSP 两种入口。不需要额外的视频服务器，也不经过任何云端。
+        </p>
       </div>
 
-      <!-- 后端根本没起来：这时登录是没有意义的重试，得说清楚。 -->
-      <div v-if="sessionError" class="banner is-err">
-        <strong>连不上后端。</strong>{{ sessionError }}
-        <div class="actions" style="margin-top: 10px">
-          <button type="button" @click="retrySession">
-            <Icon name="refresh" :size="15" />重试
-          </button>
+      <div class="auth-art__grid">
+        <div class="auth-feature">
+          <span class="auth-feature__icon"><Icon name="eye" :size="18" /></span>
+          <div>
+            <strong>多路实时预览</strong>
+            <p>浏览器里直接看 fMP4，不开插件，也不用先连 NVR。</p>
+          </div>
+        </div>
+        <div class="auth-feature">
+          <span class="auth-feature__icon"><Icon name="shield" :size="18" /></span>
+          <div>
+            <strong>ONVIF Profile S</strong>
+            <p>设备发现、媒体配置、RTSP 地址都由本机直接应答。</p>
+          </div>
+        </div>
+        <div class="auth-feature">
+          <span class="auth-feature__icon"><Icon name="monitor" :size="18" /></span>
+          <div>
+            <strong>本机离线部署</strong>
+            <p>页面与接口都跑在同一台机器上，不依赖外部 CDN。</p>
+          </div>
+        </div>
+        <div class="auth-feature">
+          <span class="auth-feature__icon"><Icon name="list" :size="18" /></span>
+          <div>
+            <strong>审计与排障</strong>
+            <p>谁改了什么、机器出了什么事，分成两份日志各自记录。</p>
+          </div>
         </div>
       </div>
 
-      <!-- 后台明确说了不需要登录（web.auth_enabled=false 或口令为空）。 -->
-      <div v-else-if="!authRequired" class="banner is-warn">
-        这台机器上的 Web 控制台<strong>没有启用登录</strong>，因此没有可输入的口令。
-        <br />直接进去即可；想开启登录，请在后端配置文件里设置
-        <code class="value">web.auth_enabled</code> 与
-        <code class="value">web.password</code>，或启动时用
-        <code class="value">--http-user</code> / <code class="value">--http-password</code>。
-        <div class="actions" style="margin-top: 12px">
-          <button type="button" class="primary" @click="router.replace('/')">
-            <Icon name="camera" :size="15" />进入控制台
-          </button>
-        </div>
+      <div class="auth-art__foot">
+        <span><i class="status-dot" /> 本机控制台</span>
+        <span class="mono">libuvcpp</span>
       </div>
+    </section>
 
-      <form v-else @submit.prevent="onSubmit">
-        <div v-if="errorText" class="banner is-err" style="margin-bottom: 18px">
-          {{ errorText }}
-        </div>
-        <div v-else-if="cooldown > 0" class="banner is-warn" style="margin-bottom: 18px">
-          失败次数过多，该地址已被暂时拒绝。<strong>这段时间里即使口令正确也会被拒</strong>
-          —— 等倒计时走完再试。
-        </div>
-
-        <label class="login-field">
-          <span class="field-label">用户名</span>
-          <span class="input-wrap">
-            <span class="input-icon"><Icon name="user" :size="17" /></span>
-            <input
-              v-model="name"
-              type="text"
-              autocomplete="username"
-              autocapitalize="off"
-              spellcheck="false"
-              :disabled="busy"
-              placeholder="admin"
-            />
-          </span>
-        </label>
-
-        <label class="login-field">
-          <span class="field-label">口令</span>
-          <span class="input-wrap">
-            <span class="input-icon"><Icon name="lock" :size="17" /></span>
-            <input
-              ref="passwordInput"
-              v-model="password"
-              type="password"
-              autocomplete="current-password"
-              :disabled="busy || cooldown > 0"
-              placeholder="••••••"
-            />
-          </span>
-        </label>
-
-        <button type="submit" class="primary login-btn" :disabled="!canSubmit">
-          <Icon v-if="busy" name="loader" :size="16" />
-          {{ submitLabel }}
+    <!-- 右栏：表单。 -->
+    <section class="auth-panel">
+      <div class="auth-actions">
+        <button
+          class="icon-button"
+          type="button"
+          :title="isLight ? '切换到深色主题' : '切换到浅色主题'"
+          :aria-label="isLight ? '切换到深色主题' : '切换到浅色主题'"
+          @click="toggleTheme"
+        >
+          <Icon :name="isLight ? 'moon' : 'sun'" :size="18" />
         </button>
-      </form>
-
-      <div class="login-foot">
-        凭据与 ONVIF 那一份<strong>不是同一套</strong>：这里是给人手敲的
-        <code class="value">web.user</code> / <code class="value">web.password</code>。
       </div>
-    </div>
+
+      <form class="auth-card" @submit.prevent="onSubmit">
+        <div class="auth-card__head">
+          <span class="eyebrow">安全登录</span>
+          <h2>登录控制台</h2>
+          <p>输入本机配置里的 Web 账号。凭据只在本机校验，不会发往外部服务。</p>
+        </div>
+
+        <!--
+          为什么会被送到这里。**故意是独立的一块，不参与下面的 v-if/v-else-if 链**
+          —— "服务刚重启过"和"后端连不上"是两件互不相干的事，串进同一条链会让其中
+          一件盖掉另一件，而那时最需要的恰恰是同时看到两条。
+        -->
+        <div v-if="lifecycleBanner" class="inline-alert inline-alert--warning">
+          <Icon name="alert" :size="16" />
+          <span>
+            <strong>{{ lifecycleBanner.reason === 'reset' ? '服务已恢复出厂并重启。' : '服务已重启。' }}</strong>
+            {{ lifecycleBanner.text }}
+          </span>
+        </div>
+
+        <!-- 后端根本没起来：这时登录是没有意义的重试，得说清楚。 -->
+        <div v-if="sessionError" class="inline-alert inline-alert--danger">
+          <Icon name="alert" :size="16" />
+          <span>
+            <strong>连不上后端。</strong>{{ sessionError }}
+            <span class="actions" style="margin-top: 10px">
+              <button type="button" class="ghost" @click="retrySession">
+                <Icon name="refresh" :size="15" />重试
+              </button>
+            </span>
+          </span>
+        </div>
+
+        <!-- 后台明确说了不需要登录（web.auth_enabled=false 或口令为空）。 -->
+        <div v-else-if="!authRequired" class="inline-alert inline-alert--warning">
+          <Icon name="info" :size="16" />
+          <span>
+            这台机器上的 Web 控制台<strong>没有启用登录</strong>，因此没有可输入的口令。
+            <br />想开启登录，请在后端配置文件里设置
+            <code class="value">web.auth_enabled</code> 与
+            <code class="value">web.password</code>，或启动时用
+            <code class="value">--http-user</code> / <code class="value">--http-password</code>。
+            <span class="actions" style="margin-top: 12px">
+              <button type="button" class="primary" @click="router.replace('/')">
+                <Icon name="camera" :size="15" />进入控制台
+              </button>
+            </span>
+          </span>
+        </div>
+
+        <template v-else>
+          <div v-if="errorText" class="inline-alert inline-alert--danger">
+            <Icon name="x" :size="16" />
+            <span>{{ errorText }}</span>
+          </div>
+          <div v-else-if="cooldown > 0" class="inline-alert inline-alert--warning">
+            <Icon name="clock" :size="16" />
+            <span>
+              失败次数过多，该地址已被暂时拒绝。<strong>这段时间里即使口令正确也会被拒</strong>
+              —— 等倒计时走完再试。
+            </span>
+          </div>
+
+          <label class="field">
+            <span>用户名</span>
+            <span class="input-shell">
+              <Icon name="user" :size="17" />
+              <input
+                v-model="name"
+                type="text"
+                autocomplete="username"
+                autocapitalize="off"
+                spellcheck="false"
+                :disabled="busy"
+                placeholder="admin"
+              />
+            </span>
+          </label>
+
+          <label class="field">
+            <span>口令</span>
+            <span class="input-shell">
+              <Icon name="lock" :size="17" />
+              <input
+                ref="passwordInput"
+                v-model="password"
+                type="password"
+                autocomplete="current-password"
+                :disabled="busy || cooldown > 0"
+                placeholder="••••••"
+              />
+            </span>
+          </label>
+
+          <button type="submit" class="primary auth-submit" :disabled="!canSubmit">
+            <Icon v-if="busy" name="loader" :size="16" />
+            {{ submitLabel }}
+          </button>
+        </template>
+
+        <div class="auth-card__meta">
+          <span>
+            凭据与 ONVIF 那一份<strong>不是同一套</strong>：这里是人手敲的
+            <code class="value">web.user</code> / <code class="value">web.password</code>。
+          </span>
+          <span class="mono">本地会话</span>
+        </div>
+      </form>
+    </section>
   </div>
 </template>
