@@ -10,4 +10,6 @@ echo.
 echo --- sc query Desk2ONVIF ---
 sc query Desk2ONVIF
 echo.
+echo Stop it with: service-stop.bat  (kill worker in Task Manager -> watchdog restarts it)
+echo.
 pause

@@ -671,6 +671,8 @@ void print_usage() {
       "  --service install      装成开机自启的服务，并立刻启动（需要管理员，\n"
       "                         不在管理员上下文里会自己弹一次 UAC）\n"
       "  --service uninstall    先停再删\n"
+      "  --service start        启动已安装的服务（需要管理员，会弹一次 UAC）\n"
+      "  --service stop         停止服务但保留服务对象（需要管理员，会弹一次 UAC）\n"
       "  --service status       看状态（只读，不需要管理员）\n"
       "  --service print        只把要做的每一步打出来，什么都不改\n"
       "  --start                给 install 用：装完立刻启动\n"
@@ -5518,7 +5520,7 @@ int cmd_console(ParsedArgs args, std::wstring const& raw_cmdline) {
   return cmd_run(args, form, raw_cmdline);
 }
 
-/// `--service run | install | uninstall | status | print`。
+/// `--service run | install | uninstall | start | stop | status | print`。
 ///
 /// `run` 是 SCM 拉起服务进程时用的内部入口（`install` 会把它写进服务的
 /// 命令行里），其余四个是给人用的。
@@ -5527,10 +5529,12 @@ int cmd_service(ParsedArgs const& args) {
   d2o::ServiceCommand const cmd = d2o::parse_service_command(sub);
   if (cmd == d2o::ServiceCommand::Unknown) {
     std::fprintf(stderr,
-                 "--service 后面要跟 run / install / uninstall / status / print 之一，"
+                 "--service 后面要跟 run / install / uninstall / start / stop / status / print 之一，"
                  "给的是 \"%s\"。\n"
                  "  install    装成开机自启的 Windows 服务（**需要管理员，会弹一次 UAC**）\n"
                  "  uninstall  停止并删除它\n"
+                 "  start      启动已安装的服务（需要管理员，会弹一次 UAC）\n"
+                 "  stop       停止服务但保留服务对象（需要管理员，会弹一次 UAC）\n"
                  "  status     看状态（只读，不需要管理员）\n"
                  "  print      只把要做的每一步打出来，什么都不改\n",
                  sub.c_str());
@@ -5553,6 +5557,8 @@ int cmd_service(ParsedArgs const& args) {
     case d2o::ServiceCommand::Run:       return d2o::service_run(config_path);
     case d2o::ServiceCommand::Install:   return d2o::service_install(config_path, start_now);
     case d2o::ServiceCommand::Uninstall: return d2o::service_uninstall();
+    case d2o::ServiceCommand::Start:     return d2o::service_start();
+    case d2o::ServiceCommand::Stop:      return d2o::service_stop();
     case d2o::ServiceCommand::Status:    return d2o::service_status();
     case d2o::ServiceCommand::Print:     return d2o::service_print(config_path, start_now);
     case d2o::ServiceCommand::Unknown:   break;

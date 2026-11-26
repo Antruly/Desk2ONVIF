@@ -20,6 +20,9 @@
   `$OutputEncoding`；PowerShell 自己打印的中文、地址也不再按 936 输出。
 - 注意：UTF-8 只解决编码，不解决字体。旧版 conhost 的“点阵字体”没有中文
   字形时仍需换 Consolas/微软雅黑或使用 Windows Terminal。
+- 服务模式新增 `--service start` / `--service stop` 和开始菜单「启动服务」
+  「停止服务」入口；停止的是整个服务（Session 0 看门狗），不是 worker。
+  控制台模式不创建这两个入口，也没有守护进程：关窗口或 Ctrl+C 就是停止。
 
 ## [0.3.1] — 2026-11-26
 

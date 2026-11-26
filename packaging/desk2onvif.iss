@@ -127,6 +127,10 @@ Source: "..\packaging\start-local.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\start-installed.bat"; DestDir: "{app}"; Flags: ignoreversion
 ; 开始菜单"服务状态"用：--service status + sc query，窗口停住给人看。
 Source: "..\packaging\service-status.bat"; DestDir: "{app}"; Flags: ignoreversion
+; 服务模式专用的启停入口。控制台模式没有守护进程，关窗口/Ctrl+C 即可，
+; 因此这两个脚本只在服务模式建快捷方式。
+Source: "..\packaging\service-start.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\packaging\service-stop.bat"; DestDir: "{app}"; Flags: ignoreversion
 ; 卸载时等 Session 1 的 worker 退出，再让 Inno 删文件（见 [UninstallRun]）。
 Source: "..\packaging\wait-worker-exit.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\list-displays.bat"; DestDir: "{app}"; Flags: ignoreversion
@@ -143,6 +147,8 @@ Source: "..\resources\desk2onvif.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; Check 函数定义在 [Code]；**不要**写 "Tasks: not installservice" ——那不是
 ; Inno 的语法，编译期不会报错，运行时却会安静地不选中/选不中。
 Name: "{group}\打开 Web 控制台"; Filename: "http://127.0.0.1:{code:GetWebPort}/"; IconFilename: "{app}\desk2onvif.ico"; Check: IsServiceMode
+Name: "{group}\启动服务"; Filename: "{app}\service-start.bat"; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"; Check: IsServiceMode
+Name: "{group}\停止服务"; Filename: "{app}\service-stop.bat"; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"; Check: IsServiceMode
 Name: "{group}\服务状态"; Filename: "{app}\service-status.bat"; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"; Check: IsServiceMode
 Name: "{group}\启动 {#MyAppName}"; Filename: "{app}\start-installed.bat"; WorkingDir: "{app}"; IconFilename: "{app}\desk2onvif.ico"; Check: IsConsoleMode
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
