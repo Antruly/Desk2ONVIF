@@ -5560,9 +5560,34 @@ int cmd_service(ParsedArgs const& args) {
   return d2o::kExitUsage;
 }
 
+#ifdef _WIN32
+/// 把**当前控制台**切成 UTF-8。只影响有控制台的这一条路径；Windows 服务、
+/// `--worker` 和重定向到文件/管道的 stdout 都不受影响。
+///
+/// 为什么要在进程里做，而不是只靠 `start.bat` 的 `chcp 65001`：
+///   * 双击 exe、从别的启动器/调试器拉起、或者安装版的控制台入口，不一定
+///     经过那几个 .bat；
+///   * `chcp` 只改控制台代码页，进程自己的 CRT 仍可能按旧代码页解释/输出；
+///   * 日志走 `stderr` 的原始 UTF-8 字节，控制台按 936 解读就是乱码。
+///
+/// `SetConsoleOutputCP` 改的是控制台**输出**代码页，`SetConsoleCP` 改输入；
+/// 两个都设，`--help`、日志和交互提示才一致。失败不致命：老系统/无控制台
+/// 环境继续按原来的代码页工作，不能因为这一句启动不了。
+void enable_utf8_console() {
+  if (::GetConsoleWindow() == nullptr) return;
+  ::SetConsoleOutputCP(CP_UTF8);
+  ::SetConsoleCP(CP_UTF8);
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  // 必须在任何 stdout/stderr 输出之前；`init_runtime()` 自己也可能打 WARN。
+  enable_utf8_console();
+#endif
+
   // 第一件事，必须在任何往线程池投递的调用之前：libuv 默认只有 4 个线程池
   // 线程，而静态文件、快照编码、配置读写全排在那一条队上。传 0 = 按 CPU 核数。
   // 放晚了库会打一条 WARN 并且**设置不生效**（它返回 UV_EALREADY 而我们

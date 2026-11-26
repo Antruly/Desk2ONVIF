@@ -44,6 +44,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# --- 控制台统一 UTF-8 ------------------------------------------------------
+# `start.bat` 里的 `chcp 65001` 解决的是 cmd 的代码页；直接跑 `start.ps1`
+# 或者从别的宿主拉起时不一定有那一步。PowerShell 自己打印的中文/地址也要
+# 按 UTF-8 输出，否则 exe 已经是 UTF-8 了，脚本标题和提示还是乱码。
+# 没有控制台（例如计划任务）时 setter 可能抛异常，不能因此不启动。
+try {
+    $utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false
+    [Console]::InputEncoding  = $utf8
+    [Console]::OutputEncoding = $utf8
+    $OutputEncoding            = $utf8
+} catch {
+    # 无控制台/宿主不支持时保持原样；exe 自己仍会 SetConsoleOutputCP。
+}
+
 # --- 路径全部相对脚本自己，和当前工作目录无关 -----------------------------
 #
 # 这一点是必需的，不是风格问题：exe 的 `--web-root` 默认值是**相对路径**
