@@ -8,8 +8,8 @@
 [![License](https://img.shields.io/badge/license-MIT%20(source)%20%2F%20GPL--3.0%20(binary)-blue)](#许可证)
 [![Built on libuvcpp](https://img.shields.io/badge/built%20on-libuvcpp-orange)](https://github.com/Antruly/libuvcpp)
 
-[**⬇ 下载最新安装包**](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.3.1.exe)
-· [绿色版](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.3.1-win64.zip)
+[**⬇ 下载最新安装包**](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.3.2.exe)
+· [绿色版](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.3.2-win64.zip)
 · [全部版本](https://github.com/Antruly/Desk2ONVIF/releases)
 
 Desk2ONVIF 把本机桌面模拟成一台标准 ONVIF 摄像机：海康、大华、Milestone
@@ -92,8 +92,8 @@ XProtect、Pelco 等 NVR 能像发现普通 IP 摄像机一样**自动发现它*
 
 ### 方式一：安装包（推荐）
 
-当前版本 **v0.3.1**，直接下
-[`Desk2ONVIF_Setup_0.3.1.exe`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.3.1.exe)
+当前版本 **v0.3.2**，直接下
+[`Desk2ONVIF_Setup_0.3.2.exe`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF_Setup_0.3.2.exe)
 （全部版本见 [Releases](https://github.com/Antruly/Desk2ONVIF/releases)）。
 Inno Setup 简体中文向导，**会请求管理员权限（UAC）**，默认装到
 `C:\Program Files\Desk2ONVIF`。
@@ -141,7 +141,7 @@ NVR 一份，互相独立），细节见[工程实录](docs/ENGINEERING.md#安�
 ### 方式二：绿色版
 
 下
-[`Desk2ONVIF-0.3.1-win64.zip`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.3.1-win64.zip)，
+[`Desk2ONVIF-0.3.2-win64.zip`](https://github.com/Antruly/Desk2ONVIF/releases/latest/download/Desk2ONVIF-0.3.2-win64.zip)，
 解压即用，整个目录拷走就能换机器。跑 `start.ps1`（或 `start-local.bat`）启动。
 **绿色版不需要管理员权限**，配置在 exe 旁边的 `config.json`，和服务模式无关。
 

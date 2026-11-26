@@ -36,6 +36,8 @@ enum class ServiceCommand {
   Install,
   Uninstall,
   Status,     ///< 只读，非管理员可跑
+  Start,      ///< 启动已安装的服务（需要管理员，会弹 UAC）
+  Stop,       ///< 停止服务但不删除（需要管理员，会弹 UAC）
   Print,      ///< 只把"要做什么"打出来，什么都不改（照 `--firewall print` 的样子）
   Unknown,
 };
@@ -59,6 +61,12 @@ int service_install(std::string const& config_path, bool start_now);
 /// 先 stop 再 delete。**顺序反了会留下一个停不掉的进程**（服务对象没了，
 /// 但 worker 还在跑，且它盯着的父进程句柄一直没有信号）。
 int service_uninstall();
+
+/// 启动/停止**已安装的服务对象**，但不删除它。服务模式专用的两个动作：
+/// 控制台模式没有守护进程，关窗口就是停止，不需要这两个脚本。
+/// 两者都需要管理员；不在管理员上下文里会自己弹一次 UAC。
+int service_start();
+int service_stop();
 
 /// 查询状态。非管理员可跑。
 ///

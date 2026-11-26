@@ -550,6 +550,8 @@ ServiceCommand parse_service_command(string const& v) {
   if (v == "install") return ServiceCommand::Install;
   if (v == "uninstall") return ServiceCommand::Uninstall;
   if (v == "status") return ServiceCommand::Status;
+  if (v == "start") return ServiceCommand::Start;
+  if (v == "stop") return ServiceCommand::Stop;
   if (v == "print") return ServiceCommand::Print;
   return ServiceCommand::Unknown;
 }
@@ -777,6 +779,111 @@ int service_uninstall() {
   return kExitOk;
 }
 
+/// 等 SCM 把服务切到指定状态。超时返回 false；服务在中途变成 STOPPED 时
+/// 也返回 false（想等 RUNNING 却等来了 STOPPED，继续等只会白白多等一轮）。
+bool wait_for_service_state(SC_HANDLE svc, DWORD want, DWORD timeout_ms) {
+  ULONGLONG const deadline = ::GetTickCount64() + timeout_ms;
+  for (;;) {
+    SERVICE_STATUS st{};
+    if (!::QueryServiceStatus(svc, &st)) return false;
+    if (st.dwCurrentState == want) return true;
+    if (want == SERVICE_RUNNING && st.dwCurrentState == SERVICE_STOPPED) {
+      return false;
+    }
+    if (::GetTickCount64() >= deadline) return false;
+    ::Sleep(200);
+  }
+}
+
+int service_start() {
+  if (!is_elevated()) return relaunch_elevated("--service start");
+
+  bool denied = false;
+  SC_HANDLE scm = open_scm(SC_MANAGER_CONNECT, denied);
+  if (scm == nullptr) return kExitFailed;
+  SC_HANDLE svc = ::OpenServiceW(scm, kServiceName,
+                                 SERVICE_START | SERVICE_QUERY_STATUS);
+  if (svc == nullptr) {
+    DWORD const e = ::GetLastError();
+    if (e == ERROR_SERVICE_DOES_NOT_EXIST) {
+      std::printf("服务没装过，不能启动。\n");
+      std::printf("  安装服务：desk2onvif --service install --start（会弹一次 UAC）\n"
+                  "  或前台运行：desk2onvif --console\n");
+      ::CloseServiceHandle(scm);
+      return kExitOk;
+    }
+    std::fprintf(stderr, "打开服务失败：%s\n", sys_error(e).c_str());
+    ::CloseServiceHandle(scm);
+    return kExitFailed;
+  }
+
+  int rc = kExitOk;
+  if (!::StartServiceW(svc, 0, nullptr)) {
+    DWORD const e = ::GetLastError();
+    if (e == ERROR_SERVICE_ALREADY_RUNNING) {
+      std::printf("服务已经在运行，不需要再启动。\n");
+    } else {
+      std::fprintf(stderr, "启动服务失败：%s\n", sys_error(e).c_str());
+      rc = kExitFailed;
+    }
+  } else if (!wait_for_service_state(svc, SERVICE_RUNNING, 15000)) {
+    std::fprintf(stderr, "服务启动超时（15 秒内没有变成 RUNNING）。\n"
+                         "看日志：%%ProgramData%%\\Desk2ONVIF\\service.log\n");
+    rc = kExitFailed;
+  } else {
+    std::printf("服务已启动，worker 会在当前交互会话里拉起。\n");
+    std::printf("  查状态：desk2onvif --service status\n");
+  }
+
+  ::CloseServiceHandle(svc);
+  ::CloseServiceHandle(scm);
+  return rc;
+}
+
+int service_stop() {
+  if (!is_elevated()) return relaunch_elevated("--service stop");
+
+  bool denied = false;
+  SC_HANDLE scm = open_scm(SC_MANAGER_CONNECT, denied);
+  if (scm == nullptr) return kExitFailed;
+  SC_HANDLE svc = ::OpenServiceW(scm, kServiceName,
+                                 SERVICE_STOP | SERVICE_QUERY_STATUS);
+  if (svc == nullptr) {
+    DWORD const e = ::GetLastError();
+    if (e == ERROR_SERVICE_DOES_NOT_EXIST) {
+      std::printf("服务没装过，没有可停止的后台服务。\n");
+      ::CloseServiceHandle(scm);
+      return kExitOk;
+    }
+    std::fprintf(stderr, "打开服务失败：%s\n", sys_error(e).c_str());
+    ::CloseServiceHandle(scm);
+    return kExitFailed;
+  }
+
+  int rc = kExitOk;
+  SERVICE_STATUS status{};
+  if (!::ControlService(svc, SERVICE_CONTROL_STOP, &status)) {
+    DWORD const e = ::GetLastError();
+    if (e == ERROR_SERVICE_NOT_ACTIVE) {
+      std::printf("服务已经停止，worker 也不会再被拉起。\n");
+    } else {
+      std::fprintf(stderr, "停止服务失败：%s\n", sys_error(e).c_str());
+      rc = kExitFailed;
+    }
+  } else if (!wait_for_service_state(svc, SERVICE_STOPPED, 30000)) {
+    std::fprintf(stderr, "服务停止超时（30 秒内没有变成 STOPPED）。\n"
+                         "看日志：%%ProgramData%%\\Desk2ONVIF\\service.log\n");
+    rc = kExitFailed;
+  } else {
+    std::printf("服务已停止，worker 也会退出，不会再有守护进程重启它。\n");
+    std::printf("  重新启动：desk2onvif --service start\n");
+  }
+
+  ::CloseServiceHandle(svc);
+  ::CloseServiceHandle(scm);
+  return rc;
+}
+
 int service_status() {
   // 只读，**不需要管理员**（SERVICE_QUERY_STATUS 是任何人都有的）。
   bool denied = false;
@@ -860,6 +967,8 @@ int service_status() {
 int service_run(string const&) { return kExitFailed; }
 int service_install(string const&, bool) { return kExitFailed; }
 int service_uninstall() { return kExitFailed; }
+int service_start() { return kExitFailed; }
+int service_stop() { return kExitFailed; }
 int service_status() { return kExitFailed; }
 int service_print(string const&, bool) { return kExitFailed; }
 

@@ -8,6 +8,22 @@
 > 所以不在这里编造条目。需要考古的话，`docs/ENGINEERING.md` 里按「轮次」
 > 记了那几轮各做了什么。
 
+## [0.3.2] — 2026-11-26
+
+**控制台 UTF-8**
+
+- exe 启动时在**有控制台**的路径上调用 `SetConsoleOutputCP(CP_UTF8)` 和
+  `SetConsoleCP(CP_UTF8)`；双击 exe、调试器/启动器拉起、安装版控制台入口
+  都不再依赖 `start.bat` 里的 `chcp 65001`。服务、`--worker` 和重定向输出
+  不受影响。
+- `start.ps1` 同时设置 `[Console]::InputEncoding` / `OutputEncoding` 和
+  `$OutputEncoding`；PowerShell 自己打印的中文、地址也不再按 936 输出。
+- 注意：UTF-8 只解决编码，不解决字体。旧版 conhost 的“点阵字体”没有中文
+  字形时仍需换 Consolas/微软雅黑或使用 Windows Terminal。
+- 服务模式新增 `--service start` / `--service stop` 和开始菜单「启动服务」
+  「停止服务」入口；停止的是整个服务（Session 0 看门狗），不是 worker。
+  控制台模式不创建这两个入口，也没有守护进程：关窗口或 Ctrl+C 就是停止。
+
 ## [0.3.1] — 2026-11-26
 
 **修复**
@@ -188,6 +204,7 @@
 - 源码采用 **MIT**，随包分发的二进制因链接 GPL 版 x264 而按 **GPL-3.0-or-later**
   分发。详见 [README](README.md#许可证)
 
+[0.3.2]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.2
 [0.3.1]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.2.0
