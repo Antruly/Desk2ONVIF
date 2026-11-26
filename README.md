@@ -104,9 +104,13 @@ Inno Setup 简体中文向导，**会请求管理员权限（UAC）**，默认�
   开机自动启动，崩溃后由 SCM 自动重启。桌面和开始菜单里放的是
   `http://127.0.0.1:8080/` 的 **URL 快捷方式**，双击直接进 Web 控制台；
   开始菜单里另有“服务状态”（等价于 `sc query Desk2ONVIF` /
-  `desk2onvif.exe --service status`）。
+  `desk2onvif.exe --service status`）、“启动服务”和“停止服务”。
+  **要停就点“停止服务”**（或 `desk2onvif.exe --service stop`），它停的是
+  Session 0 看门狗；在任务管理器里杀 worker 会被看门狗重新拉起来。
+  “停止服务”只停不删，下次开机仍会自启；彻底移除用卸载程序。
 - **不勾选**：控制台形态。桌面/开始菜单指向 `start-installed.bat`，
-  双击后窗口里能看到日志，关掉窗口就停止。
+  双击后窗口里能看到日志，**关掉窗口或 Ctrl+C 就停止**。这种形态没有
+  守护进程，也不会创建“启动服务/停止服务”两个入口。
 
 两种形态的配置都在
 `C:\ProgramData\Desk2ONVIF\config.json`（安装器创建时给 Users 组修改权限，
