@@ -40,8 +40,11 @@
 - 新增 **WS-UsernameToken**（PasswordDigest、Created、Nonce、±5 分钟窗口、
   nonce 重放缓存），与 HTTP Digest 并存；任一通过即放行。
 - 新增 Media2 端点 `/onvif/media2_service`：能力、Profile、StreamUri、
-  SnapshotUri、视频源/编码器配置与编码器 options；编码器 `Set` 只接受同一
-  Profile 的宽高/帧率/码率，越界明确 Fault。
+  SnapshotUri、`GetVideoEncoderConfigurations`、
+  `GetVideoEncoderConfigurationOptions`。本轮**未实现** Media2 的
+  `GetVideoSourceConfigurations` / `GetVideoEncoderConfiguration` /
+  `SetVideoEncoderConfiguration`，请求会明确回 `ActionNotSupported`；
+  Media1 侧对应的 Set 能力不受影响。
 - 新增 Events PullPoint 端点 `/onvif/events_service`：
   `GetEventProperties`、`CreatePullPointSubscription`、`PullMessages`、
   `Renew`、`Unsubscribe`；`PullMessages` 按 Timeout 延迟响应（上限 10 秒，
