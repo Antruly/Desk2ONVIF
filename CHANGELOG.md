@@ -8,6 +8,17 @@
 > 所以不在这里编造条目。需要考古的话，`docs/ENGINEERING.md` 里按「轮次」
 > 记了那几轮各做了什么。
 
+## [0.3.1] — 2026-11-26
+
+**修复**
+
+- 服务日志 `%ProgramData%\Desk2ONVIF\service.log` 在 0.3.0 里始终只有 3 字节
+  BOM：`ServiceLog::open_append` 用了 MinGW 不支持的 `_wfopen(..., L"a, ccs=UTF-8")`，
+  流被设成宽字符方向，窄字符 `fprintf` 返回成功但正文没有落盘。改用普通
+  `L"a"` 追加 UTF-8 字节；服务启动、worker 拉起/退出、无交互会话等日志现在
+  会真正写入。
+- 版本号按补丁位递增到 **0.3.1**；业务代码与 0.3.0 相同。
+
 ## [0.3.0] — 2026-11-26
 
 **服务形态与通道**
@@ -177,6 +188,7 @@
 - 源码采用 **MIT**，随包分发的二进制因链接 GPL 版 x264 而按 **GPL-3.0-or-later**
   分发。详见 [README](README.md#许可证)
 
+[0.3.1]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.2.0
 [0.1.9]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.1.9
