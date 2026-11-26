@@ -129,7 +129,12 @@ class ServiceLog {
       ::DeleteFileW(old.c_str());
       ::MoveFileW(path.c_str(), old.c_str());
     }
-    f_ = _wfopen(path.c_str(), L"a, ccs=UTF-8");
+    // 不要用 `ccs=UTF-8`：MinGW 的 `_wfopen` 会接受这个模式并把流设成宽字符
+    // 方向，随后窄字符的 `fprintf` 虽然返回写入了多少字节，**实际只留下一个
+    // BOM**（实测：文件 3 字节，内容全丢）。service.log 之前一直只有 3 字节
+    // BOM 就是这个原因。普通 `a` 模式下 `fprintf` 写的是我们拼好的 UTF-8
+    // 字节，既正确又不需要依赖 MSVC 扩展。
+    f_ = _wfopen(path.c_str(), L"a");
     return f_ != nullptr;
   }
 
