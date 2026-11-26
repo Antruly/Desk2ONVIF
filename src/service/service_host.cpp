@@ -363,7 +363,12 @@ HANDLE spawn_worker(DWORD session, string const& config_path) {
   wstring const dir = exe_dir();
   BOOL const created = ::CreateProcessAsUserW(
       primary, nullptr, cmd.data(), nullptr, nullptr, FALSE,
-      CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE, env,
+      // **不要 CREATE_NEW_CONSOLE。** worker 的日志已经写进
+      // `desk2onvif.log`，再给它开一个控制台只会在登录用户的桌面上留下
+      // 一个黑窗口；那个窗口在旧版本里还会因为代码页不是 UTF-8 而满屏乱码，
+      // 用户会把它当成“一直守护着的乱码进程”。CREATE_NO_WINDOW 同样能保持
+      // 交互桌面（DXGI 要的是 winsta0\default，不是控制台），只是没有窗口。
+      CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env,
       dir.empty() ? nullptr : dir.c_str(), &si, &pi);
 
   if (env != nullptr) ::DestroyEnvironmentBlock(env);
