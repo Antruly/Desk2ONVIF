@@ -8,6 +8,17 @@
 > 所以不在这里编造条目。需要考古的话，`docs/ENGINEERING.md` 里按「轮次」
 > 记了那几轮各做了什么。
 
+## [0.3.3] — 2026-11-27
+
+**修复服务 worker 的控制台窗口**
+
+- `CreateProcessAsUserW` 的创建标志从 `CREATE_NEW_CONSOLE` 改为
+  `CREATE_NO_WINDOW`。worker 的日志本来就在 `desk2onvif.log`，不需要控制台；
+  旧行为会在登录用户桌面上留一个黑窗口，代码页不对时满屏乱码，看起来像
+  “一直守护着的乱码进程”。
+- 交互桌面（`winsta0\\default`）保持不变，DXGI 桌面采集不受影响。
+- 版本按补丁位 0.3.3。
+
 ## [0.3.2] — 2026-11-26
 
 **控制台 UTF-8**
@@ -204,6 +215,7 @@
 - 源码采用 **MIT**，随包分发的二进制因链接 GPL 版 x264 而按 **GPL-3.0-or-later**
   分发。详见 [README](README.md#许可证)
 
+[0.3.3]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.3
 [0.3.2]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.2
 [0.3.1]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Antruly/Desk2ONVIF/releases/tag/v0.3.0
